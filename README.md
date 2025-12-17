@@ -147,6 +147,12 @@ Example client configuration:
         Send queue buffer size (default 1000)
   -recv-queue int
         Receive queue buffer size (default 1000)
+  -multi-client
+        Enable multi-client support (server mode, default true)
+  -max-clients int
+        Maximum number of concurrent clients (server mode, default 100)
+  -client-isolation
+        Enable client isolation mode (clients cannot communicate with each other)
   -tls
         Enable TLS encryption (recommended for security)
   -tls-cert string
@@ -209,13 +215,84 @@ ping 10.0.0.1
   - Higher values use more memory but handle traffic bursts better
   - Typical values: 1000-5000 for normal use, 5000-10000 for high-bandwidth tunnels
 
+## Multi-Client Support (多客户端支持)
+
+**NEW**: Server now supports multiple simultaneous client connections!
+
+### Hub Mode
+
+The server operates as a hub/switch, allowing multiple clients to connect and communicate with each other:
+
+```
+                    Server (10.0.0.1)
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+   Client 1          Client 2          Client 3
+  (10.0.0.2)        (10.0.0.3)        (10.0.0.4)
+        │                │                │
+        └────────────────┴────────────────┘
+              Can communicate with each other
+```
+
+### Setup Example
+
+**Server:**
+```bash
+sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 -multi-client
+```
+
+**Client 1:**
+```bash
+sudo ./lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.2/24
+```
+
+**Client 2:**
+```bash
+sudo ./lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.3/24
+```
+
+**Client 3:**
+```bash
+sudo ./lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.4/24
+```
+
+### Client-to-Client Communication
+
+Once connected, clients can directly communicate:
+
+```bash
+# On Client 1, ping Client 2
+ping 10.0.0.3
+
+# On Client 2, ssh to Client 3
+ssh user@10.0.0.4
+
+# On Client 1, access service on Client 3
+curl http://10.0.0.4:8080
+```
+
+### Configuration Options
+
+- `-multi-client`: Enable multi-client support (default: true)
+- `-max-clients`: Maximum concurrent clients (default: 100)
+- `-client-isolation`: Enable client isolation mode (clients can only talk to server, not each other)
+
+### Client Isolation Mode
+
+If you want clients to only communicate with the server (not with each other):
+
+```bash
+sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 -client-isolation
+```
+
 ## Limitations (限制)
 
 - Currently supports only IPv4
-- Single client per server instance
 - Requires root/admin privileges for TUN device
 - Linux only (uses Linux TUN/TAP interfaces)
 - **No encryption by default** - enable TLS for secure communication
+- All traffic flows through server (server can be a bottleneck)
 
 ## Security (安全)
 

@@ -28,6 +28,9 @@ func main() {
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards")
 	sendQueueSize := flag.Int("send-queue", 1000, "Send queue buffer size")
 	recvQueueSize := flag.Int("recv-queue", 1000, "Receive queue buffer size")
+	multiClient := flag.Bool("multi-client", true, "Enable multi-client support (server mode)")
+	maxClients := flag.Int("max-clients", 100, "Maximum number of concurrent clients (server mode)")
+	clientIsolation := flag.Bool("client-isolation", false, "Enable client isolation mode (clients cannot communicate with each other)")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS encryption")
@@ -79,6 +82,9 @@ func main() {
 			TLSCertFile:       *tlsCertFile,
 			TLSKeyFile:        *tlsKeyFile,
 			TLSSkipVerify:     *tlsSkipVerify,
+			MultiClient:       *multiClient,
+			MaxClients:        *maxClients,
+			ClientIsolation:   *clientIsolation,
 		}
 	}
 
@@ -100,6 +106,10 @@ func main() {
 	log.Printf("FEC: %d data + %d parity shards", cfg.FECDataShards, cfg.FECParityShards)
 	log.Printf("Send Queue Size: %d", cfg.SendQueueSize)
 	log.Printf("Receive Queue Size: %d", cfg.RecvQueueSize)
+	if cfg.Mode == "server" {
+		log.Printf("Multi-client: %v (max: %d)", cfg.MultiClient, cfg.MaxClients)
+		log.Printf("Client Isolation: %v", cfg.ClientIsolation)
+	}
 	log.Printf("TLS Encryption: %v", cfg.TLSEnabled)
 	if !cfg.TLSEnabled {
 		log.Println("⚠️  WARNING: TLS disabled - traffic will be sent in PLAINTEXT")

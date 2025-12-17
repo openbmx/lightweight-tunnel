@@ -19,19 +19,38 @@ import (
 const (
 	PacketTypeData      = 0x01
 	PacketTypeKeepalive = 0x02
+
+	// IPv4 constants
+	IPv4Version      = 4
+	IPv4SrcIPOffset  = 12
+	IPv4DstIPOffset  = 16
+	IPv4MinHeaderLen = 20
 )
+
+// ClientConnection represents a single client connection
+type ClientConnection struct {
+	conn       *tcp_disguise.Conn
+	sendQueue  chan []byte
+	recvQueue  chan []byte
+	clientIP   net.IP
+	stopCh     chan struct{}
+	stopOnce   sync.Once
+	wg         sync.WaitGroup
+}
 
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
 	config     *config.Config
 	fec        *fec.FEC
-	conn       *tcp_disguise.Conn
+	conn       *tcp_disguise.Conn    // Used in client mode
+	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
+	clientsMux sync.RWMutex
 	tunName    string
 	tunFile    *TunDevice
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
-	sendQueue  chan []byte
-	recvQueue  chan []byte
+	sendQueue  chan []byte  // Used in client mode
+	recvQueue  chan []byte  // Used in client mode
 }
 
 // NewTunnel creates a new tunnel instance
@@ -42,13 +61,21 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		return nil, fmt.Errorf("failed to create FEC: %v", err)
 	}
 
-	return &Tunnel{
-		config:    cfg,
-		fec:       fecCodec,
-		stopCh:    make(chan struct{}),
-		sendQueue: make(chan []byte, cfg.SendQueueSize),
-		recvQueue: make(chan []byte, cfg.RecvQueueSize),
-	}, nil
+	t := &Tunnel{
+		config:  cfg,
+		fec:     fecCodec,
+		stopCh:  make(chan struct{}),
+	}
+
+	if cfg.Mode == "client" {
+		t.sendQueue = make(chan []byte, cfg.SendQueueSize)
+		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
+	} else {
+		// Server mode: multi-client support
+		t.clients = make(map[string]*ClientConnection)
+	}
+
+	return t, nil
 }
 
 // Start starts the tunnel
@@ -75,23 +102,24 @@ func (t *Tunnel) Start() error {
 			t.tunFile.Close()
 			return fmt.Errorf("failed to connect as client: %v", err)
 		}
+
+		// Start client mode packet processing
+		t.wg.Add(4)
+		go t.tunReader()
+		go t.tunWriter()
+		go t.netReader()
+		go t.netWriter()
+
+		// Start keepalive
+		t.wg.Add(1)
+		go t.keepalive()
 	} else {
-		if err := t.listenServer(); err != nil {
+		// Server mode: start accepting clients
+		if err := t.startServer(); err != nil {
 			t.tunFile.Close()
 			return fmt.Errorf("failed to start as server: %v", err)
 		}
 	}
-
-	// Start packet processing goroutines
-	t.wg.Add(4)
-	go t.tunReader()
-	go t.tunWriter()
-	go t.netReader()
-	go t.netWriter()
-
-	// Start keepalive
-	t.wg.Add(1)
-	go t.keepalive()
 
 	log.Printf("Tunnel started in %s mode", t.config.Mode)
 	return nil
@@ -100,14 +128,65 @@ func (t *Tunnel) Start() error {
 // Stop stops the tunnel
 func (t *Tunnel) Stop() {
 	close(t.stopCh)
+	
+	// Close all client connections (server mode)
+	t.clientsMux.Lock()
+	for _, client := range t.clients {
+		client.stopOnce.Do(func() {
+			close(client.stopCh)
+		})
+		client.conn.Close()
+	}
+	t.clientsMux.Unlock()
+	
+	// Close single connection (client mode)
 	if t.conn != nil {
 		t.conn.Close()
 	}
+	
 	if t.tunFile != nil {
 		t.tunFile.Close()
 	}
 	t.wg.Wait()
 	log.Println("Tunnel stopped")
+}
+
+// addClient adds a client to the routing table
+func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
+	t.clientsMux.Lock()
+	defer t.clientsMux.Unlock()
+
+	ipStr := ip.String()
+	if existing, ok := t.clients[ipStr]; ok {
+		log.Printf("Warning: IP conflict detected for %s, closing old connection", ipStr)
+		existing.stopOnce.Do(func() {
+			close(existing.stopCh)
+		})
+		existing.conn.Close()
+	}
+
+	client.clientIP = ip
+	t.clients[ipStr] = client
+	log.Printf("Client registered with IP: %s (total clients: %d)", ipStr, len(t.clients))
+}
+
+// removeClient removes a client from the routing table
+func (t *Tunnel) removeClient(client *ClientConnection) {
+	t.clientsMux.Lock()
+	defer t.clientsMux.Unlock()
+
+	if client.clientIP != nil {
+		ipStr := client.clientIP.String()
+		delete(t.clients, ipStr)
+		log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
+	}
+}
+
+// getClientByIP retrieves a client by IP address
+func (t *Tunnel) getClientByIP(ip net.IP) *ClientConnection {
+	t.clientsMux.RLock()
+	defer t.clientsMux.RUnlock()
+	return t.clients[ip.String()]
 }
 
 // configureTUN configures the TUN device with IP address
@@ -177,8 +256,8 @@ func (t *Tunnel) connectClient() error {
 	return nil
 }
 
-// listenServer listens for client connections as server
-func (t *Tunnel) listenServer() error {
+// startServer starts the server and accepts multiple clients
+func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 	
 	var listener *tcp_disguise.Listener
@@ -211,24 +290,95 @@ func (t *Tunnel) listenServer() error {
 		return err
 	}
 
-	log.Printf("Waiting for client connection...")
-	
-	// Accept first connection (single client)
-	conn, err := listener.Accept()
-	if err != nil {
-		listener.Close()
-		return err
+	// Start TUN reader for server mode
+	t.wg.Add(1)
+	go t.tunReaderServer()
+
+	// Start accepting clients in a goroutine
+	t.wg.Add(1)
+	go t.acceptClients(listener)
+
+	if t.config.MultiClient {
+		log.Printf("Multi-client mode enabled (max: %d clients)", t.config.MaxClients)
+		if t.config.ClientIsolation {
+			log.Println("Client isolation enabled - clients cannot communicate with each other")
+		}
 	}
 
-	t.conn = conn
-	log.Printf("Client connected: %s -> %s", conn.RemoteAddr(), conn.LocalAddr())
-	
-	// Close listener after accepting one connection
-	listener.Close()
 	return nil
 }
 
-// tunReader reads packets from TUN device and queues them for sending
+// acceptClients accepts multiple client connections
+func (t *Tunnel) acceptClients(listener *tcp_disguise.Listener) {
+	defer t.wg.Done()
+	defer listener.Close()
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		default:
+		}
+
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
+				log.Printf("Accept error: %v", err)
+			}
+			return
+		}
+
+		// Check if we've reached max clients
+		t.clientsMux.RLock()
+		clientCount := len(t.clients)
+		t.clientsMux.RUnlock()
+
+		if !t.config.MultiClient && clientCount >= 1 {
+			log.Printf("Single-client mode: rejecting connection from %s", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
+		if clientCount >= t.config.MaxClients {
+			log.Printf("Max clients reached (%d), rejecting connection from %s", t.config.MaxClients, conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+
+		// Start handling this client
+		go t.handleClient(conn)
+	}
+}
+
+// handleClient handles a single client connection
+func (t *Tunnel) handleClient(conn *tcp_disguise.Conn) {
+	log.Printf("Client connected: %s", conn.RemoteAddr())
+
+	client := &ClientConnection{
+		conn:      conn,
+		sendQueue: make(chan []byte, t.config.SendQueueSize),
+		recvQueue: make(chan []byte, t.config.RecvQueueSize),
+		stopCh:    make(chan struct{}),
+	}
+
+	// Start client goroutines
+	client.wg.Add(3)
+	go t.clientNetReader(client)
+	go t.clientNetWriter(client)
+	go t.clientKeepalive(client)
+
+	// Wait for client to disconnect
+	client.wg.Wait()
+
+	// Clean up client
+	t.removeClient(client)
+	log.Printf("Client disconnected: %s", conn.RemoteAddr())
+}
+
+// tunReader reads packets from TUN device and queues them for sending (client mode)
 func (t *Tunnel) tunReader() {
 	defer t.wg.Done()
 	
@@ -243,7 +393,10 @@ func (t *Tunnel) tunReader() {
 
 		n, err := t.tunFile.Read(buf)
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("TUN read error: %v", err)
 			}
 			return
@@ -265,6 +418,62 @@ func (t *Tunnel) tunReader() {
 	}
 }
 
+// tunReaderServer reads packets from TUN device and routes them to clients (server mode)
+func (t *Tunnel) tunReaderServer() {
+	defer t.wg.Done()
+	
+	buf := make([]byte, t.config.MTU+100)
+	
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		default:
+		}
+
+		n, err := t.tunFile.Read(buf)
+		if err != nil {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
+				log.Printf("TUN read error: %v", err)
+			}
+			return
+		}
+
+		if n < IPv4MinHeaderLen {
+			continue
+		}
+
+		// Copy packet data
+		packet := make([]byte, n)
+		copy(packet, buf[:n])
+
+		// Parse destination IP from packet (IPv4)
+		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (4 bytes starting at offset 16 for IPv4)
+		if packet[0]>>4 != IPv4Version {
+			// Not IPv4, skip
+			continue
+		}
+
+		dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
+
+		// Find the client with this destination IP
+		client := t.getClientByIP(dstIP)
+		if client != nil {
+			select {
+			case client.sendQueue <- packet:
+			case <-t.stopCh:
+				return
+			default:
+				log.Printf("Client send queue full for %s, dropping packet", dstIP)
+			}
+		}
+		// If no client found, packet is dropped (or could be for server itself)
+	}
+}
+
 // tunWriter writes packets from receive queue to TUN device
 func (t *Tunnel) tunWriter() {
 	defer t.wg.Done()
@@ -275,7 +484,10 @@ func (t *Tunnel) tunWriter() {
 			return
 		case packet := <-t.recvQueue:
 			if _, err := t.tunFile.Write(packet); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("TUN write error: %v", err)
 				}
 				return
@@ -297,7 +509,10 @@ func (t *Tunnel) netReader() {
 
 		packet, err := t.conn.ReadPacket()
 		if err != nil {
-			if !isClosed(t.stopCh) {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			default:
 				log.Printf("Network read error: %v", err)
 			}
 			return
@@ -342,7 +557,10 @@ func (t *Tunnel) netWriter() {
 			copy(fullPacket[1:], packet)
 
 			if err := t.conn.WritePacket(fullPacket); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("Network write error: %v", err)
 				}
 				return
@@ -366,7 +584,10 @@ func (t *Tunnel) keepalive() {
 			return
 		case <-ticker.C:
 			if err := t.conn.WritePacket(keepalivePacket); err != nil {
-				if !isClosed(t.stopCh) {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
 					log.Printf("Keepalive error: %v", err)
 				}
 				return
@@ -375,15 +596,176 @@ func (t *Tunnel) keepalive() {
 	}
 }
 
-// isClosed checks if a channel is closed
-func isClosed(ch chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
+// clientNetReader reads packets from a client connection
+func (t *Tunnel) clientNetReader(client *ClientConnection) {
+	defer client.wg.Done()
+	
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-client.stopCh:
+			return
+		default:
+		}
+
+		packet, err := client.conn.ReadPacket()
+		if err != nil {
+			select {
+			case <-t.stopCh:
+				// Tunnel is stopping, no need to log
+			case <-client.stopCh:
+				// Client already stopped, no need to log
+			default:
+				log.Printf("Client network read error from %s: %v", client.conn.RemoteAddr(), err)
+			}
+			client.stopOnce.Do(func() {
+				close(client.stopCh)
+			})
+			return
+		}
+
+		if len(packet) < 1 {
+			continue
+		}
+
+		// Check packet type
+		packetType := packet[0]
+		payload := packet[1:]
+
+		switch packetType {
+		case PacketTypeData:
+			if len(payload) < IPv4MinHeaderLen {
+				continue
+			}
+
+			// Extract source IP from the packet to register client
+			if payload[0]>>4 == IPv4Version { // IPv4
+				srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
+				
+				// Register client IP if not yet registered
+				if client.clientIP == nil {
+					t.addClient(client, srcIP)
+				}
+
+				// Route packet based on destination
+				dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
+				
+				// Check if destination is another client
+				if t.config.ClientIsolation {
+					// In isolation mode, only send to TUN device (server)
+					// Clients cannot communicate with each other
+					if _, err := t.tunFile.Write(payload); err != nil {
+						select {
+						case <-t.stopCh:
+							// Tunnel is stopping, no need to log
+						default:
+							log.Printf("TUN write error: %v", err)
+						}
+						return
+					}
+				} else {
+					// Check if packet is for another client
+					targetClient := t.getClientByIP(dstIP)
+					if targetClient != nil && targetClient != client {
+						// Forward to target client
+						select {
+						case targetClient.sendQueue <- payload:
+						case <-t.stopCh:
+							return
+						case <-client.stopCh:
+							return
+						default:
+							log.Printf("Target client send queue full for %s, dropping packet", dstIP)
+						}
+					} else {
+						// Send to TUN device (for server or unknown destination)
+						if _, err := t.tunFile.Write(payload); err != nil {
+							select {
+							case <-t.stopCh:
+								// Tunnel is stopping, no need to log
+							default:
+								log.Printf("TUN write error: %v", err)
+							}
+							return
+						}
+					}
+				}
+			}
+		case PacketTypeKeepalive:
+			// Keepalive received, no action needed
+		}
 	}
 }
+
+// clientNetWriter writes packets from client send queue to network
+func (t *Tunnel) clientNetWriter(client *ClientConnection) {
+	defer client.wg.Done()
+	
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-client.stopCh:
+			return
+		case packet := <-client.sendQueue:
+			// Prepend packet type
+			fullPacket := make([]byte, len(packet)+1)
+			fullPacket[0] = PacketTypeData
+			copy(fullPacket[1:], packet)
+
+			if err := client.conn.WritePacket(fullPacket); err != nil {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				case <-client.stopCh:
+					// Client already stopped, no need to log
+				default:
+					log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), err)
+				}
+				client.stopOnce.Do(func() {
+					close(client.stopCh)
+				})
+				return
+			}
+		}
+	}
+}
+
+// clientKeepalive sends periodic keepalive packets to a client
+func (t *Tunnel) clientKeepalive(client *ClientConnection) {
+	defer client.wg.Done()
+	
+	ticker := time.NewTicker(time.Duration(t.config.KeepaliveInterval) * time.Second)
+	defer ticker.Stop()
+
+	keepalivePacket := []byte{PacketTypeKeepalive}
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-client.stopCh:
+			return
+		case <-ticker.C:
+			if err := client.conn.WritePacket(keepalivePacket); err != nil {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				case <-client.stopCh:
+					// Client already stopped, no need to log
+				default:
+					log.Printf("Client keepalive error to %s: %v", client.conn.RemoteAddr(), err)
+				}
+				client.stopOnce.Do(func() {
+					close(client.stopCh)
+				})
+				return
+			}
+		}
+	}
+}
+
 
 // Helper to get local IP for the other peer
 func GetPeerIP(tunnelAddr string) (string, error) {

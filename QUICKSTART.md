@@ -287,9 +287,46 @@ ip route show
 iftop -i tun0
 ```
 
+## Multi-Client Support (NEW!)
+
+The server now supports **multiple simultaneous client connections**:
+
+```bash
+# Server (accepts multiple clients)
+sudo ./bin/lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
+
+# Client 1
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.2/24
+
+# Client 2
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.3/24
+
+# Client 3
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.4/24
+```
+
+**Clients can communicate with each other:**
+```bash
+# On Client 1, ping Client 2
+ping 10.0.0.3
+
+# On Client 2, SSH to Client 3
+ssh user@10.0.0.4
+```
+
+For detailed multi-client setup instructions, see [examples/MULTI-CLIENT-GUIDE.md](examples/MULTI-CLIENT-GUIDE.md)
+
+### Multi-Client Options
+
+- `-multi-client`: Enable multi-client support (default: true)
+- `-max-clients`: Maximum concurrent clients (default: 100)
+- `-client-isolation`: Prevent clients from communicating with each other
+
 ## Next Steps
 
-- Read [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details
-- Check [README.md](README.md) for full documentation
+- Read [examples/MULTI-CLIENT-GUIDE.md](examples/MULTI-CLIENT-GUIDE.md) for multi-client setup
+- Read [IMPLEMENTATION.md](IMPLEMENTATION.md) for technical Q&A (user-space vs kernel, multi-core support)
+- Check [ARCHITECTURE.md](ARCHITECTURE.md) for implementation details
+- Review [README.md](README.md) for full documentation
 - Review example configurations in `examples/` directory
-- Consider adding encryption for production use
+- Consider adding TLS encryption for production use

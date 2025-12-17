@@ -22,6 +22,9 @@ type Config struct {
 	TLSCertFile   string `json:"tls_cert_file"`  // Path to TLS certificate file (server mode)
 	TLSKeyFile    string `json:"tls_key_file"`   // Path to TLS private key file (server mode)
 	TLSSkipVerify bool   `json:"tls_skip_verify"` // Skip TLS certificate verification (client mode, insecure)
+	MultiClient   bool   `json:"multi_client"`   // Enable multi-client support (server mode, default true)
+	MaxClients    int    `json:"max_clients"`    // Maximum number of concurrent clients (default 100)
+	ClientIsolation bool `json:"client_isolation"` // Enable client isolation (clients cannot communicate with each other)
 }
 
 // DefaultConfig returns a default configuration
@@ -38,6 +41,9 @@ func DefaultConfig() *Config {
 		KeepaliveInterval: 10,
 		SendQueueSize:     1000,
 		RecvQueueSize:     1000,
+		MultiClient:       true,
+		MaxClients:        100,
+		ClientIsolation:   false,
 	}
 }
 
@@ -75,6 +81,12 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.RecvQueueSize == 0 {
 		config.RecvQueueSize = 1000
 	}
+	if config.MaxClients == 0 {
+		config.MaxClients = 100
+	}
+	// Note: MultiClient and ClientIsolation default to false when loaded from JSON
+	// The command-line interface and DefaultConfig() set MultiClient=true by default
+	// Explicitly set "multi_client": true in JSON config for multi-client support
 
 	return &config, nil
 }

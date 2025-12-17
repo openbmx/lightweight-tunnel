@@ -202,15 +202,49 @@ JSON-based configuration with sensible defaults:
 
 ## Limitations
 
-1. **Single Client**: Server accepts only one client connection
-2. **IPv4 Only**: No IPv6 support currently
-3. **Linux Only**: Uses Linux-specific TUN/TAP interfaces
-4. **No NAT Traversal**: Requires direct connectivity or port forwarding
-5. **Simple FEC**: XOR-based FEC is less robust than Reed-Solomon
+1. **IPv4 Only**: No IPv6 support currently
+2. **Linux Only**: Uses Linux-specific TUN/TAP interfaces
+3. **No NAT Traversal**: Requires direct connectivity or port forwarding
+4. **Simple FEC**: XOR-based FEC is less robust than Reed-Solomon
+5. **Centralized Routing**: All traffic flows through server (potential bottleneck)
+
+## Multi-Client Architecture (NEW)
+
+### Hub Mode
+
+```
+                       Server
+                         │
+                   ┌─────┼─────┐
+                   │     │     │
+               Client1 Client2 Client3
+                   │     │     │
+                   └─────┴─────┘
+              Clients can communicate
+```
+
+### Components for Multi-Client
+
+1. **Client Connection Pool**: Map of client IP → connection
+2. **Packet Router**: Routes packets between clients based on destination IP
+3. **Dynamic Registration**: Clients register their IP on first packet
+4. **IP Conflict Detection**: Warns and handles IP conflicts
+
+### Packet Flow (Multi-Client)
+
+**Client-to-Client:**
+```
+Client1 → Server → Routing Decision → Client2
+```
+
+**Client-to-Server:**
+```
+Client1 → Server → TUN Device → Server App
+```
 
 ## Future Enhancements
 
-1. **Multi-client Support**: Server accepts multiple clients
+1. ✅ **Multi-client Support**: Server accepts multiple clients (DONE)
 2. **IPv6 Support**: Add IPv6 packet handling
 3. **Pre-shared Key Auth**: Implement PSK authentication
 4. **Certificate-based Auth**: Mutual TLS authentication
