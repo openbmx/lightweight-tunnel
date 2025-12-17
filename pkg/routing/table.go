@@ -8,6 +8,13 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 )
 
+const (
+	// ServerRoutePenalty is the quality penalty for routing through server
+	ServerRoutePenalty = 20
+	// RelayHopPenalty is the quality penalty per relay hop
+	RelayHopPenalty = 15
+)
+
 // RouteType represents the type of route
 type RouteType int
 
@@ -79,7 +86,7 @@ func (rt *RoutingTable) updateRouteForPeer(peer *p2p.PeerInfo) {
 	// Check server route quality
 	serverQuality := peer.GetQualityScore()
 	if peer.ThroughServer {
-		serverQuality -= 20 // Penalty for server routing
+		serverQuality -= ServerRoutePenalty // Penalty for server routing
 	}
 	
 	// Choose best route
@@ -109,7 +116,7 @@ func (rt *RoutingTable) findBestRelayRoute(peer *p2p.PeerInfo) *Route {
 		
 		// Calculate relay route quality
 		// Quality is based on relay peer quality minus a hop penalty
-		relayQuality := relayPeer.GetQualityScore() - 15 // Penalty for additional hop
+		relayQuality := relayPeer.GetQualityScore() - RelayHopPenalty // Penalty for additional hop
 		
 		// Don't exceed max hops
 		hops := 2

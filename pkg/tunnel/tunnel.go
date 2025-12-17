@@ -108,12 +108,24 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 func parseTunnelIP(tunnelAddr string) (net.IP, error) {
 	parts := strings.Split(tunnelAddr, "/")
 	if len(parts) != 2 {
-		return nil, errors.New("invalid tunnel address format")
+		return nil, errors.New("invalid tunnel address format, expected IP/mask")
 	}
+	
+	// Validate IP address
 	ip := net.ParseIP(parts[0])
 	if ip == nil {
-		return nil, errors.New("invalid IP address")
+		return nil, fmt.Errorf("invalid IP address: %s", parts[0])
 	}
+	
+	// Validate CIDR mask (should be between 0 and 32 for IPv4)
+	var maskBits int
+	if _, err := fmt.Sscanf(parts[1], "%d", &maskBits); err != nil {
+		return nil, fmt.Errorf("invalid CIDR mask: %s", parts[1])
+	}
+	if maskBits < 0 || maskBits > 32 {
+		return nil, fmt.Errorf("CIDR mask must be between 0 and 32, got %d", maskBits)
+	}
+	
 	return ip.To4(), nil
 }
 

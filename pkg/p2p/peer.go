@@ -81,25 +81,34 @@ func (p *PeerInfo) GetQualityScore() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	
+	// Quality scoring constants
+	const (
+		latencyPenaltyDivisor   = 10    // Divide latency by this to get penalty groups
+		latencyPenaltyMultiplier = 5     // Multiply penalty groups by this value
+		packetLossPenaltyScale   = 1000  // Scale packet loss to penalty points
+		p2pQualityBonus          = 20    // Bonus points for P2P connection
+		serverRoutePenalty       = 30    // Penalty points for server routing
+	)
+	
 	// Base score
 	score := 100
 	
 	// Deduct for latency (every 10ms reduces score by 5)
-	latencyPenalty := int(p.Latency.Milliseconds() / 10 * 5)
+	latencyPenalty := int(p.Latency.Milliseconds() / latencyPenaltyDivisor * latencyPenaltyMultiplier)
 	score -= latencyPenalty
 	
 	// Deduct for packet loss (1% loss = 10 points)
-	lossPenalty := int(p.PacketLoss * 1000)
+	lossPenalty := int(p.PacketLoss * packetLossPenaltyScale)
 	score -= lossPenalty
 	
 	// Bonus for direct P2P connection
 	if p.Connected {
-		score += 20
+		score += p2pQualityBonus
 	}
 	
 	// Penalty for going through server
 	if p.ThroughServer {
-		score -= 30
+		score -= serverRoutePenalty
 	}
 	
 	// Ensure score is in valid range

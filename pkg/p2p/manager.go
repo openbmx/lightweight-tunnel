@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+const (
+	// HandshakeAttempts is the number of handshake packets to send
+	HandshakeAttempts = 5
+	// HandshakeInterval is the delay between handshake packets
+	HandshakeInterval = 200 * time.Millisecond
+	// ReadTimeout is the timeout for UDP read operations
+	ReadTimeout = 1 * time.Second
+)
+
 // Connection represents a P2P UDP connection to a peer
 type Connection struct {
 	LocalAddr  *net.UDPAddr
@@ -154,12 +163,12 @@ func (m *Manager) performHandshake(conn *Connection) {
 	// Send multiple handshake packets to establish NAT mapping
 	handshakeMsg := []byte("P2P_HANDSHAKE")
 	
-	for i := 0; i < 5; i++ {
+	for i := 0; i < HandshakeAttempts; i++ {
 		_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
 		if err != nil {
 			log.Printf("Handshake send error to %s: %v", conn.PeerIP, err)
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(HandshakeInterval)
 	}
 }
 
@@ -191,7 +200,7 @@ func (m *Manager) receivePackets() {
 		default:
 		}
 		
-		m.listener.SetReadDeadline(time.Now().Add(1 * time.Second))
+		m.listener.SetReadDeadline(time.Now().Add(ReadTimeout))
 		n, remoteAddr, err := m.listener.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
