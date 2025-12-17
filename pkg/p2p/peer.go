@@ -1,0 +1,142 @@
+package p2p
+
+import (
+	"net"
+	"sync"
+	"time"
+)
+
+// PeerInfo contains information about a peer
+type PeerInfo struct {
+	TunnelIP     net.IP    // Tunnel IP address (e.g., 10.0.0.2)
+	PublicAddr   string    // Public address for P2P (IP:Port)
+	LocalAddr    string    // Local address behind NAT
+	LastSeen     time.Time // Last time we received data from this peer
+	Latency      time.Duration // Measured latency to this peer
+	PacketLoss   float64   // Packet loss rate (0.0 - 1.0)
+	Connected    bool      // Whether P2P connection is established
+	ThroughServer bool     // Whether currently routing through server
+	RelayPeers   []net.IP  // List of peers that can relay to this peer
+	mu           sync.RWMutex
+}
+
+// NewPeerInfo creates a new peer information structure
+func NewPeerInfo(tunnelIP net.IP) *PeerInfo {
+	return &PeerInfo{
+		TunnelIP:   tunnelIP,
+		LastSeen:   time.Now(),
+		RelayPeers: make([]net.IP, 0),
+	}
+}
+
+// UpdateLatency updates the latency measurement
+func (p *PeerInfo) UpdateLatency(latency time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Latency = latency
+	p.LastSeen = time.Now()
+}
+
+// UpdatePacketLoss updates the packet loss rate
+func (p *PeerInfo) UpdatePacketLoss(loss float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.PacketLoss = loss
+}
+
+// SetConnected marks the peer as connected via P2P
+func (p *PeerInfo) SetConnected(connected bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Connected = connected
+	if connected {
+		p.ThroughServer = false
+	}
+}
+
+// SetThroughServer marks traffic as going through server
+func (p *PeerInfo) SetThroughServer(through bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ThroughServer = through
+}
+
+// AddRelayPeer adds a peer that can relay traffic to this peer
+func (p *PeerInfo) AddRelayPeer(relayIP net.IP) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	// Check if already in list
+	for _, ip := range p.RelayPeers {
+		if ip.Equal(relayIP) {
+			return
+		}
+	}
+	
+	p.RelayPeers = append(p.RelayPeers, relayIP)
+}
+
+// GetQualityScore returns a quality score for this peer (0-100, higher is better)
+func (p *PeerInfo) GetQualityScore() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	// Base score
+	score := 100
+	
+	// Deduct for latency (every 10ms reduces score by 5)
+	latencyPenalty := int(p.Latency.Milliseconds() / 10 * 5)
+	score -= latencyPenalty
+	
+	// Deduct for packet loss (1% loss = 10 points)
+	lossPenalty := int(p.PacketLoss * 1000)
+	score -= lossPenalty
+	
+	// Bonus for direct P2P connection
+	if p.Connected {
+		score += 20
+	}
+	
+	// Penalty for going through server
+	if p.ThroughServer {
+		score -= 30
+	}
+	
+	// Ensure score is in valid range
+	if score < 0 {
+		score = 0
+	}
+	if score > 100 {
+		score = 100
+	}
+	
+	return score
+}
+
+// IsStale checks if peer information is stale
+func (p *PeerInfo) IsStale(timeout time.Duration) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return time.Since(p.LastSeen) > timeout
+}
+
+// Clone creates a copy of peer info for safe reading
+func (p *PeerInfo) Clone() *PeerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	clone := &PeerInfo{
+		TunnelIP:      p.TunnelIP,
+		PublicAddr:    p.PublicAddr,
+		LocalAddr:     p.LocalAddr,
+		LastSeen:      p.LastSeen,
+		Latency:       p.Latency,
+		PacketLoss:    p.PacketLoss,
+		Connected:     p.Connected,
+		ThroughServer: p.ThroughServer,
+		RelayPeers:    make([]net.IP, len(p.RelayPeers)),
+	}
+	copy(clone.RelayPeers, p.RelayPeers)
+	
+	return clone
+}

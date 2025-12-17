@@ -25,6 +25,14 @@ type Config struct {
 	MultiClient   bool   `json:"multi_client"`   // Enable multi-client support (server mode, default true)
 	MaxClients    int    `json:"max_clients"`    // Maximum number of concurrent clients (default 100)
 	ClientIsolation bool `json:"client_isolation"` // Enable client isolation (clients cannot communicate with each other)
+	
+	// P2P and routing configuration
+	P2PEnabled         bool   `json:"p2p_enabled"`          // Enable P2P direct connections (default true)
+	P2PPort            int    `json:"p2p_port"`             // UDP port for P2P connections (default 0 = auto)
+	EnableMeshRouting  bool   `json:"enable_mesh_routing"`  // Enable mesh routing through other clients (default true)
+	MaxHops            int    `json:"max_hops"`             // Maximum hops for mesh routing (default 3)
+	RouteUpdateInterval int   `json:"route_update_interval"` // Route quality check interval in seconds (default 30)
+	P2PTimeout         int    `json:"p2p_timeout"`          // P2P connection timeout in seconds (default 5)
 }
 
 // DefaultConfig returns a default configuration
@@ -41,9 +49,15 @@ func DefaultConfig() *Config {
 		KeepaliveInterval: 10,
 		SendQueueSize:     1000,
 		RecvQueueSize:     1000,
-		MultiClient:       true,
-		MaxClients:        100,
-		ClientIsolation:   false,
+		MultiClient:         true,
+		MaxClients:          100,
+		ClientIsolation:     false,
+		P2PEnabled:          true,
+		P2PPort:             0,  // Auto-select
+		EnableMeshRouting:   true,
+		MaxHops:             3,
+		RouteUpdateInterval: 30,
+		P2PTimeout:          5,
 	}
 }
 
@@ -90,6 +104,15 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.MaxClients == 0 {
 		config.MaxClients = 100
 	}
+	if config.MaxHops == 0 {
+		config.MaxHops = 3
+	}
+	if config.RouteUpdateInterval == 0 {
+		config.RouteUpdateInterval = 30
+	}
+	if config.P2PTimeout == 0 {
+		config.P2PTimeout = 5
+	}
 	
 	// Default multi_client to true for server mode if not explicitly set
 	// This matches the command-line default and expected behavior
@@ -97,6 +120,14 @@ func LoadConfig(filename string) (*Config, error) {
 		if _, exists := rawConfig["multi_client"]; !exists {
 			config.MultiClient = true
 		}
+	}
+	
+	// Default P2P and mesh routing to true if not explicitly set
+	if _, exists := rawConfig["p2p_enabled"]; !exists {
+		config.P2PEnabled = true
+	}
+	if _, exists := rawConfig["enable_mesh_routing"]; !exists {
+		config.EnableMeshRouting = true
 	}
 
 	return &config, nil

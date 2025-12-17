@@ -31,6 +31,11 @@ func main() {
 	multiClient := flag.Bool("multi-client", true, "Enable multi-client support (server mode)")
 	maxClients := flag.Int("max-clients", 100, "Maximum number of concurrent clients (server mode)")
 	clientIsolation := flag.Bool("client-isolation", false, "Enable client isolation mode (clients cannot communicate with each other)")
+	p2pEnabled := flag.Bool("p2p", true, "Enable P2P direct connections")
+	p2pPort := flag.Int("p2p-port", 0, "UDP port for P2P connections (0 = auto)")
+	enableMeshRouting := flag.Bool("mesh-routing", true, "Enable mesh routing through other clients")
+	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
+	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS encryption")
@@ -67,24 +72,30 @@ func main() {
 	} else {
 		// Use command line arguments
 		cfg = &config.Config{
-			Mode:              *mode,
-			LocalAddr:         *localAddr,
-			RemoteAddr:        *remoteAddr,
-			TunnelAddr:        *tunnelAddr,
-			MTU:               *mtu,
-			FECDataShards:     *fecData,
-			FECParityShards:   *fecParity,
-			Timeout:           30,
-			KeepaliveInterval: 10,
-			SendQueueSize:     *sendQueueSize,
-			RecvQueueSize:     *recvQueueSize,
-			TLSEnabled:        *tlsEnabled,
-			TLSCertFile:       *tlsCertFile,
-			TLSKeyFile:        *tlsKeyFile,
-			TLSSkipVerify:     *tlsSkipVerify,
-			MultiClient:       *multiClient,
-			MaxClients:        *maxClients,
-			ClientIsolation:   *clientIsolation,
+			Mode:                *mode,
+			LocalAddr:           *localAddr,
+			RemoteAddr:          *remoteAddr,
+			TunnelAddr:          *tunnelAddr,
+			MTU:                 *mtu,
+			FECDataShards:       *fecData,
+			FECParityShards:     *fecParity,
+			Timeout:             30,
+			KeepaliveInterval:   10,
+			SendQueueSize:       *sendQueueSize,
+			RecvQueueSize:       *recvQueueSize,
+			TLSEnabled:          *tlsEnabled,
+			TLSCertFile:         *tlsCertFile,
+			TLSKeyFile:          *tlsKeyFile,
+			TLSSkipVerify:       *tlsSkipVerify,
+			MultiClient:         *multiClient,
+			MaxClients:          *maxClients,
+			ClientIsolation:     *clientIsolation,
+			P2PEnabled:          *p2pEnabled,
+			P2PPort:             *p2pPort,
+			EnableMeshRouting:   *enableMeshRouting,
+			MaxHops:             *maxHops,
+			RouteUpdateInterval: *routeUpdateInterval,
+			P2PTimeout:          5,
 		}
 	}
 
