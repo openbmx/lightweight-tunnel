@@ -155,6 +155,7 @@ func (t *Tunnel) connectClient() error {
 		log.Println("TLS encryption enabled")
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: t.config.TLSSkipVerify,
+			MinVersion:         tls.VersionTLS12,
 		}
 		
 		if t.config.TLSSkipVerify {
@@ -187,7 +188,7 @@ func (t *Tunnel) listenServer() error {
 		log.Println("TLS encryption enabled")
 		
 		if t.config.TLSCertFile == "" || t.config.TLSKeyFile == "" {
-			return errors.New("TLS enabled but certificate or key file not specified")
+			return errors.New("TLS enabled but tls_cert_file or tls_key_file not specified in configuration")
 		}
 		
 		cert, err := tls.LoadX509KeyPair(t.config.TLSCertFile, t.config.TLSKeyFile)

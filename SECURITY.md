@@ -328,12 +328,12 @@ openssl req -x509 -newkey rsa:4096 -keyout client.key -out client.crt -days 365 
 
 ## Reporting Security Issues
 
-If you discover a security vulnerability, please email: security@example.com
+If you discover a security vulnerability, please report it by creating a private security advisory on GitHub or by opening an issue with the `security` label.
 
-**Do not** create public GitHub issues for security vulnerabilities.
+**Do not** include exploit details in public issues - use GitHub's security advisory feature for sensitive reports.
 
 ## 报告安全问题
 
-如果您发现安全漏洞，请发送电子邮件至：security@example.com
+如果您发现安全漏洞，请通过在 GitHub 上创建私有安全公告或创建带有 `security` 标签的 issue 来报告。
 
-**不要**为安全漏洞创建公开的 GitHub issue。
+**不要**在公开 issue 中包含漏洞利用详情 - 使用 GitHub 的安全公告功能报告敏感信息。

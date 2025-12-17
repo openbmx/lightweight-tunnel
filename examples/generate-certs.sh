@@ -35,8 +35,7 @@ openssl req -x509 -newkey rsa:4096 \
     -out "$CERT_DIR/server.crt" \
     -days "$DAYS_VALID" \
     -nodes \
-    -subj "/CN=$SERVER_NAME" \
-    2>/dev/null
+    -subj "/CN=$SERVER_NAME"
 
 # Set appropriate permissions
 chmod 600 "$CERT_DIR/server.key"
