@@ -16,18 +16,54 @@ go build -o bin/lightweight-tunnel ./cmd/lightweight-tunnel
 
 ## Basic Usage
 
+### ⚠️ Security First
+
+**IMPORTANT**: By default, tunnel traffic is **NOT encrypted**. ISPs and network operators can view all content.
+
+**For secure communication, always use TLS:**
+```bash
+# Server with TLS
+sudo ./bin/lightweight-tunnel -m server -tls -tls-cert server.crt -tls-key server.key
+
+# Client with TLS  
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -tls
+```
+
+See [examples/TLS-GUIDE.md](examples/TLS-GUIDE.md) for detailed TLS setup instructions.
+
 ### Server Setup
 
+**Without TLS (insecure):**
 ```bash
 # Start server (requires root for TUN device)
 sudo ./bin/lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
 ```
 
+**With TLS (recommended):**
+```bash
+# Generate test certificates first
+./examples/generate-certs.sh
+
+# Start server with TLS
+sudo ./bin/lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 \
+  -tls -tls-cert certs/server.crt -tls-key certs/server.key
+```
+
 ### Client Setup
 
+**Without TLS (insecure):**
 ```bash
 # Start client (replace SERVER_IP with your server's IP)
 sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.2/24
+```
+
+**With TLS (recommended):**
+```bash
+# With self-signed certificates (testing)
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.2/24 -tls -tls-skip-verify
+
+# With valid certificates (production)
+sudo ./bin/lightweight-tunnel -m client -r SERVER_IP:9000 -t 10.0.0.2/24 -tls
 ```
 
 ### Test Connection

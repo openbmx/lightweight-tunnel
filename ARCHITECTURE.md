@@ -169,13 +169,13 @@ JSON-based configuration with sensible defaults:
 ### Current Implementation
 
 - **TCP Disguise**: Helps bypass simple firewall rules that block UDP
-- **No Encryption**: Data is transmitted in plaintext
-- **No Authentication**: No verification of peer identity
+- **TLS Encryption**: Optional TLS 1.2+ encryption for data confidentiality
+- **No Authentication**: Pre-shared key auth not yet implemented (coming soon)
 
 ### Recommendations for Production
 
-1. **Add TLS/SSL**: Wrap TCP connection in TLS for encryption
-2. **Authentication**: Implement pre-shared key or certificate-based auth
+1. **✅ Enable TLS/SSL**: Always use TLS encryption in production
+2. **Authentication**: Use certificate-based authentication
 3. **Rate Limiting**: Prevent DoS attacks
 4. **Connection Limits**: Limit number of connections per IP
 5. **Packet Validation**: Validate packet sizes and types
@@ -212,13 +212,14 @@ JSON-based configuration with sensible defaults:
 
 1. **Multi-client Support**: Server accepts multiple clients
 2. **IPv6 Support**: Add IPv6 packet handling
-3. **Encryption**: Built-in TLS/encryption support
-4. **Authentication**: Pre-shared key or certificate auth
+3. **Pre-shared Key Auth**: Implement PSK authentication
+4. **Certificate-based Auth**: Mutual TLS authentication
 5. **Better FEC**: Implement proper Reed-Solomon codes
 6. **NAT Traversal**: Add UDP hole punching or relay support
 7. **Bandwidth Management**: QoS and rate limiting
 8. **Statistics**: Real-time connection statistics and monitoring
 9. **Cross-platform**: Support for macOS and Windows
+10. **Traffic Obfuscation**: Additional obfuscation beyond TLS
 
 ## Testing Strategy
 

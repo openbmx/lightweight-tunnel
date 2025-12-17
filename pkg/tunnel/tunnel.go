@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -146,7 +147,27 @@ func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
 	
 	timeout := time.Duration(t.config.Timeout) * time.Second
-	conn, err := tcp_disguise.DialTCP(t.config.RemoteAddr, timeout)
+	
+	var conn *tcp_disguise.Conn
+	var err error
+	
+	if t.config.TLSEnabled {
+		log.Println("TLS encryption enabled")
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: t.config.TLSSkipVerify,
+			MinVersion:         tls.VersionTLS12,
+		}
+		
+		if t.config.TLSSkipVerify {
+			log.Println("WARNING: TLS certificate verification disabled (insecure)")
+		}
+		
+		conn, err = tcp_disguise.DialTLS(t.config.RemoteAddr, timeout, tlsConfig)
+	} else {
+		log.Println("WARNING: TLS encryption disabled - traffic is sent in plaintext and can be inspected by ISPs")
+		conn, err = tcp_disguise.DialTCP(t.config.RemoteAddr, timeout)
+	}
+	
 	if err != nil {
 		return err
 	}
@@ -160,7 +181,32 @@ func (t *Tunnel) connectClient() error {
 func (t *Tunnel) listenServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 	
-	listener, err := tcp_disguise.ListenTCP(t.config.LocalAddr)
+	var listener *tcp_disguise.Listener
+	var err error
+	
+	if t.config.TLSEnabled {
+		log.Println("TLS encryption enabled")
+		
+		if t.config.TLSCertFile == "" || t.config.TLSKeyFile == "" {
+			return errors.New("TLS enabled but tls_cert_file or tls_key_file not specified in configuration")
+		}
+		
+		cert, err := tls.LoadX509KeyPair(t.config.TLSCertFile, t.config.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to load TLS certificate: %v", err)
+		}
+		
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		
+		listener, err = tcp_disguise.ListenTLS(t.config.LocalAddr, tlsConfig)
+	} else {
+		log.Println("WARNING: TLS encryption disabled - traffic is sent in plaintext and can be inspected by ISPs")
+		listener, err = tcp_disguise.ListenTCP(t.config.LocalAddr)
+	}
+	
 	if err != nil {
 		return err
 	}

@@ -28,6 +28,10 @@ func main() {
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
+	tlsEnabled := flag.Bool("tls", false, "Enable TLS encryption")
+	tlsCertFile := flag.String("tls-cert", "", "TLS certificate file (server mode)")
+	tlsKeyFile := flag.String("tls-key", "", "TLS private key file (server mode)")
+	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "Skip TLS certificate verification (client mode, insecure)")
 
 	flag.Parse()
 
@@ -67,6 +71,10 @@ func main() {
 			FECParityShards:   *fecParity,
 			Timeout:           30,
 			KeepaliveInterval: 10,
+			TLSEnabled:        *tlsEnabled,
+			TLSCertFile:       *tlsCertFile,
+			TLSKeyFile:        *tlsKeyFile,
+			TLSSkipVerify:     *tlsSkipVerify,
 		}
 	}
 
@@ -86,6 +94,12 @@ func main() {
 	log.Printf("Tunnel Address: %s", cfg.TunnelAddr)
 	log.Printf("MTU: %d", cfg.MTU)
 	log.Printf("FEC: %d data + %d parity shards", cfg.FECDataShards, cfg.FECParityShards)
+	log.Printf("TLS Encryption: %v", cfg.TLSEnabled)
+	if !cfg.TLSEnabled {
+		log.Println("⚠️  WARNING: TLS disabled - traffic will be sent in PLAINTEXT")
+		log.Println("⚠️  ISPs and network operators can view and log all tunnel content")
+		log.Println("⚠️  Enable TLS with -tls flag for secure communication")
+	}
 
 	// Create tunnel
 	tun, err := tunnel.NewTunnel(cfg)
@@ -130,6 +144,13 @@ func validateConfig(cfg *config.Config) error {
 
 	if cfg.FECDataShards < 1 || cfg.FECParityShards < 1 {
 		return fmt.Errorf("FEC shards must be positive")
+	}
+
+	// TLS validation
+	if cfg.TLSEnabled && cfg.Mode == "server" {
+		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
+			return fmt.Errorf("TLS enabled in server mode but certificate or key file not specified")
+		}
 	}
 
 	return nil

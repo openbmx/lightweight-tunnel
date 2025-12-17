@@ -8,7 +8,7 @@
   "fec_parity": 3,
   "timeout": 30,
   "keepalive": 10,
-  "tls_enabled": false,
-  "tls_cert_file": "/path/to/server.crt",
-  "tls_key_file": "/path/to/server.key"
+  "tls_enabled": true,
+  "tls_cert_file": "/etc/lightweight-tunnel/server.crt",
+  "tls_key_file": "/etc/lightweight-tunnel/server.key"
 }

@@ -16,6 +16,10 @@ type Config struct {
 	FECParityShards int  `json:"fec_parity"`     // Number of FEC parity shards
 	Timeout       int    `json:"timeout"`        // Connection timeout in seconds
 	KeepaliveInterval int `json:"keepalive"`    // Keepalive interval in seconds
+	TLSEnabled    bool   `json:"tls_enabled"`    // Enable TLS encryption
+	TLSCertFile   string `json:"tls_cert_file"`  // Path to TLS certificate file (server mode)
+	TLSKeyFile    string `json:"tls_key_file"`   // Path to TLS private key file (server mode)
+	TLSSkipVerify bool   `json:"tls_skip_verify"` // Skip TLS certificate verification (client mode, insecure)
 }
 
 // DefaultConfig returns a default configuration

@@ -8,6 +8,6 @@
   "fec_parity": 3,
   "timeout": 30,
   "keepalive": 10,
-  "tls_enabled": false,
+  "tls_enabled": true,
   "tls_skip_verify": false
 }

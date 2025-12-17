@@ -1,6 +1,7 @@
 package tcp_disguise
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -39,9 +40,31 @@ func DialTCP(address string, timeout time.Duration) (*Conn, error) {
 	return NewConn(conn), nil
 }
 
+// DialTLS establishes a TLS-encrypted TCP connection
+func DialTLS(address string, timeout time.Duration, tlsConfig *tls.Config) (*Conn, error) {
+	dialer := &net.Dialer{
+		Timeout: timeout,
+	}
+	
+	conn, err := tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	return NewConn(conn), nil
+}
+
 // ListenTCP listens on a TCP port for disguised connections
 func ListenTCP(address string) (*Listener, error) {
 	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	return &Listener{listener: listener}, nil
+}
+
+// ListenTLS listens on a TCP port with TLS encryption
+func ListenTLS(address string, tlsConfig *tls.Config) (*Listener, error) {
+	listener, err := tls.Listen("tcp", address, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
