@@ -89,7 +89,7 @@ sudo /usr/local/bin/lightweight-tunnel -service install -c /etc/lightweight-tunn
 #    可选：自定义服务名与配置路径
 # sudo /usr/local/bin/lightweight-tunnel -service install \\
 #      -service-name tunnel-a \\
-#      -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/...json
+#      -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/lightweight-tunnel/tunnel-a.json
 
 # 4) 控制命令
 sudo /usr/local/bin/lightweight-tunnel -service status
