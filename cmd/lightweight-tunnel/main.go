@@ -20,10 +20,9 @@ var (
 	version                  = "1.0.0"
 	defaultServiceConfigPath = "/etc/lightweight-tunnel/config.json"
 	serviceDir               = "/etc/systemd/system"
-	runCommand               = func(name string, args ...string) ([]byte, error) {
-		return exec.Command(name, args...).CombinedOutput()
-	}
 )
+
+type commandRunner func(name string, args ...string) ([]byte, error)
 
 func main() {
 	// Command line flags
@@ -250,12 +249,20 @@ func generateConfigFile(filename string) error {
 }
 
 func manageService(action, serviceName, configPath string) error {
+	return manageServiceWithRunner(action, serviceName, configPath, serviceDir, defaultCommandRunner)
+}
+
+func manageServiceWithRunner(action, serviceName, configPath, dir string, runner commandRunner) error {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+
 	if serviceName == "" {
 		return fmt.Errorf("service name is required")
 	}
 
 	unitName := normalizeServiceName(serviceName)
-	unitFile := filepath.Join(serviceDir, unitName)
+	unitFile := filepath.Join(dir, unitName)
 
 	switch action {
 	case "install":
@@ -304,23 +311,19 @@ WantedBy=multi-user.target
 			{"systemctl", "enable", unitName},
 			{"systemctl", "start", unitName},
 		}
-		return runCommands(commands)
+		return runCommands(runner, commands)
 
 	case "uninstall":
-		if out, err := runCommand("systemctl", "stop", unitName); err != nil {
-			log.Printf("Warning: failed to stop service %s: %v: %s", unitName, err, string(out))
-		}
-		if out, err := runCommand("systemctl", "disable", unitName); err != nil {
-			log.Printf("Warning: failed to disable service %s: %v: %s", unitName, err, string(out))
-		}
+		logSystemctlWarning(runner, "stop", unitName)
+		logSystemctlWarning(runner, "disable", unitName)
 		if err := os.Remove(unitFile); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove service file: %w", err)
 		}
-		_, err := runCommand("systemctl", "daemon-reload")
+		_, err := runner("systemctl", "daemon-reload")
 		return err
 
 	case "start", "stop", "restart", "status":
-		out, err := runCommand("systemctl", action, unitName)
+		out, err := runner("systemctl", action, unitName)
 		if err != nil {
 			return fmt.Errorf("systemctl %s failed: %v: %s", action, err, string(out))
 		}
@@ -340,12 +343,22 @@ func normalizeServiceName(name string) string {
 	return name + ".service"
 }
 
-func runCommands(commands [][]string) error {
+func runCommands(runner commandRunner, commands [][]string) error {
 	for _, cmd := range commands {
-		out, err := runCommand(cmd[0], cmd[1:]...)
+		out, err := runner(cmd[0], cmd[1:]...)
 		if err != nil {
-			return fmt.Errorf("%s %s failed: %v: %s", cmd[0], strings.Join(cmd[1:], " "), err, string(out))
+			return fmt.Errorf("%s %s failed: %v (output: %s)", cmd[0], strings.Join(cmd[1:], " "), err, strings.TrimSpace(string(out)))
 		}
 	}
 	return nil
+}
+
+func logSystemctlWarning(runner commandRunner, action, unitName string) {
+	if out, err := runner("systemctl", action, unitName); err != nil {
+		log.Printf("Warning: systemctl %s %s failed: %v (output: %s)", action, unitName, err, strings.TrimSpace(string(out)))
+	}
+}
+
+func defaultCommandRunner(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
 }

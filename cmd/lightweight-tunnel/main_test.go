@@ -15,19 +15,13 @@ func TestManageServiceInstallCreatesUnitFile(t *testing.T) {
 		t.Fatalf("failed to write config: %v", err)
 	}
 
-	originalDir := serviceDir
-	serviceDir = tmp
-	defer func() { serviceDir = originalDir }()
-
 	var executed [][]string
-	originalRunner := runCommand
-	runCommand = func(name string, args ...string) ([]byte, error) {
+	runner := func(name string, args ...string) ([]byte, error) {
 		executed = append(executed, append([]string{name}, args...))
 		return []byte("ok"), nil
 	}
-	defer func() { runCommand = originalRunner }()
 
-	if err := manageService("install", "my-tunnel", configPath); err != nil {
+	if err := manageServiceWithRunner("install", "my-tunnel", configPath, tmp, runner); err != nil {
 		t.Fatalf("install failed: %v", err)
 	}
 
@@ -58,14 +52,12 @@ func TestManageServiceInstallCreatesUnitFile(t *testing.T) {
 
 func TestManageServiceNormalizesNames(t *testing.T) {
 	var executed [][]string
-	originalRunner := runCommand
-	runCommand = func(name string, args ...string) ([]byte, error) {
+	runner := func(name string, args ...string) ([]byte, error) {
 		executed = append(executed, append([]string{name}, args...))
 		return nil, nil
 	}
-	defer func() { runCommand = originalRunner }()
 
-	if err := manageService("restart", "custom.service", ""); err != nil {
+	if err := manageServiceWithRunner("restart", "custom.service", "", t.TempDir(), runner); err != nil {
 		t.Fatalf("restart failed: %v", err)
 	}
 
