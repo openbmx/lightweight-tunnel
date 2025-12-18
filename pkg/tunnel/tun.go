@@ -30,8 +30,9 @@ type ifreq struct {
 
 // CreateTUN creates a new TUN device
 func CreateTUN(name string) (*TunDevice, error) {
-	// Open TUN device
-	file, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	// Open TUN device using syscall to avoid Go's runtime poller
+	// This prevents "not pollable" errors on some systems/kernels
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /dev/net/tun: %v", err)
 	}
@@ -42,15 +43,15 @@ func CreateTUN(name string) (*TunDevice, error) {
 	ifr.Flags = IFF_TUN | IFF_NO_PI
 
 	// Create TUN device using ioctl
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TUNSETIFF), uintptr(unsafe.Pointer(&ifr)))
 	if errno != 0 {
-		file.Close()
+		syscall.Close(fd)
 		return nil, fmt.Errorf("failed to create TUN device: %v", errno)
 	}
 	
-	// Keep file descriptor in BLOCKING mode for proper Read/Write operations
-	// Non-blocking mode would require proper epoll/select handling which is not implemented
-	// Blocking mode works correctly with goroutines and allows clean shutdown via Close()
+	// Create os.File from file descriptor
+	// Since fd was opened in blocking mode, os.NewFile will not register it with the poller
+	file := os.NewFile(uintptr(fd), "/dev/net/tun")
 
 	// Get actual device name (may differ if name was in use)
 	actualName := string(ifr.Name[:])
