@@ -38,7 +38,10 @@ func TestManageServiceInstallCreatesUnitFile(t *testing.T) {
 	}
 
 	content := string(data)
-	absConfig, _ := filepath.Abs(configPath)
+	absConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		t.Fatalf("failed to resolve absolute config path: %v", err)
+	}
 	if !strings.Contains(content, absConfig) {
 		t.Fatalf("unit file does not reference config path: %s", content)
 	}
