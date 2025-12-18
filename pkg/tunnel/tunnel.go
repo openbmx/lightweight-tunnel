@@ -886,12 +886,8 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						// Store this client's peer info for future clients
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
-						otherClients := len(t.clients) - 1
-						if otherClients < 0 {
-							otherClients = 0
-						}
 						peerInfos := make([]string, 0, len(t.clients))
-						broadcastTargets := make([]*ClientConnection, 0, otherClients)
+						broadcastTargets := make([]*ClientConnection, 0, len(t.clients))
 						for _, existing := range t.clients {
 							if existing == client {
 								continue
