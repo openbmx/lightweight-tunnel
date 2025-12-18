@@ -65,7 +65,7 @@ func main() {
 	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
 	tunName := flag.String("tun", "", "TUN device name (empty = auto assign)")
-	advertisedRoutes := flag.String("routes", "", "Comma-separated CIDR ranges that should be reachable through this node (forwarded to peers via server)")
+	advertisedRoutes := flag.String("routes", "", "Comma-separated CIDR ranges reachable through this node (advertised to the server for routing)")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	serviceAction := flag.String("service", "", "Manage systemd service: install|uninstall|start|stop|restart|status")

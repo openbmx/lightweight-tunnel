@@ -41,7 +41,7 @@ func parseCIDRList(routes []string) (valid []*net.IPNet, invalid []string) {
 			continue
 		}
 		_, ipNet, err := net.ParseCIDR(r)
-		if err != nil || ipNet == nil || ipNet.IP.To4() == nil {
+		if err != nil || ipNet.IP.To4() == nil {
 			invalid = append(invalid, r)
 			continue
 		}

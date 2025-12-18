@@ -393,6 +393,13 @@ func (t *Tunnel) getClientForDestination(dstIP net.IP) *ClientConnection {
 	t.clientsMux.RLock()
 	client := t.clients[bestClientIP]
 	t.clientsMux.RUnlock()
+
+	if client == nil {
+		// Clean up stale route entry if the client disconnected between lookups
+		t.routeMux.Lock()
+		delete(t.clientRoutes, bestClientIP)
+		t.routeMux.Unlock()
+	}
 	return client
 }
 
@@ -402,16 +409,17 @@ func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
 	if len(invalid) > 0 {
 		log.Printf("Ignoring invalid advertised routes from %s: %v", clientIP, invalid)
 	}
+	routeCount := len(valid)
 
 	t.routeMux.Lock()
-	if len(valid) == 0 {
+	defer t.routeMux.Unlock()
+
+	if routeCount == 0 {
 		delete(t.clientRoutes, clientIP.String())
-		t.routeMux.Unlock()
 		return
 	}
 	t.clientRoutes[clientIP.String()] = valid
-	t.routeMux.Unlock()
-	log.Printf("Registered %d advertised route(s) for client %s", len(valid), clientIP)
+	log.Printf("Registered %d advertised route(s) for client %s", routeCount, clientIP)
 }
 
 // removeClientRoutes removes all advertised routes for a client
@@ -1505,6 +1513,7 @@ func (t *Tunnel) announceRoutes() {
 	for _, n := range valid {
 		routeStrings = append(routeStrings, n.String())
 	}
+	routeCount := len(routeStrings)
 
 	payloadStr := fmt.Sprintf("%s|%s", t.myTunnelIP.String(), strings.Join(routeStrings, ","))
 	fullPacket := make([]byte, len(payloadStr)+1)
@@ -1513,12 +1522,12 @@ func (t *Tunnel) announceRoutes() {
 
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
-		log.Printf("Failed to encrypt route announcement: %v", err)
+		log.Printf("Failed to encrypt route announcement for %s (%d routes): %v", t.myTunnelIP, routeCount, err)
 		return
 	}
 
 	if err := t.conn.WritePacket(encryptedPacket); err != nil {
-		log.Printf("Failed to send route announcement: %v", err)
+		log.Printf("Failed to send route announcement for %s (%d routes): %v", t.myTunnelIP, routeCount, err)
 	}
 }
 
