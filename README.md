@@ -71,6 +71,26 @@ go build -o lightweight-tunnel ./cmd/lightweight-tunnel
 go install ./cmd/lightweight-tunnel
 ```
 
+### 作为系统服务运行（开机自启）
+
+```bash
+# 准备配置（示例路径，需 root）
+sudo mkdir -p /etc/lightweight-tunnel
+sudo ./lightweight-tunnel -g /etc/lightweight-tunnel/config.json
+
+# 安装并启动 systemd 服务
+sudo ./lightweight-tunnel -service install -c /etc/lightweight-tunnel/config.json
+
+# 控制命令（控制面板入口）
+sudo ./lightweight-tunnel -service status
+sudo ./lightweight-tunnel -service restart
+sudo ./lightweight-tunnel -service uninstall   # 需要时移除服务
+```
+
+说明：
+- 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name` 自定义，多隧道部署时为每个配置指定不同名称。
+- 服务使用指定的配置文件开机自启，配置更新后运行 `sudo systemctl restart <服务名>` 生效。
+
 ### 基本使用
 
 #### 场景一：带加密的安全隧道（推荐）
@@ -275,6 +295,10 @@ sudo ./lightweight-tunnel -c config.json
 | `-tls-cert` | TLS 证书文件（服务端） | - |
 | `-tls-key` | TLS 私钥文件（服务端） | - |
 | `-tls-skip-verify` | 跳过证书验证（客户端，不安全） | false |
+| `-tun` | 指定 TUN 设备名（为空则自动分配 tun0、tun1...） | - |
+| `-service` | systemd 服务操作：install/uninstall/start/stop/restart/status | - |
+| `-service-name` | systemd 服务名 | lightweight-tunnel |
+| `-service-config` | 安装/控制服务使用的配置文件路径 | /etc/lightweight-tunnel/config.json |
 | `-v` | 显示版本 | - |
 | `-g` | 生成示例配置文件 | - |
 
@@ -472,6 +496,16 @@ sudo kill -9 PID
 - P2P 流量不使用 TCP 伪装（使用纯 UDP），但仍然加密
 - P2P 需要 UDP 端口支持（可能被防火墙阻止）
 - TCP 伪装可能被深度包检测（DPI）识破
+
+## 多隧道场景与 TUN 设备
+
+- 留空 `-tun` 或配置中的 `tun_name` 时，内核会自动分配 `tun0`、`tun1`、`tun2`……可同时运行多个实例/服务。
+- 如果需要固定名称，给每条隧道设置不同的 `tun_name`（例如 `tun-b`、`tun-c`、`tun-d`），避免与其他进程冲突。
+- 配合 `-service-name` 运行多个 systemd 服务即可实现多隧道自启动，例如：
+  - `sudo ./lightweight-tunnel -service install -service-name tunnel-b -c /etc/lightweight-tunnel/b.json`
+  - `sudo ./lightweight-tunnel -service install -service-name tunnel-c -c /etc/lightweight-tunnel/c.json`
+  - `sudo ./lightweight-tunnel -service install -service-name tunnel-d -c /etc/lightweight-tunnel/d.json`
+  每个配置中可设置不同的远端 IP/端口（如 19000/29000/39000）和网段（10.0.0.1/24、10.0.1.1/24、10.0.2.1/24），对应的 TUN 设备会分别创建。
 
 ## 为什么不用真正的 TCP？
 

@@ -157,7 +157,7 @@ func (t *Tunnel) Start() error {
 	// Use empty string to let kernel automatically assign device name (tun0, tun1, etc.)
 	// This follows standard Linux TUN/TAP practices and prevents conflicts when multiple instances are running
 	// The actual assigned device name is logged below and accessible via tunDev.Name()
-	tunDev, err := CreateTUN("")
+	tunDev, err := CreateTUN(t.config.TunName)
 	if err != nil {
 		return fmt.Errorf("failed to create TUN device: %v", err)
 	}
