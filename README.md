@@ -326,6 +326,33 @@ sudo ./lightweight-tunnel -m client -r <SERVER_IP>:9000 -t 10.0.0.2/24 \
 
 > 说明：当前路由广播由客户端上报给服务端后用于服务端转发路径（包含客户端之间的转发），P2P 广播仅记录日志，不会直接更新路由表。
 
+使用配置文件示例：
+
+```json
+// server.json
+{
+  "mode": "server",
+  "local_addr": "0.0.0.0:9000",
+  "tunnel_addr": "10.0.0.1/24",
+  "key": "your-secret-key",
+  "advertised_routes": []
+}
+```
+
+```json
+// client.json
+{
+  "mode": "client",
+  "remote_addr": "<服务器IP>:9000",
+  "tunnel_addr": "10.0.0.2/24",
+  "key": "your-secret-key",
+  "advertised_routes": [
+    "192.168.1.0/24",
+    "10.10.0.0/16"
+  ]
+}
+```
+
 ### 多客户端配置选项
 
 **Hub 模式（默认，推荐带加密）：** 所有客户端可以互相通信
