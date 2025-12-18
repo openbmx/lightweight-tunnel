@@ -13,7 +13,8 @@ import (
 )
 
 var (
-	version = "1.0.0"
+	version                  = "1.0.0"
+	defaultServiceConfigPath = "/etc/lightweight-tunnel/config.json"
 )
 
 func main() {
@@ -36,8 +37,12 @@ func main() {
 	enableMeshRouting := flag.Bool("mesh-routing", true, "Enable mesh routing through other clients")
 	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
+	tunName := flag.String("tun", "", "TUN device name (empty = auto assign)")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
+	serviceAction := flag.String("service", "", "Manage systemd service: install|uninstall|start|stop|restart|status")
+	serviceName := flag.String("service-name", "lightweight-tunnel", "Systemd service name")
+	serviceConfig := flag.String("service-config", defaultServiceConfigPath, "Config file to bind with the system service (defaults to /etc/lightweight-tunnel/config.json)")
 	tlsEnabled := flag.Bool("tls", false, "Enable TLS encryption")
 	tlsCertFile := flag.String("tls-cert", "", "TLS certificate file (server mode)")
 	tlsKeyFile := flag.String("tls-key", "", "TLS private key file (server mode)")
@@ -58,6 +63,23 @@ func main() {
 			log.Fatalf("Failed to generate config: %v", err)
 		}
 		fmt.Printf("Generated config file: %s\n", *generateConfig)
+		return
+	}
+
+	// Manage system service
+	if *serviceAction != "" {
+		targetConfig := *configFile
+		if targetConfig == "" {
+			targetConfig = *serviceConfig
+		}
+
+		if targetConfig == "" {
+			log.Fatalf("Service config not provided. Use -c or -service-config to specify the config file.")
+		}
+
+		if err := manageService(*serviceAction, *serviceName, targetConfig); err != nil {
+			log.Fatalf("Service action failed: %v", err)
+		}
 		return
 	}
 
@@ -84,6 +106,7 @@ func main() {
 			KeepaliveInterval:   10,
 			SendQueueSize:       *sendQueueSize,
 			RecvQueueSize:       *recvQueueSize,
+			TunName:             *tunName,
 			Key:                 *key,
 			TLSEnabled:          *tlsEnabled,
 			TLSCertFile:         *tlsCertFile,
@@ -145,7 +168,7 @@ func main() {
 	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	
+
 	log.Println("Tunnel running. Press Ctrl+C to stop.")
 	<-sigCh
 
@@ -166,6 +189,10 @@ func validateConfig(cfg *config.Config) error {
 
 	if cfg.TunnelAddr == "" {
 		return fmt.Errorf("tunnel address required")
+	}
+
+	if len(cfg.TunName) > 15 {
+		return fmt.Errorf("TUN name too long (max 15 characters)")
 	}
 
 	if cfg.MTU < 500 || cfg.MTU > 9000 {
@@ -192,7 +219,7 @@ func generateConfigFile(filename string) error {
 	serverCfg.Mode = "server"
 	serverCfg.LocalAddr = "0.0.0.0:9000"
 	serverCfg.TunnelAddr = "10.0.0.1/24"
-	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY"  // Example key
+	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Example key
 
 	if err := config.SaveConfig(filename, serverCfg); err != nil {
 		return err
@@ -204,7 +231,7 @@ func generateConfigFile(filename string) error {
 	clientCfg.Mode = "client"
 	clientCfg.RemoteAddr = "SERVER_IP:9000"
 	clientCfg.TunnelAddr = "10.0.0.2/24"
-	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY"  // Must match server key
+	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Must match server key
 
 	if err := config.SaveConfig(clientFilename, clientCfg); err != nil {
 		return err
