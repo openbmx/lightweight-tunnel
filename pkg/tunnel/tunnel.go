@@ -887,16 +887,22 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
 						peerInfos := make([]string, 0, len(t.clients))
+						broadcastTargets := make([]*ClientConnection, 0, len(t.clients))
 						for _, existing := range t.clients {
-							if existing == client || existing.peerInfo == "" {
+							if existing == client {
 								continue
 							}
-							peerInfos = append(peerInfos, existing.peerInfo)
+							if existing.peerInfo != "" {
+								peerInfos = append(peerInfos, existing.peerInfo)
+							}
+							if existing.clientIP != nil {
+								broadcastTargets = append(broadcastTargets, existing)
+							}
 						}
 						t.clientsMux.Unlock()
 
 						// Broadcast this peer info to all other clients
-						t.broadcastPeerInfo(tunnelIP, peerInfoStr)
+						t.broadcastPeerInfo(tunnelIP, peerInfoStr, broadcastTargets)
 
 						// Send existing peers to this client so it learns about them
 						t.sendExistingPeersToClient(client, peerInfos)
@@ -1356,50 +1362,35 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 }
 
 // broadcastPeerInfo broadcasts peer information to all connected clients (server mode)
-func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
+func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string, targets []*ClientConnection) {
 	if !t.config.P2PEnabled {
 		return
 	}
 
-	// Create peer info packet
-	fullPacket := make([]byte, len(peerInfo)+1)
-	fullPacket[0] = PacketTypePeerInfo
-	copy(fullPacket[1:], []byte(peerInfo))
-
-	// Encrypt
-	encryptedPacket, err := t.encryptPacket(fullPacket)
+	encryptedPacket, err := t.buildPeerInfoPacket(peerInfo)
 	if err != nil {
 		log.Printf("Failed to encrypt peer info for broadcast: %v", err)
 		return
 	}
 
-	// Broadcast to all clients except the sender
-	t.clientsMux.RLock()
-	for _, client := range t.clients {
-		if client.clientIP != nil && !client.clientIP.Equal(newClientIP) {
-			// Send directly to network connection (bypass sendQueue which is for data packets)
-			// This avoids double-wrapping by clientNetWriter
-			if err := client.conn.WritePacket(encryptedPacket); err != nil {
-				log.Printf("Failed to broadcast peer info to %s: %v", client.clientIP, err)
-				// Signal this specific client to disconnect on write error
-				client.stopOnce.Do(func() {
-					close(client.stopCh)
-				})
-			} else {
-				log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
-			}
+	for _, client := range targets {
+		// Send directly to network connection (bypass sendQueue which is for data packets)
+		// This avoids double-wrapping by clientNetWriter
+		if err := client.conn.WritePacket(encryptedPacket); err != nil {
+			log.Printf("Failed to broadcast peer info to %s: %v", client.clientIP, err)
+			// Signal this specific client to disconnect on write error
+			client.stopOnce.Do(func() {
+				close(client.stopCh)
+			})
+		} else {
+			log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
 		}
 	}
-	t.clientsMux.RUnlock()
 }
 
 // sendPeerInfoPacket sends a single peer info packet to a specific client
 func (t *Tunnel) sendPeerInfoPacket(client *ClientConnection, peerInfo string) error {
-	fullPacket := make([]byte, len(peerInfo)+1)
-	fullPacket[0] = PacketTypePeerInfo
-	copy(fullPacket[1:], []byte(peerInfo))
-
-	encryptedPacket, err := t.encryptPacket(fullPacket)
+	encryptedPacket, err := t.buildPeerInfoPacket(peerInfo)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt peer info: %v", err)
 	}
@@ -1421,4 +1412,13 @@ func (t *Tunnel) sendExistingPeersToClient(target *ClientConnection, peerInfos [
 			log.Printf("Failed to send existing peer info to %s: %v", target.conn.RemoteAddr(), err)
 		}
 	}
+}
+
+// buildPeerInfoPacket builds and encrypts a peer info packet
+func (t *Tunnel) buildPeerInfoPacket(peerInfo string) ([]byte, error) {
+	fullPacket := make([]byte, len(peerInfo)+1)
+	fullPacket[0] = PacketTypePeerInfo
+	copy(fullPacket[1:], []byte(peerInfo))
+
+	return t.encryptPacket(fullPacket)
 }
