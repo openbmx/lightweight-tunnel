@@ -229,26 +229,22 @@ func (t *Tunnel) Stop() {
 		}
 	}
 	
-	// Close all client connections (server mode)
+	// Close all client connections and signal client goroutines (server mode)
 	t.clientsMux.Lock()
 	for _, client := range t.clients {
+		// Close connection first
 		if err := client.conn.Close(); err != nil {
 			log.Printf("Error closing client connection: %v", err)
 		}
-	}
-	t.clientsMux.Unlock()
-	
-	// Signal all goroutines to stop (including clients)
-	close(t.stopCh)
-	
-	// Signal individual client goroutines to stop
-	t.clientsMux.Lock()
-	for _, client := range t.clients {
+		// Then signal client goroutines to stop
 		client.stopOnce.Do(func() {
 			close(client.stopCh)
 		})
 	}
 	t.clientsMux.Unlock()
+	
+	// Signal all tunnel goroutines to stop
+	close(t.stopCh)
 	
 	// Stop P2P manager
 	if t.p2pManager != nil {
