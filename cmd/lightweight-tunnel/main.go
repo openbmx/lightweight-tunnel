@@ -22,6 +22,22 @@ var (
 	serviceDir               = "/etc/systemd/system"
 )
 
+const systemdUnitTemplate = `[Unit]
+Description=Lightweight Tunnel Service (%s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root privileges are required to create and manage TUN devices
+Type=simple
+ExecStart=%s -c %s
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+`
+
 type commandRunner func(name string, args ...string) ([]byte, error)
 
 func main() {
@@ -286,20 +302,7 @@ func manageServiceWithRunner(action, serviceName, configPath, dir string, runner
 		quotedBin := strconv.Quote(binPath)
 		quotedConfig := strconv.Quote(absConfig)
 
-		unitContent := fmt.Sprintf(`[Unit]
-Description=Lightweight Tunnel Service (%s)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%s -c %s
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-`, serviceName, quotedBin, quotedConfig)
+		unitContent := fmt.Sprintf(systemdUnitTemplate, serviceName, quotedBin, quotedConfig)
 
 		if err := os.WriteFile(unitFile, []byte(unitContent), 0644); err != nil {
 			return fmt.Errorf("failed to write service file: %w", err)
