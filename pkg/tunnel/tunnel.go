@@ -180,6 +180,11 @@ func (t *Tunnel) Start() error {
 			
 			log.Printf("P2P enabled on port %d", t.p2pManager.GetLocalPort())
 			
+			// Announce our P2P info to the server
+			if err := t.announcePeerInfo(); err != nil {
+				log.Printf("Warning: Failed to announce P2P info: %v", err)
+			}
+			
 			// Start route update goroutine
 			t.wg.Add(1)
 			go t.routeUpdateLoop()
@@ -827,6 +832,27 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			}
 		case PacketTypeKeepalive:
 			// Keepalive received, no action needed
+		case PacketTypePeerInfo:
+			// Handle peer info from client (server mode)
+			if t.config.P2PEnabled {
+				peerInfoStr := string(payload)
+				log.Printf("Received peer info from client: %s", peerInfoStr)
+				
+				// Parse peer info to get tunnel IP
+				parts := strings.Split(peerInfoStr, "|")
+				if len(parts) >= 3 {
+					tunnelIP := net.ParseIP(parts[0])
+					if tunnelIP != nil {
+						// Register client if not yet registered
+						if client.clientIP == nil {
+							t.addClient(client, tunnelIP)
+						}
+						
+						// Broadcast this peer info to all other clients
+						t.broadcastPeerInfo(tunnelIP, peerInfoStr)
+					}
+				}
+			}
 		}
 	}
 }
@@ -1129,4 +1155,74 @@ func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
 		return data, nil
 	}
 	return t.cipher.Decrypt(data)
+}
+
+// announcePeerInfo sends peer information to server (client mode)
+func (t *Tunnel) announcePeerInfo() error {
+	if t.p2pManager == nil {
+		return nil
+	}
+	
+	// Get local P2P port
+	p2pPort := t.p2pManager.GetLocalPort()
+	
+	// Get our external address from the connection
+	localAddr := t.conn.LocalAddr().(*net.UDPAddr)
+	publicAddr := fmt.Sprintf("%s:%d", localAddr.IP.String(), p2pPort)
+	localP2PAddr := fmt.Sprintf("%s:%d", localAddr.IP.String(), p2pPort)
+	
+	// Format: TunnelIP|PublicAddr|LocalAddr
+	peerInfo := fmt.Sprintf("%s|%s|%s", t.myTunnelIP.String(), publicAddr, localP2PAddr)
+	
+	// Create peer info packet
+	fullPacket := make([]byte, len(peerInfo)+1)
+	fullPacket[0] = PacketTypePeerInfo
+	copy(fullPacket[1:], []byte(peerInfo))
+	
+	// Encrypt
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt peer info: %v", err)
+	}
+	
+	// Send to server
+	if err := t.conn.WritePacket(encryptedPacket); err != nil {
+		return fmt.Errorf("failed to send peer info: %v", err)
+	}
+	
+	log.Printf("Announced P2P info to server: %s at %s", t.myTunnelIP, publicAddr)
+	return nil
+}
+
+// broadcastPeerInfo broadcasts peer information to all connected clients (server mode)
+func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
+	if !t.config.P2PEnabled {
+		return
+	}
+	
+	// Create peer info packet
+	fullPacket := make([]byte, len(peerInfo)+1)
+	fullPacket[0] = PacketTypePeerInfo
+	copy(fullPacket[1:], []byte(peerInfo))
+	
+	// Encrypt
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt peer info for broadcast: %v", err)
+		return
+	}
+	
+	// Broadcast to all clients except the sender
+	t.clientsMux.RLock()
+	for _, client := range t.clients {
+		if client.clientIP != nil && !client.clientIP.Equal(newClientIP) {
+			select {
+			case client.sendQueue <- encryptedPacket:
+				log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
+			default:
+				log.Printf("Failed to broadcast peer info to %s: queue full", client.clientIP)
+			}
+		}
+	}
+	t.clientsMux.RUnlock()
 }
