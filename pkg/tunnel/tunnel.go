@@ -886,12 +886,10 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						// Store this client's peer info for future clients
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
-						peerCapacity := len(t.clients) - 1
-						if peerCapacity < 0 {
-							peerCapacity = 0
-						}
-						peerInfos := make([]string, 0, peerCapacity)
-						broadcastTargets := make([]*ClientConnection, 0, peerCapacity)
+						peerInfoCapacity := max(0, len(t.clients)-1)
+						broadcastCapacity := max(0, len(t.clients)-1)
+						peerInfos := make([]string, 0, peerInfoCapacity)
+						broadcastTargets := make([]*ClientConnection, 0, broadcastCapacity)
 						for _, existing := range t.clients {
 							if existing == client {
 								continue
@@ -1414,7 +1412,13 @@ func (t *Tunnel) sendPeerInfoPacket(client *ClientConnection, peerInfo string) e
 func (t *Tunnel) sendExistingPeersToClient(target *ClientConnection, peerInfos []string) {
 	for _, info := range peerInfos {
 		if err := t.sendPeerInfoPacket(target, info); err != nil {
-			log.Printf("Failed to send existing peer info to %s: %v", target.conn.RemoteAddr(), err)
+			targetID := "<unknown>"
+			if target.clientIP != nil {
+				targetID = target.clientIP.String()
+			} else if target.conn != nil && target.conn.RemoteAddr() != nil {
+				targetID = target.conn.RemoteAddr().String()
+			}
+			log.Printf("Failed to send existing peer info to %s: %v", targetID, err)
 		}
 	}
 }
