@@ -73,24 +73,35 @@ go install ./cmd/lightweight-tunnel
 
 ### 作为系统服务运行（开机自启）
 
+> 提示：安装 systemd 服务时会把 **当前二进制的绝对路径** 和 **指定的配置文件路径** 写入单元文件，安装后如果移动二进制或配置文件，请重新执行安装命令。
+
 ```bash
-# 准备配置（示例路径，需 root）
+# 1) 将二进制放到固定路径（推荐 /usr/local/bin）
+go build -o lightweight-tunnel ./cmd/lightweight-tunnel
+sudo install -m 755 ./lightweight-tunnel /usr/local/bin/lightweight-tunnel
+
+# 2) 准备配置（示例路径，需 root）
 sudo mkdir -p /etc/lightweight-tunnel
-sudo ./lightweight-tunnel -g /etc/lightweight-tunnel/config.json
+sudo /usr/local/bin/lightweight-tunnel -g /etc/lightweight-tunnel/config.json
 
-# 安装并启动 systemd 服务
-sudo ./lightweight-tunnel -service install -c /etc/lightweight-tunnel/config.json
+# 3) 安装并启动 systemd 服务（绑定指定配置）
+sudo /usr/local/bin/lightweight-tunnel -service install -c /etc/lightweight-tunnel/config.json
+#    可选：自定义服务名与配置路径
+# sudo /usr/local/bin/lightweight-tunnel -service install \\
+#      -service-name tunnel-a \\
+#      -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/lightweight-tunnel/tunnel-a.json
 
-# 控制命令（控制面板入口）
-sudo ./lightweight-tunnel -service status
-sudo ./lightweight-tunnel -service restart
-sudo ./lightweight-tunnel -service uninstall   # 需要时移除服务
+# 4) 控制命令
+sudo /usr/local/bin/lightweight-tunnel -service status
+sudo /usr/local/bin/lightweight-tunnel -service restart
+sudo /usr/local/bin/lightweight-tunnel -service uninstall   # 需要时移除服务
 ```
 
 说明：
-- 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name` 自定义，多隧道部署时为每个配置指定不同名称。
-- 配置文件名可自定义，通过 `-service-config` 或 `-c` 指定任意路径和文件名。
-- 服务使用指定的配置文件开机自启，配置更新后运行 `sudo systemctl restart <服务名>` 生效。
+- `-service install` 会在 `/etc/systemd/system/<服务名>.service` 中写入 ExecStart 与配置路径；二进制或配置移动后需重新安装服务。
+- 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name <name>` 自定义，多隧道部署时为每个配置指定不同名称。
+- 配置文件名可自定义，通过 `-service-config <path>` 或 `-c <path>` 指定任意路径和文件名，未显式指定时默认 `/etc/lightweight-tunnel/config.json`。
+- 配置更新后执行 `sudo systemctl restart <服务名>` 生效，可用 `journalctl -u <服务名> -f` 查看运行日志。
 
 ### 基本使用
 
