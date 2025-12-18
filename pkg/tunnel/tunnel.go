@@ -214,7 +214,7 @@ func (t *Tunnel) Start() error {
 
 		// Advertise additional reachable routes to server
 		if len(t.config.AdvertisedRoutes) > 0 {
-			go t.announceRoutes()
+			t.announceRoutes()
 		}
 	} else {
 		// Server mode: start accepting clients
@@ -1522,12 +1522,12 @@ func (t *Tunnel) announceRoutes() {
 
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
-		log.Printf("Failed to encrypt route announcement for %s (%d routes): %v", t.myTunnelIP, routeCount, err)
+		log.Printf("Failed to encrypt route announcement for %s (%d routes, no retry): %v", t.myTunnelIP, routeCount, err)
 		return
 	}
 
 	if err := t.conn.WritePacket(encryptedPacket); err != nil {
-		log.Printf("Failed to send route announcement for %s (%d routes): %v", t.myTunnelIP, routeCount, err)
+		log.Printf("Failed to send route announcement for %s (%d routes, no retry): %v", t.myTunnelIP, routeCount, err)
 	}
 }
 
