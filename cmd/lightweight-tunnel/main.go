@@ -65,6 +65,7 @@ func main() {
 	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
 	tunName := flag.String("tun", "", "TUN device name (empty = auto assign)")
+	advertisedRoutes := flag.String("routes", "", "Comma-separated CIDR ranges that should be reachable through this node (forwarded to peers via server)")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	serviceAction := flag.String("service", "", "Manage systemd service: install|uninstall|start|stop|restart|status")
@@ -134,6 +135,7 @@ func main() {
 			SendQueueSize:       *sendQueueSize,
 			RecvQueueSize:       *recvQueueSize,
 			TunName:             *tunName,
+			AdvertisedRoutes:    splitAndCleanList(*advertisedRoutes),
 			Key:                 *key,
 			TLSEnabled:          *tlsEnabled,
 			TLSCertFile:         *tlsCertFile,
@@ -247,6 +249,7 @@ func generateConfigFile(filename string) error {
 	serverCfg.LocalAddr = "0.0.0.0:9000"
 	serverCfg.TunnelAddr = "10.0.0.1/24"
 	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Example key
+	serverCfg.AdvertisedRoutes = []string{}
 
 	if err := config.SaveConfig(filename, serverCfg); err != nil {
 		return err
@@ -258,7 +261,8 @@ func generateConfigFile(filename string) error {
 	clientCfg.Mode = "client"
 	clientCfg.RemoteAddr = "SERVER_IP:9000"
 	clientCfg.TunnelAddr = "10.0.0.2/24"
-	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Must match server key
+	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY"        // Must match server key
+	clientCfg.AdvertisedRoutes = []string{"192.168.1.0/24"} // Example: expose local LAN via tunnel
 
 	if err := config.SaveConfig(clientFilename, clientCfg); err != nil {
 		return err
@@ -270,6 +274,24 @@ func generateConfigFile(filename string) error {
 
 func manageService(action, serviceName, configPath string) error {
 	return manageServiceWithRunner(action, serviceName, configPath, serviceDir, defaultCommandRunner)
+}
+
+func splitAndCleanList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	clean := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			clean = append(clean, p)
+		}
+	}
+	if len(clean) == 0 {
+		return nil
+	}
+	return clean
 }
 
 func manageServiceWithRunner(action, serviceName, configPath, dir string, runner commandRunner) error {

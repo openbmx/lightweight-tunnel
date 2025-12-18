@@ -244,6 +244,7 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
   "mode": "client",
   "remote_addr": "<服务器IP>:9000",
   "tunnel_addr": "10.0.0.2/24",
+  "advertised_routes": ["192.168.1.0/24"],
   "key": "your-secret-key",
   "mtu": 1400,
   "fec_data": 10,
@@ -306,6 +307,7 @@ sudo ./lightweight-tunnel -c config.json
 | `-tls-key` | TLS 私钥文件（服务端） | - |
 | `-tls-skip-verify` | 跳过证书验证（客户端，不安全） | false |
 | `-tun` | 指定 TUN 设备名（为空则自动分配 tun0、tun1...） | - |
+| `-routes` | 逗号分隔的 CIDR 列表，表示可经由本节点访问的其他网段（例如本地网卡或其他 TUN） | - |
 | `-service` | systemd 服务操作：install/uninstall/start/stop/restart/status | - |
 | `-service-name` | systemd 服务名 | lightweight-tunnel |
 | `-service-config` | 安装/控制服务使用的配置文件路径 | /etc/lightweight-tunnel/config.json |

@@ -12,8 +12,8 @@ import (
 
 	"github.com/openbmx/lightweight-tunnel/internal/config"
 	"github.com/openbmx/lightweight-tunnel/pkg/crypto"
-	"github.com/openbmx/lightweight-tunnel/pkg/fec"
 	"github.com/openbmx/lightweight-tunnel/pkg/faketcp"
+	"github.com/openbmx/lightweight-tunnel/pkg/fec"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
 )
@@ -30,7 +30,7 @@ const (
 	IPv4SrcIPOffset  = 12
 	IPv4DstIPOffset  = 16
 	IPv4MinHeaderLen = 20
-	
+
 	// P2P timing constants
 	P2PRegistrationDelay = 100 * time.Millisecond // Delay to ensure peer registration completes
 	P2PMaxRetries        = 5
@@ -39,38 +39,40 @@ const (
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn       *faketcp.Conn
-	sendQueue  chan []byte
-	recvQueue  chan []byte
-	clientIP   net.IP
-	stopCh     chan struct{}
-	stopOnce   sync.Once
-	wg         sync.WaitGroup
+	conn      *faketcp.Conn
+	sendQueue chan []byte
+	recvQueue chan []byte
+	clientIP  net.IP
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
 }
 
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
-	config     *config.Config
-	fec        *fec.FEC
-	cipher     *crypto.Cipher   // Encryption cipher (nil if no key)
-	conn       *faketcp.Conn    // Used in client mode
-	listener   *faketcp.Listener // Used in server mode
-	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
-	clientsMux sync.RWMutex
-	tunName    string
-	tunFile    *TunDevice
-	stopCh     chan struct{}
-	stopOnce   sync.Once // Ensures Stop() is only executed once
-	wg         sync.WaitGroup
-	sendQueue  chan []byte  // Used in client mode
-	recvQueue  chan []byte  // Used in client mode
-	
+	config       *config.Config
+	fec          *fec.FEC
+	cipher       *crypto.Cipher               // Encryption cipher (nil if no key)
+	conn         *faketcp.Conn                // Used in client mode
+	listener     *faketcp.Listener            // Used in server mode
+	clients      map[string]*ClientConnection // Used in server mode (key: IP address)
+	clientsMux   sync.RWMutex
+	routeMux     sync.RWMutex
+	clientRoutes map[string][]*net.IPNet // Advertised routes from clients (server mode)
+	tunName      string
+	tunFile      *TunDevice
+	stopCh       chan struct{}
+	stopOnce     sync.Once // Ensures Stop() is only executed once
+	wg           sync.WaitGroup
+	sendQueue    chan []byte // Used in client mode
+	recvQueue    chan []byte // Used in client mode
+
 	// P2P and routing
-	p2pManager    *p2p.Manager      // P2P connection manager
+	p2pManager    *p2p.Manager          // P2P connection manager
 	routingTable  *routing.RoutingTable // Routing table
-	myTunnelIP    net.IP            // My tunnel IP address
-	publicAddr    string            // Public address as seen by server (for NAT traversal)
-	publicAddrMux sync.RWMutex      // Protects publicAddr
+	myTunnelIP    net.IP                // My tunnel IP address
+	publicAddr    string                // Public address as seen by server (for NAT traversal)
+	publicAddrMux sync.RWMutex          // Protects publicAddr
 }
 
 // NewTunnel creates a new tunnel instance
@@ -80,13 +82,13 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create FEC: %v", err)
 	}
-	
+
 	// Parse my tunnel IP
 	myIP, err := parseTunnelIP(cfg.TunnelAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse tunnel address: %v", err)
 	}
-	
+
 	// Create encryption cipher if key is provided
 	var cipher *crypto.Cipher
 	if cfg.Key != "" {
@@ -104,7 +106,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		stopCh:     make(chan struct{}),
 		myTunnelIP: myIP,
 	}
-	
+
 	// Initialize P2P manager if enabled
 	if cfg.P2PEnabled && cfg.Mode == "client" {
 		t.p2pManager = p2p.NewManager(cfg.P2PPort)
@@ -117,6 +119,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	} else {
 		// Server mode: multi-client support
 		t.clients = make(map[string]*ClientConnection)
+		t.clientRoutes = make(map[string][]*net.IPNet)
 		// Server also needs routing table for mesh routing
 		if cfg.EnableMeshRouting {
 			t.routingTable = routing.NewRoutingTable(cfg.MaxHops)
@@ -132,13 +135,13 @@ func parseTunnelIP(tunnelAddr string) (net.IP, error) {
 	if len(parts) != 2 {
 		return nil, errors.New("invalid tunnel address format, expected IP/mask")
 	}
-	
+
 	// Validate IP address
 	ip := net.ParseIP(parts[0])
 	if ip == nil {
 		return nil, fmt.Errorf("invalid IP address: %s", parts[0])
 	}
-	
+
 	// Validate CIDR mask (should be between 0 and 32 for IPv4)
 	var maskBits int
 	if _, err := fmt.Sscanf(parts[1], "%d", &maskBits); err != nil {
@@ -147,7 +150,7 @@ func parseTunnelIP(tunnelAddr string) (net.IP, error) {
 	if maskBits < 0 || maskBits > 32 {
 		return nil, fmt.Errorf("CIDR mask must be between 0 and 32, got %d", maskBits)
 	}
-	
+
 	return ip.To4(), nil
 }
 
@@ -178,21 +181,21 @@ func (t *Tunnel) Start() error {
 			t.tunFile.Close()
 			return fmt.Errorf("failed to connect as client: %v", err)
 		}
-		
+
 		// Start P2P manager if enabled
 		if t.config.P2PEnabled && t.p2pManager != nil {
 			if err := t.p2pManager.Start(); err != nil {
 				t.tunFile.Close()
 				return fmt.Errorf("failed to start P2P manager: %v", err)
 			}
-			
+
 			// Set packet handler for P2P
 			t.p2pManager.SetPacketHandler(t.handleP2PPacket)
-			
+
 			log.Printf("P2P enabled on port %d", t.p2pManager.GetLocalPort())
-			
+
 			// Note: P2P info will be announced after receiving public address from server
-			
+
 			// Start route update goroutine
 			t.wg.Add(1)
 			go t.routeUpdateLoop()
@@ -208,6 +211,11 @@ func (t *Tunnel) Start() error {
 		// Start keepalive
 		t.wg.Add(1)
 		go t.keepalive()
+
+		// Advertise additional reachable routes to server
+		if len(t.config.AdvertisedRoutes) > 0 {
+			go t.announceRoutes()
+		}
 	} else {
 		// Server mode: start accepting clients
 		if err := t.startServer(); err != nil {
@@ -230,24 +238,24 @@ func (t *Tunnel) Stop() {
 				log.Printf("Error closing TUN device: %v", err)
 			}
 		}
-		
+
 		// Close listener (server mode) - this will unblock Accept()
 		if t.listener != nil {
 			if err := t.listener.Close(); err != nil {
 				log.Printf("Error closing listener: %v", err)
 			}
 		}
-		
+
 		// Close single connection (client mode) - this will unblock Read/Write
 		if t.conn != nil {
 			if err := t.conn.Close(); err != nil {
 				log.Printf("Error closing connection: %v", err)
 			}
 		}
-		
+
 		// Signal all tunnel goroutines to stop
 		close(t.stopCh)
-		
+
 		// Close all client connections and signal client goroutines (server mode)
 		t.clientsMux.Lock()
 		for _, client := range t.clients {
@@ -262,12 +270,12 @@ func (t *Tunnel) Stop() {
 			})
 		}
 		t.clientsMux.Unlock()
-		
+
 		// Stop P2P manager
 		if t.p2pManager != nil {
 			t.p2pManager.Stop()
 		}
-		
+
 		// Now wait for all goroutines to finish
 		t.wg.Wait()
 		log.Println("Tunnel stopped")
@@ -290,6 +298,7 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 			// Then signal goroutines to stop
 			close(existing.stopCh)
 		})
+		t.removeClientRoutes(existing.clientIP)
 	}
 
 	client.clientIP = ip
@@ -300,7 +309,7 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 // removeClient removes a client from the routing table
 func (t *Tunnel) removeClient(client *ClientConnection) {
 	var clientIP net.IP
-	
+
 	t.clientsMux.Lock()
 	if client.clientIP != nil {
 		clientIP = client.clientIP
@@ -309,14 +318,17 @@ func (t *Tunnel) removeClient(client *ClientConnection) {
 		log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
 	}
 	t.clientsMux.Unlock()
-	
+
 	if clientIP != nil {
 		// Remove from routing table if mesh routing enabled (outside of lock)
 		if t.routingTable != nil {
 			t.routingTable.RemovePeer(clientIP)
 			log.Printf("Removed peer %s from routing table", clientIP)
 		}
-		
+
+		// Remove advertised routes for this client
+		t.removeClientRoutes(clientIP)
+
 		// Broadcast peer disconnection to other clients (acquires its own lock)
 		if t.config.P2PEnabled {
 			t.broadcastPeerDisconnect(clientIP)
@@ -328,23 +340,23 @@ func (t *Tunnel) removeClient(client *ClientConnection) {
 func (t *Tunnel) broadcastPeerDisconnect(disconnectedIP net.IP) {
 	// Format: DISCONNECT|TunnelIP
 	disconnectInfo := fmt.Sprintf("DISCONNECT|%s", disconnectedIP.String())
-	
+
 	// Create peer info packet with disconnect message
 	fullPacket := make([]byte, len(disconnectInfo)+1)
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(disconnectInfo))
-	
+
 	// Encrypt
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
 		log.Printf("Failed to encrypt disconnect notification: %v", err)
 		return
 	}
-	
+
 	// Broadcast to all clients with its own lock
 	t.clientsMux.RLock()
 	defer t.clientsMux.RUnlock()
-	
+
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(disconnectedIP) {
 			if err := client.conn.WritePacket(encryptedPacket); err != nil {
@@ -359,6 +371,61 @@ func (t *Tunnel) getClientByIP(ip net.IP) *ClientConnection {
 	t.clientsMux.RLock()
 	defer t.clientsMux.RUnlock()
 	return t.clients[ip.String()]
+}
+
+// getClientForDestination returns a client either by direct IP match or by advertised routes
+func (t *Tunnel) getClientForDestination(dstIP net.IP) *ClientConnection {
+	// Direct IP match first
+	if client := t.getClientByIP(dstIP); client != nil {
+		return client
+	}
+
+	// Route-based match
+	t.routeMux.RLock()
+	bestClientIP := chooseRouteClient(dstIP, t.clientRoutes)
+	t.routeMux.RUnlock()
+
+	if bestClientIP == "" {
+		return nil
+	}
+
+	// Convert to IP for lookup
+	ip := net.ParseIP(bestClientIP)
+	if ip == nil {
+		return nil
+	}
+	return t.getClientByIP(ip)
+}
+
+// updateClientRoutes stores advertised routes for a client (server mode)
+func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
+	valid, invalid := parseCIDRList(routes)
+	if len(invalid) > 0 {
+		log.Printf("Ignoring invalid advertised routes from %s: %v", clientIP, invalid)
+	}
+
+	t.routeMux.Lock()
+	if t.clientRoutes == nil {
+		t.clientRoutes = make(map[string][]*net.IPNet)
+	}
+	if len(valid) == 0 {
+		delete(t.clientRoutes, clientIP.String())
+		t.routeMux.Unlock()
+		return
+	}
+	t.clientRoutes[clientIP.String()] = valid
+	t.routeMux.Unlock()
+	log.Printf("Registered %d advertised route(s) for client %s", len(valid), clientIP)
+}
+
+// removeClientRoutes removes all advertised routes for a client
+func (t *Tunnel) removeClientRoutes(clientIP net.IP) {
+	if clientIP == nil {
+		return
+	}
+	t.routeMux.Lock()
+	delete(t.clientRoutes, clientIP.String())
+	t.routeMux.Unlock()
 }
 
 // configureTUN configures the TUN device with IP address
@@ -396,14 +463,14 @@ func (t *Tunnel) configureTUN() error {
 // connectClient connects to server as client
 func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
-	
+
 	timeout := time.Duration(t.config.Timeout) * time.Second
-	
+
 	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
 		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
-	
+
 	log.Println("Using UDP with fake TCP headers for firewall bypass")
 	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
 	if err != nil {
@@ -418,18 +485,18 @@ func (t *Tunnel) connectClient() error {
 // startServer starts the server and accepts multiple clients
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
-	
+
 	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
 		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
-	
+
 	log.Println("Using UDP with fake TCP headers for firewall bypass")
 	listener, err := faketcp.Listen(t.config.LocalAddr)
 	if err != nil {
 		return err
 	}
-	
+
 	// Store listener for later cleanup
 	t.listener = listener
 
@@ -528,9 +595,9 @@ func (t *Tunnel) handleClient(conn *faketcp.Conn) {
 // tunReader reads packets from TUN device and queues them for sending (client mode)
 func (t *Tunnel) tunReader() {
 	defer t.wg.Done()
-	
+
 	buf := make([]byte, t.config.MTU+100)
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -554,12 +621,12 @@ func (t *Tunnel) tunReader() {
 			if n < IPv4MinHeaderLen {
 				continue
 			}
-			
+
 			// Check if packet is IPv4 (skip non-IPv4 packets like IPv6)
 			if buf[0]>>4 != IPv4Version {
 				continue
 			}
-			
+
 			// Copy packet data
 			packet := make([]byte, n)
 			copy(packet, buf[:n])
@@ -586,9 +653,9 @@ func (t *Tunnel) tunReader() {
 // tunReaderServer reads packets from TUN device and routes them to clients (server mode)
 func (t *Tunnel) tunReaderServer() {
 	defer t.wg.Done()
-	
+
 	buf := make([]byte, t.config.MTU+100)
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -624,8 +691,8 @@ func (t *Tunnel) tunReaderServer() {
 
 		dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
 
-		// Find the client with this destination IP
-		client := t.getClientByIP(dstIP)
+		// Find the client with this destination IP (direct IP or advertised route)
+		client := t.getClientForDestination(dstIP)
 		if client != nil {
 			select {
 			case client.sendQueue <- packet:
@@ -642,7 +709,7 @@ func (t *Tunnel) tunReaderServer() {
 // tunWriter writes packets from receive queue to TUN device
 func (t *Tunnel) tunWriter() {
 	defer t.wg.Done()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -664,7 +731,7 @@ func (t *Tunnel) tunWriter() {
 // netReader reads packets from network connection
 func (t *Tunnel) netReader() {
 	defer t.wg.Done()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -725,7 +792,7 @@ func (t *Tunnel) netReader() {
 			t.publicAddr = publicAddr
 			t.publicAddrMux.Unlock()
 			log.Printf("Received public address from server: %s", publicAddr)
-			
+
 			// Now announce P2P info with the correct public address
 			if t.p2pManager != nil {
 				// Retry announcement with exponential backoff if it fails
@@ -760,7 +827,7 @@ func (t *Tunnel) netReader() {
 // netWriter writes packets from send queue to network connection
 func (t *Tunnel) netWriter() {
 	defer t.wg.Done()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -794,7 +861,7 @@ func (t *Tunnel) netWriter() {
 // keepalive sends periodic keepalive packets
 func (t *Tunnel) keepalive() {
 	defer t.wg.Done()
-	
+
 	ticker := time.NewTicker(time.Duration(t.config.KeepaliveInterval) * time.Second)
 	defer ticker.Stop()
 
@@ -827,7 +894,7 @@ func (t *Tunnel) keepalive() {
 // clientNetReader reads packets from a client connection
 func (t *Tunnel) clientNetReader(client *ClientConnection) {
 	defer client.wg.Done()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -885,7 +952,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			// Extract source IP from the packet to register client
 			if payload[0]>>4 == IPv4Version { // IPv4
 				srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
-				
+
 				// Register client IP if not yet registered
 				if client.clientIP == nil {
 					t.addClient(client, srcIP)
@@ -909,7 +976,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 					}
 				} else {
 					// Check if packet is for another client
-					targetClient := t.getClientByIP(dstIP)
+					targetClient := t.getClientForDestination(dstIP)
 					if targetClient != nil && targetClient != client {
 						// Forward to target client
 						select {
@@ -942,7 +1009,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			if t.config.P2PEnabled {
 				peerInfoStr := string(payload)
 				log.Printf("Received peer info from client: %s", peerInfoStr)
-				
+
 				// Parse peer info to get tunnel IP
 				parts := strings.Split(peerInfoStr, "|")
 				if len(parts) >= 3 {
@@ -952,12 +1019,25 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						if client.clientIP == nil {
 							t.addClient(client, tunnelIP)
 						}
-						
+
 						// Broadcast this peer info to all other clients
 						t.broadcastPeerInfo(tunnelIP, peerInfoStr)
 					}
 				}
 			}
+		case PacketTypeRouteInfo:
+			tunnelIP, routes := parseRouteInfoPayload(payload)
+			if tunnelIP == nil {
+				continue
+			}
+			// Register client if not yet registered
+			if client.clientIP == nil {
+				t.addClient(client, tunnelIP)
+			} else if !client.clientIP.Equal(tunnelIP) {
+				log.Printf("Route info IP %s does not match registered client IP %s", tunnelIP, client.clientIP)
+				continue
+			}
+			t.updateClientRoutes(tunnelIP, routes)
 		}
 	}
 }
@@ -965,7 +1045,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 // clientNetWriter writes packets from client send queue to network
 func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 	defer client.wg.Done()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -1006,7 +1086,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 // clientKeepalive sends periodic keepalive packets to a client
 func (t *Tunnel) clientKeepalive(client *ClientConnection) {
 	defer client.wg.Done()
-	
+
 	ticker := time.NewTicker(time.Duration(t.config.KeepaliveInterval) * time.Second)
 	defer ticker.Stop()
 
@@ -1043,28 +1123,27 @@ func (t *Tunnel) clientKeepalive(client *ClientConnection) {
 	}
 }
 
-
 // handleP2PPacket handles packets received via P2P connection
 func (t *Tunnel) handleP2PPacket(peerIP net.IP, data []byte) {
 	if len(data) < 1 {
 		return
 	}
-	
+
 	// Decrypt if cipher is available
 	decryptedData, err := t.decryptPacket(data)
 	if err != nil {
 		log.Printf("P2P decryption error from %s (wrong key?): %v", peerIP, err)
 		return
 	}
-	
+
 	if len(decryptedData) < 1 {
 		return
 	}
-	
+
 	// Check packet type
 	packetType := decryptedData[0]
 	payload := decryptedData[1:]
-	
+
 	switch packetType {
 	case PacketTypeData:
 		// Queue for TUN device
@@ -1093,21 +1172,21 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 	if len(parts) < 3 {
 		return
 	}
-	
+
 	tunnelIP := net.ParseIP(parts[0])
 	if tunnelIP == nil {
 		return
 	}
-	
+
 	peer := p2p.NewPeerInfo(tunnelIP)
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
-	
+
 	// Add to routing table FIRST before P2P manager
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
 	}
-	
+
 	// Then add to P2P manager
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
@@ -1118,7 +1197,7 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 			t.p2pManager.ConnectToPeer(tunnelIP)
 		}()
 	}
-	
+
 	log.Printf("Received peer info: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
 }
 
@@ -1131,7 +1210,7 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	if len(parts) < 2 {
 		return
 	}
-	
+
 	// Check if this is a disconnect message first
 	if parts[0] == "DISCONNECT" {
 		disconnectedIP := net.ParseIP(parts[1])
@@ -1140,31 +1219,31 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 		}
 		return
 	}
-	
+
 	// Normal peer info message requires at least 3 parts
 	if len(parts) < 3 {
 		return
 	}
-	
+
 	tunnelIP := net.ParseIP(parts[0])
 	if tunnelIP == nil {
 		return
 	}
-	
+
 	// Don't add ourselves
 	if tunnelIP.Equal(t.myTunnelIP) {
 		return
 	}
-	
+
 	peer := p2p.NewPeerInfo(tunnelIP)
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
-	
+
 	// Add to routing table FIRST before P2P manager
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
 	}
-	
+
 	// Then add to P2P manager
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
@@ -1175,19 +1254,19 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 			t.p2pManager.ConnectToPeer(tunnelIP)
 		}()
 	}
-	
+
 	log.Printf("Received peer info from server: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
 }
 
 // handlePeerDisconnect handles notification that a peer has disconnected
 func (t *Tunnel) handlePeerDisconnect(peerIP net.IP) {
 	log.Printf("Peer %s disconnected, removing from routing table", peerIP)
-	
+
 	// Remove from routing table
 	if t.routingTable != nil {
 		t.routingTable.RemovePeer(peerIP)
 	}
-	
+
 	// Remove from P2P manager
 	if t.p2pManager != nil {
 		t.p2pManager.RemovePeer(peerIP)
@@ -1203,10 +1282,10 @@ func (t *Tunnel) handleRouteInfoPacket(fromIP net.IP, data []byte) {
 // routeUpdateLoop periodically updates route quality and selects best routes
 func (t *Tunnel) routeUpdateLoop() {
 	defer t.wg.Done()
-	
+
 	ticker := time.NewTicker(time.Duration(t.config.RouteUpdateInterval) * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -1215,10 +1294,10 @@ func (t *Tunnel) routeUpdateLoop() {
 			if t.routingTable != nil {
 				// Update all routes based on current peer states
 				t.routingTable.UpdateRoutes()
-				
+
 				// Clean stale routes
 				t.routingTable.CleanStaleRoutes(60 * time.Second)
-				
+
 				// Log routing stats
 				stats := t.routingTable.GetRouteStats()
 				log.Printf("Routing stats: %d peers, %d direct, %d relay, %d server",
@@ -1234,14 +1313,14 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 	if len(packet) < IPv4MinHeaderLen {
 		return errors.New("packet too small")
 	}
-	
+
 	// Parse destination IP
 	if packet[0]>>4 != IPv4Version {
 		return errors.New("not IPv4 packet")
 	}
-	
+
 	dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
-	
+
 	// Get best route
 	if t.routingTable != nil {
 		route := t.routingTable.GetRoute(dstIP)
@@ -1253,14 +1332,14 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 					fullPacket := make([]byte, len(packet)+1)
 					fullPacket[0] = PacketTypeData
 					copy(fullPacket[1:], packet)
-					
+
 					// Encrypt the packet before sending via P2P
 					encryptedPacket, err := t.encryptPacket(fullPacket)
 					if err != nil {
 						log.Printf("P2P encryption error: %v", err)
 						return t.sendViaServer(packet)
 					}
-					
+
 					if err := t.p2pManager.SendPacket(dstIP, encryptedPacket); err != nil {
 						log.Printf("P2P send failed to %s, falling back to server: %v", dstIP, err)
 						// Fall back to server
@@ -1276,7 +1355,7 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 			}
 		}
 	}
-	
+
 	// Default: send via server
 	return t.sendViaServer(packet)
 }
@@ -1342,67 +1421,102 @@ func (t *Tunnel) announcePeerInfo() error {
 	if t.p2pManager == nil {
 		return nil
 	}
-	
+
 	// Get local P2P port
 	p2pPort := t.p2pManager.GetLocalPort()
-	
+
 	// Get our public address (received from server)
 	t.publicAddrMux.RLock()
 	publicAddrStr := t.publicAddr
 	t.publicAddrMux.RUnlock()
-	
+
 	if publicAddrStr == "" {
 		// Public address not yet received from server, will try again later
 		return fmt.Errorf("public address not yet available")
 	}
-	
+
 	// Parse public address to extract IP
 	publicHost, _, err := net.SplitHostPort(publicAddrStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse public address: %v", err)
 	}
-	
+
 	// Build P2P address with P2P port using public IP
 	publicP2PAddr := fmt.Sprintf("%s:%d", publicHost, p2pPort)
-	
+
 	// Get local address for local network peers
 	localAddr := t.conn.LocalAddr()
 	if localAddr == nil {
 		return fmt.Errorf("connection has no local address")
 	}
 	localAddrStr := localAddr.String()
-	
+
 	// Parse to extract local IP (format is "IP:port")
 	localHost, _, err := net.SplitHostPort(localAddrStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse local address: %v", err)
 	}
-	
+
 	// Build local P2P address
 	localP2PAddr := fmt.Sprintf("%s:%d", localHost, p2pPort)
-	
+
 	// Format: TunnelIP|PublicAddr|LocalAddr
 	// Use public address for NAT traversal and local address for same-network peers
 	peerInfo := fmt.Sprintf("%s|%s|%s", t.myTunnelIP.String(), publicP2PAddr, localP2PAddr)
-	
+
 	// Create peer info packet
 	fullPacket := make([]byte, len(peerInfo)+1)
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(peerInfo))
-	
+
 	// Encrypt
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt peer info: %v", err)
 	}
-	
+
 	// Send to server
 	if err := t.conn.WritePacket(encryptedPacket); err != nil {
 		return fmt.Errorf("failed to send peer info: %v", err)
 	}
-	
+
 	log.Printf("Announced P2P info to server: %s at public=%s local=%s", t.myTunnelIP, publicP2PAddr, localP2PAddr)
 	return nil
+}
+
+// announceRoutes advertises additional reachable CIDR ranges to the server
+func (t *Tunnel) announceRoutes() {
+	if len(t.config.AdvertisedRoutes) == 0 || t.conn == nil {
+		return
+	}
+
+	valid, invalid := parseCIDRList(t.config.AdvertisedRoutes)
+	if len(invalid) > 0 {
+		log.Printf("Skipping invalid advertised routes: %v", invalid)
+	}
+	if len(valid) == 0 {
+		return
+	}
+
+	routeStrings := make([]string, 0, len(valid))
+	for _, n := range valid {
+		routeStrings = append(routeStrings, n.String())
+	}
+
+	payloadStr := fmt.Sprintf("%s|%s", t.myTunnelIP.String(), strings.Join(routeStrings, ","))
+	fullPacket := make([]byte, len(payloadStr)+1)
+	fullPacket[0] = PacketTypeRouteInfo
+	copy(fullPacket[1:], []byte(payloadStr))
+
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt route announcement: %v", err)
+		return
+	}
+
+	if err := t.conn.WritePacket(encryptedPacket); err != nil {
+		log.Printf("Failed to send route announcement: %v", err)
+	}
 }
 
 // sendPublicAddrToClient sends the client's public address for NAT traversal (server mode)
@@ -1413,21 +1527,21 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 		log.Printf("Cannot send public address: client has no remote address")
 		return
 	}
-	
+
 	publicAddrStr := remoteAddr.String()
-	
+
 	// Create public address packet
 	fullPacket := make([]byte, len(publicAddrStr)+1)
 	fullPacket[0] = PacketTypePublicAddr
 	copy(fullPacket[1:], []byte(publicAddrStr))
-	
+
 	// Encrypt the packet (don't rely on clientNetWriter since this is not a data packet)
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
 		log.Printf("Failed to encrypt public address: %v", err)
 		return
 	}
-	
+
 	// Send directly to network connection (bypass sendQueue which is for data packets)
 	// This avoids double-wrapping by clientNetWriter
 	if err := client.conn.WritePacket(encryptedPacket); err != nil {
@@ -1438,7 +1552,7 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 		})
 		return
 	}
-	
+
 	log.Printf("Sent public address %s to client", publicAddrStr)
 }
 
@@ -1447,19 +1561,19 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 	if !t.config.P2PEnabled {
 		return
 	}
-	
+
 	// Create peer info packet
 	fullPacket := make([]byte, len(peerInfo)+1)
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(peerInfo))
-	
+
 	// Encrypt
 	encryptedPacket, err := t.encryptPacket(fullPacket)
 	if err != nil {
 		log.Printf("Failed to encrypt peer info for broadcast: %v", err)
 		return
 	}
-	
+
 	// Broadcast to all clients except the sender
 	t.clientsMux.RLock()
 	defer t.clientsMux.RUnlock()
