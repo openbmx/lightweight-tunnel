@@ -886,13 +886,20 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						// Store this client's peer info for future clients
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
+						peerInfos := make([]string, 0, len(t.clients))
+						for _, existing := range t.clients {
+							if existing == client || existing.peerInfo == "" {
+								continue
+							}
+							peerInfos = append(peerInfos, existing.peerInfo)
+						}
 						t.clientsMux.Unlock()
 
 						// Broadcast this peer info to all other clients
 						t.broadcastPeerInfo(tunnelIP, peerInfoStr)
 
 						// Send existing peers to this client so it learns about them
-						t.sendExistingPeersToClient(client)
+						t.sendExistingPeersToClient(client, peerInfos)
 					}
 				}
 			}
@@ -1408,21 +1415,7 @@ func (t *Tunnel) sendPeerInfoPacket(client *ClientConnection, peerInfo string) e
 }
 
 // sendExistingPeersToClient sends all known peers to the specified client
-func (t *Tunnel) sendExistingPeersToClient(target *ClientConnection) {
-	// Collect peer info strings first to minimize time holding lock
-	t.clientsMux.RLock()
-	peerInfos := make([]string, 0, len(t.clients))
-	for _, client := range t.clients {
-		if client == target {
-			continue
-		}
-		if client.peerInfo == "" {
-			continue
-		}
-		peerInfos = append(peerInfos, client.peerInfo)
-	}
-	t.clientsMux.RUnlock()
-
+func (t *Tunnel) sendExistingPeersToClient(target *ClientConnection, peerInfos []string) {
 	for _, info := range peerInfos {
 		if err := t.sendPeerInfoPacket(target, info); err != nil {
 			log.Printf("Failed to send existing peer info to %s: %v", target.conn.RemoteAddr(), err)
