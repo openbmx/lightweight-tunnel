@@ -86,6 +86,10 @@ sudo /usr/local/bin/lightweight-tunnel -g /etc/lightweight-tunnel/config.json
 
 # 3) 安装并启动 systemd 服务（绑定指定配置）
 sudo /usr/local/bin/lightweight-tunnel -service install -c /etc/lightweight-tunnel/config.json
+#    可选：自定义服务名与配置路径
+# sudo /usr/local/bin/lightweight-tunnel -service install \\
+#      -service-name tunnel-a \\
+#      -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/...json
 
 # 4) 控制命令
 sudo /usr/local/bin/lightweight-tunnel -service status
@@ -95,8 +99,8 @@ sudo /usr/local/bin/lightweight-tunnel -service uninstall   # 需要时移除服
 
 说明：
 - `-service install` 会在 `/etc/systemd/system/<服务名>.service` 中写入 ExecStart 与配置路径；二进制或配置移动后需重新安装服务。
-- 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name` 自定义，多隧道部署时为每个配置指定不同名称。
-- 配置文件名可自定义，通过 `-service-config` 或 `-c` 指定任意路径和文件名，未显式指定时默认 `/etc/lightweight-tunnel/config.json`。
+- 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name <name>` 自定义，多隧道部署时为每个配置指定不同名称。
+- 配置文件名可自定义，通过 `-service-config <path>` 或 `-c <path>` 指定任意路径和文件名，未显式指定时默认 `/etc/lightweight-tunnel/config.json`。
 - 配置更新后执行 `sudo systemctl restart <服务名>` 生效，可用 `journalctl -u <服务名> -f` 查看运行日志。
 
 ### 基本使用
