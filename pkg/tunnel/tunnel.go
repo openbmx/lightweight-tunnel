@@ -960,7 +960,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 				// Route packet based on destination
 				dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
-				
+
 				// Check if destination is another client
 				if t.config.ClientIsolation {
 					// In isolation mode, only send to TUN device (server)
@@ -1275,8 +1275,15 @@ func (t *Tunnel) handlePeerDisconnect(peerIP net.IP) {
 
 // handleRouteInfoPacket handles route information updates
 func (t *Tunnel) handleRouteInfoPacket(fromIP net.IP, data []byte) {
-	// This can be extended to exchange routing information
-	// For now, we rely on direct connectivity checks
+	tunnelIP, routes := parseRouteInfoPayload(data)
+	if tunnelIP == nil {
+		log.Printf("Invalid route info packet from %s", fromIP)
+		return
+	}
+
+	// Route advertisement over P2P is not applied to routing tables yet,
+	// but we log it for visibility and future extension.
+	log.Printf("Received route info via P2P from %s (%s): %v (not applied; server-side advertisements are supported)", fromIP, tunnelIP, routes)
 }
 
 // routeUpdateLoop periodically updates route quality and selects best routes
