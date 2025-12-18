@@ -87,9 +87,7 @@ sudo /usr/local/bin/lightweight-tunnel -g /etc/lightweight-tunnel/config.json
 # 3) 安装并启动 systemd 服务（绑定指定配置）
 sudo /usr/local/bin/lightweight-tunnel -service install -c /etc/lightweight-tunnel/config.json
 #    可选：自定义服务名与配置路径
-# sudo /usr/local/bin/lightweight-tunnel -service install \\
-#      -service-name tunnel-a \\
-#      -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/lightweight-tunnel/tunnel-a.json
+# sudo /usr/local/bin/lightweight-tunnel -service install -service-name tunnel-a -c /etc/lightweight-tunnel/tunnel-a.json   # 或 -service-config /etc/lightweight-tunnel/tunnel-a.json
 
 # 4) 控制命令
 sudo /usr/local/bin/lightweight-tunnel -service status
