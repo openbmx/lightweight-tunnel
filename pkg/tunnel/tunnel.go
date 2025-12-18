@@ -299,11 +299,9 @@ func (t *Tunnel) connectClient() error {
 	
 	timeout := time.Duration(t.config.Timeout) * time.Second
 	
-	// Note: TLS is not supported with UDP-based fake TCP
-	// For encryption, use application-level encryption or IPsec
+	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
-		log.Println("WARNING: TLS is not supported with UDP-based fake TCP tunnel")
-		log.Println("For encryption, consider using application-level encryption or IPsec")
+		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
 	
 	log.Println("Using UDP with fake TCP headers for firewall bypass")
@@ -321,11 +319,9 @@ func (t *Tunnel) connectClient() error {
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 	
-	// Note: TLS is not supported with UDP-based fake TCP
-	// For encryption, use application-level encryption or IPsec
+	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
-		log.Println("WARNING: TLS is not supported with UDP-based fake TCP tunnel")
-		log.Println("For encryption, consider using application-level encryption or IPsec")
+		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
 	
 	log.Println("Using UDP with fake TCP headers for firewall bypass")

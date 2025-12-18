@@ -3,9 +3,9 @@ package faketcp
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"net"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -60,7 +60,6 @@ type IPHeader struct {
 // Conn represents a fake TCP connection over UDP
 type Conn struct {
 	udpConn     *net.UDPConn
-	rawConn     int // raw socket file descriptor
 	localAddr   *net.UDPAddr
 	remoteAddr  *net.UDPAddr
 	srcPort     uint16
@@ -196,7 +195,8 @@ func (l *Listener) Accept() (*Conn, error) {
 			select {
 			case conn.recvQueue <- payload:
 			default:
-				// Queue full, drop packet
+				// Queue full, drop packet and log
+				log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
 			}
 		}
 	}
@@ -316,13 +316,12 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 	buf[13] = h.Flags
 	
 	binary.BigEndian.PutUint16(buf[14:16], h.Window)
-	binary.BigEndian.PutUint16(buf[16:18], h.Checksum)
 	binary.BigEndian.PutUint16(buf[18:20], h.UrgentPtr)
 	
 	// Calculate checksum (simplified - set to 0 for now)
-	// In production, you'd calculate a proper TCP checksum
-	checksum := c.calculateChecksum(buf)
-	binary.BigEndian.PutUint16(buf[16:18], checksum)
+	// Note: We don't need a real TCP checksum since we're just disguising UDP
+	// Most simple firewalls only check the header structure, not the checksum
+	binary.BigEndian.PutUint16(buf[16:18], 0)
 	
 	return buf
 }
@@ -347,19 +346,10 @@ func parseTCPHeader(buf []byte) *TCPHeader {
 }
 
 // calculateChecksum calculates TCP checksum (simplified version)
-func (c *Conn) calculateChecksum(data []byte) uint16 {
-	// Simplified checksum - just return 0 for now
-	// In production, implement proper TCP checksum with pseudo-header
-	// This is acceptable since we're just disguising, not implementing real TCP
-	return 0
-}
-
 // Close closes the connection
 func (c *Conn) Close() error {
-	if c.rawConn > 0 {
-		syscall.Close(c.rawConn)
-	}
-	// Don't close udpConn if it's shared with listener
+	// Note: We don't close udpConn if it's shared with a listener
+	// For connected sockets created with Dial(), closing is handled by the caller
 	return nil
 }
 
