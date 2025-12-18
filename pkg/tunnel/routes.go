@@ -7,6 +7,8 @@ import (
 
 // parseRouteInfoPayload parses a route info payload in the format "TunnelIP|cidr1,cidr2"
 // and returns the tunnel IP with the cleaned CIDR list.
+// The sender uses comma-separated CIDRs without spaces; trimming here keeps the
+// parser tolerant of accidental whitespace.
 func parseRouteInfoPayload(payload []byte) (net.IP, []string) {
 	parts := strings.SplitN(string(payload), "|", 2)
 	if len(parts) != 2 {

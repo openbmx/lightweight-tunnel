@@ -389,12 +389,11 @@ func (t *Tunnel) getClientForDestination(dstIP net.IP) *ClientConnection {
 		return nil
 	}
 
-	// Convert to IP for lookup
-	ip := net.ParseIP(bestClientIP)
-	if ip == nil {
-		return nil
-	}
-	return t.getClientByIP(ip)
+	// Lookup client directly by stored key
+	t.clientsMux.RLock()
+	client := t.clients[bestClientIP]
+	t.clientsMux.RUnlock()
+	return client
 }
 
 // updateClientRoutes stores advertised routes for a client (server mode)
@@ -405,9 +404,6 @@ func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
 	}
 
 	t.routeMux.Lock()
-	if t.clientRoutes == nil {
-		t.clientRoutes = make(map[string][]*net.IPNet)
-	}
 	if len(valid) == 0 {
 		delete(t.clientRoutes, clientIP.String())
 		t.routeMux.Unlock()
