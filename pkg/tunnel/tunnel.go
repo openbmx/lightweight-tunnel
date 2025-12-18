@@ -154,7 +154,9 @@ func parseTunnelIP(tunnelAddr string) (net.IP, error) {
 // Start starts the tunnel
 func (t *Tunnel) Start() error {
 	// Create TUN device
-	tunDev, err := CreateTUN("tun0")
+	// Use empty string to let kernel automatically assign device name (tun0, tun1, etc.)
+	// This prevents conflicts when multiple instances are running
+	tunDev, err := CreateTUN("")
 	if err != nil {
 		return fmt.Errorf("failed to create TUN device: %v", err)
 	}
