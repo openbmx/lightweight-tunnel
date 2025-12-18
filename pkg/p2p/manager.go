@@ -127,14 +127,9 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	// Check if already connected
 	if _, exists := m.connections[ipStr]; exists {
 		// Check if peer is actually marked as connected
-		if peer, peerExists := m.peers[ipStr]; peerExists {
-			peer.mu.RLock()
-			connected := peer.Connected
-			peer.mu.RUnlock()
-			if connected {
-				log.Printf("Already connected to peer %s", ipStr)
-				return nil
-			}
+		if m.isPeerConnected(ipStr) {
+			log.Printf("Already connected to peer %s", ipStr)
+			return nil
 		}
 		// Reuse existing connection for retry
 		log.Printf("Retrying P2P connection to %s", ipStr)
@@ -346,6 +341,18 @@ func (m *Manager) GetLocalPort() int {
 	return m.localPort
 }
 
+// isPeerConnected checks if a peer is actually connected (handshake complete)
+// Must be called with m.mu held (read or write lock)
+func (m *Manager) isPeerConnected(ipStr string) bool {
+	if peer, exists := m.peers[ipStr]; exists {
+		peer.mu.RLock()
+		connected := peer.Connected
+		peer.mu.RUnlock()
+		return connected
+	}
+	return false
+}
+
 // IsConnected checks if we have a P2P connection to a peer
 func (m *Manager) IsConnected(peerIP net.IP) bool {
 	m.mu.RLock()
@@ -358,13 +365,6 @@ func (m *Manager) IsConnected(peerIP net.IP) bool {
 		return false
 	}
 	
-	// Check if peer is marked as connected
-	if peer, exists := m.peers[ipStr]; exists {
-		peer.mu.RLock()
-		connected := peer.Connected
-		peer.mu.RUnlock()
-		return connected
-	}
-	
-	return false
+	// Check if peer is marked as connected (handshake complete)
+	return m.isPeerConnected(ipStr)
 }
