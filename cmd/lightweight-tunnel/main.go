@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/openbmx/lightweight-tunnel/internal/config"
@@ -15,7 +19,30 @@ import (
 var (
 	version                  = "1.0.0"
 	defaultServiceConfigPath = "/etc/lightweight-tunnel/config.json"
+	serviceDir               = "/etc/systemd/system"
 )
+
+const systemdUnitTemplate = `[Unit]
+Description=Lightweight Tunnel Service (%q)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root privileges are required to create and manage TUN devices
+Type=simple
+ExecStart=%s -c %s
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+`
+
+type commandRunner func(name string, args ...string) ([]byte, error)
 
 func main() {
 	// Command line flags
@@ -239,4 +266,105 @@ func generateConfigFile(filename string) error {
 
 	fmt.Printf("Also generated client config example: %s\n", clientFilename)
 	return nil
+}
+
+func manageService(action, serviceName, configPath string) error {
+	return manageServiceWithRunner(action, serviceName, configPath, serviceDir, defaultCommandRunner)
+}
+
+func manageServiceWithRunner(action, serviceName, configPath, dir string, runner commandRunner) error {
+	if runner == nil {
+		runner = defaultCommandRunner
+	}
+
+	if serviceName == "" {
+		return fmt.Errorf("service name is required")
+	}
+
+	unitName := normalizeServiceName(serviceName)
+	unitFile := filepath.Join(dir, unitName)
+
+	switch action {
+	case "install":
+		if configPath == "" {
+			return fmt.Errorf("config file path is required for install")
+		}
+
+		absConfig, err := filepath.Abs(configPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve config path: %w", err)
+		}
+
+		if _, err := os.Stat(absConfig); err != nil {
+			return fmt.Errorf("config file not found: %w", err)
+		}
+
+		binPath, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to locate binary: %w", err)
+		}
+		quotedBin := strconv.Quote(binPath)
+		quotedConfig := strconv.Quote(absConfig)
+
+		unitContent := fmt.Sprintf(systemdUnitTemplate, serviceName, quotedBin, quotedConfig)
+
+		if err := os.WriteFile(unitFile, []byte(unitContent), 0640); err != nil {
+			return fmt.Errorf("failed to write service file: %w", err)
+		}
+
+		commands := [][]string{
+			{"systemctl", "daemon-reload"},
+			{"systemctl", "enable", unitName},
+			{"systemctl", "start", unitName},
+		}
+		return runCommands(runner, commands)
+
+	case "uninstall":
+		logSystemctlWarning(runner, "stop", unitName)
+		logSystemctlWarning(runner, "disable", unitName)
+		if err := os.Remove(unitFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove service file: %w", err)
+		}
+		_, err := runner("systemctl", "daemon-reload")
+		return err
+
+	case "start", "stop", "restart", "status":
+		out, err := runner("systemctl", action, unitName)
+		if err != nil {
+			return fmt.Errorf("systemctl %s failed: %v: %s", action, err, string(out))
+		}
+		if len(out) > 0 {
+			fmt.Print(string(out))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown service action: %s", action)
+	}
+}
+
+func normalizeServiceName(name string) string {
+	if strings.HasSuffix(name, ".service") {
+		return name
+	}
+	return name + ".service"
+}
+
+func runCommands(runner commandRunner, commands [][]string) error {
+	for _, cmd := range commands {
+		out, err := runner(cmd[0], cmd[1:]...)
+		if err != nil {
+			return fmt.Errorf("%s %s failed: %v (output: %s)", cmd[0], strings.Join(cmd[1:], " "), err, strings.TrimSpace(string(out)))
+		}
+	}
+	return nil
+}
+
+func logSystemctlWarning(runner commandRunner, action, unitName string) {
+	if out, err := runner("systemctl", action, unitName); err != nil {
+		log.Printf("Warning: systemctl %s %s failed: %v (output: %s)", action, unitName, err, strings.TrimSpace(string(out)))
+	}
+}
+
+func defaultCommandRunner(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).CombinedOutput()
 }
