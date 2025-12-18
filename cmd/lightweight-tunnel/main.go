@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -275,6 +276,8 @@ func manageService(action, serviceName, configPath string) error {
 		if err != nil {
 			return fmt.Errorf("failed to locate binary: %w", err)
 		}
+		quotedBin := strconv.Quote(binPath)
+		quotedConfig := strconv.Quote(absConfig)
 
 		unitContent := fmt.Sprintf(`[Unit]
 Description=Lightweight Tunnel Service (%s)
@@ -290,7 +293,7 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-`, serviceName, fmt.Sprintf("%q", binPath), fmt.Sprintf("%q", absConfig))
+`, serviceName, quotedBin, quotedConfig)
 
 		if err := os.WriteFile(unitFile, []byte(unitContent), 0644); err != nil {
 			return fmt.Errorf("failed to write service file: %w", err)
@@ -304,8 +307,12 @@ WantedBy=multi-user.target
 		return runCommands(commands)
 
 	case "uninstall":
-		_, _ = runCommand("systemctl", "stop", unitName)
-		_, _ = runCommand("systemctl", "disable", unitName)
+		if out, err := runCommand("systemctl", "stop", unitName); err != nil {
+			log.Printf("Warning: failed to stop service %s: %v: %s", unitName, err, string(out))
+		}
+		if out, err := runCommand("systemctl", "disable", unitName); err != nil {
+			log.Printf("Warning: failed to disable service %s: %v: %s", unitName, err, string(out))
+		}
 		if err := os.Remove(unitFile); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove service file: %w", err)
 		}
