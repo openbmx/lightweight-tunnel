@@ -54,7 +54,7 @@ func TestManageServiceNormalizesNames(t *testing.T) {
 	var executed [][]string
 	runner := func(name string, args ...string) ([]byte, error) {
 		executed = append(executed, append([]string{name}, args...))
-		return nil, nil
+		return []byte("ok"), nil
 	}
 
 	if err := manageServiceWithRunner("restart", "custom.service", "", t.TempDir(), runner); err != nil {

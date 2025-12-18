@@ -286,6 +286,7 @@ func manageServiceWithRunner(action, serviceName, configPath, dir string, runner
 		quotedBin := strconv.Quote(binPath)
 		quotedConfig := strconv.Quote(absConfig)
 
+		// Use a high file descriptor limit to support many concurrent peers without hitting OS limits.
 		unitContent := fmt.Sprintf(`[Unit]
 Description=Lightweight Tunnel Service (%s)
 After=network-online.target
@@ -302,7 +303,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 `, serviceName, quotedBin, quotedConfig)
 
-		if err := os.WriteFile(unitFile, []byte(unitContent), 0644); err != nil {
+		if err := os.WriteFile(unitFile, []byte(unitContent), 0640); err != nil {
 			return fmt.Errorf("failed to write service file: %w", err)
 		}
 
