@@ -244,6 +244,7 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
   "mode": "client",
   "remote_addr": "<服务器IP>:9000",
   "tunnel_addr": "10.0.0.2/24",
+  "advertised_routes": ["192.168.1.0/24"],
   "key": "your-secret-key",
   "mtu": 1400,
   "fec_data": 10,
@@ -306,11 +307,51 @@ sudo ./lightweight-tunnel -c config.json
 | `-tls-key` | TLS 私钥文件（服务端） | - |
 | `-tls-skip-verify` | 跳过证书验证（客户端，不安全） | false |
 | `-tun` | 指定 TUN 设备名（为空则自动分配 tun0、tun1...） | - |
+| `-routes` | 逗号分隔的 CIDR 列表，表示可经由本节点访问的其他网段（例如本地网卡或其他 TUN） | - |
 | `-service` | systemd 服务操作：install/uninstall/start/stop/restart/status | - |
 | `-service-name` | systemd 服务名 | lightweight-tunnel |
 | `-service-config` | 安装/控制服务使用的配置文件路径 | /etc/lightweight-tunnel/config.json |
 | `-v` | 显示版本 | - |
 | `-g` | 生成示例配置文件 | - |
+
+### 广播额外网段（访问其他 TUN/网卡）
+
+如果客户端后面还有其他网段需要通过隧道提供给其他节点访问（例如本地 LAN 或另一条 TUN），可以使用 `advertised_routes` 或 `-routes` 进行声明，服务端会基于这些前缀进行转发：
+
+```bash
+# 客户端示例：将 192.168.1.0/24 经由隧道提供给其他节点访问
+sudo ./lightweight-tunnel -m client -r <SERVER_IP>:9000 -t 10.0.0.2/24 \
+    -routes "192.168.1.0/24"
+```
+
+> 说明：当前路由广播由客户端上报给服务端后用于服务端转发路径（包含客户端之间的转发），P2P 广播仅记录日志，不会直接更新路由表。
+
+使用配置文件示例：
+
+```json
+// server.json
+{
+  "mode": "server",
+  "local_addr": "0.0.0.0:9000",
+  "tunnel_addr": "10.0.0.1/24",
+  "key": "your-secret-key",
+  "advertised_routes": []
+}
+```
+
+```json
+// client.json
+{
+  "mode": "client",
+  "remote_addr": "<服务器IP>:9000",
+  "tunnel_addr": "10.0.0.2/24",
+  "key": "your-secret-key",
+  "advertised_routes": [
+    "192.168.1.0/24",
+    "10.10.0.0/16"
+  ]
+}
+```
 
 ### 多客户端配置选项
 
