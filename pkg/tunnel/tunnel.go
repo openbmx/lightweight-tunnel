@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -13,9 +12,9 @@ import (
 
 	"github.com/openbmx/lightweight-tunnel/internal/config"
 	"github.com/openbmx/lightweight-tunnel/pkg/fec"
+	"github.com/openbmx/lightweight-tunnel/pkg/faketcp"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
-	"github.com/openbmx/lightweight-tunnel/pkg/tcp_disguise"
 )
 
 const (
@@ -33,7 +32,7 @@ const (
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn       *tcp_disguise.Conn
+	conn       *faketcp.Conn
 	sendQueue  chan []byte
 	recvQueue  chan []byte
 	clientIP   net.IP
@@ -46,7 +45,7 @@ type ClientConnection struct {
 type Tunnel struct {
 	config     *config.Config
 	fec        *fec.FEC
-	conn       *tcp_disguise.Conn    // Used in client mode
+	conn       *faketcp.Conn    // Used in client mode
 	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
 	clientsMux sync.RWMutex
 	tunName    string
@@ -300,26 +299,13 @@ func (t *Tunnel) connectClient() error {
 	
 	timeout := time.Duration(t.config.Timeout) * time.Second
 	
-	var conn *tcp_disguise.Conn
-	var err error
-	
+	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
-		log.Println("TLS encryption enabled")
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: t.config.TLSSkipVerify,
-			MinVersion:         tls.VersionTLS12,
-		}
-		
-		if t.config.TLSSkipVerify {
-			log.Println("WARNING: TLS certificate verification disabled (insecure)")
-		}
-		
-		conn, err = tcp_disguise.DialTLS(t.config.RemoteAddr, timeout, tlsConfig)
-	} else {
-		log.Println("WARNING: TLS encryption disabled - traffic is sent in plaintext and can be inspected by ISPs")
-		conn, err = tcp_disguise.DialTCP(t.config.RemoteAddr, timeout)
+		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
 	
+	log.Println("Using UDP with fake TCP headers for firewall bypass")
+	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
 	if err != nil {
 		return err
 	}
@@ -333,32 +319,13 @@ func (t *Tunnel) connectClient() error {
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 	
-	var listener *tcp_disguise.Listener
-	var err error
-	
+	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
-		log.Println("TLS encryption enabled")
-		
-		if t.config.TLSCertFile == "" || t.config.TLSKeyFile == "" {
-			return errors.New("TLS enabled but tls_cert_file or tls_key_file not specified in configuration")
-		}
-		
-		cert, err := tls.LoadX509KeyPair(t.config.TLSCertFile, t.config.TLSKeyFile)
-		if err != nil {
-			return fmt.Errorf("failed to load TLS certificate: %v", err)
-		}
-		
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		}
-		
-		listener, err = tcp_disguise.ListenTLS(t.config.LocalAddr, tlsConfig)
-	} else {
-		log.Println("WARNING: TLS encryption disabled - traffic is sent in plaintext and can be inspected by ISPs")
-		listener, err = tcp_disguise.ListenTCP(t.config.LocalAddr)
+		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
 	}
 	
+	log.Println("Using UDP with fake TCP headers for firewall bypass")
+	listener, err := faketcp.Listen(t.config.LocalAddr)
 	if err != nil {
 		return err
 	}
@@ -382,7 +349,7 @@ func (t *Tunnel) startServer() error {
 }
 
 // acceptClients accepts multiple client connections
-func (t *Tunnel) acceptClients(listener *tcp_disguise.Listener) {
+func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
 	defer t.wg.Done()
 	defer listener.Close()
 
@@ -427,7 +394,7 @@ func (t *Tunnel) acceptClients(listener *tcp_disguise.Listener) {
 }
 
 // handleClient handles a single client connection
-func (t *Tunnel) handleClient(conn *tcp_disguise.Conn) {
+func (t *Tunnel) handleClient(conn *faketcp.Conn) {
 	log.Printf("Client connected: %s", conn.RemoteAddr())
 
 	client := &ClientConnection{

@@ -2,14 +2,15 @@
 
 ## Overview
 
-Lightweight Tunnel is a Go-based network tunnel implementation that provides secure, reliable communication between two endpoints using TCP disguise and Forward Error Correction (FEC).
+Lightweight Tunnel is a Go-based network tunnel implementation that provides secure, reliable communication between endpoints using **UDP with fake TCP headers** and Forward Error Correction (FEC). This design avoids TCP-over-TCP issues while bypassing firewalls that only allow TCP traffic.
 
 ## Design Goals
 
 1. **Lightweight**: Minimal resource usage suitable for low-spec servers
 2. **Reliable**: FEC error correction for packet loss recovery
-3. **Stealthy**: TCP disguise to bypass firewall restrictions
-4. **Simple**: Easy to deploy and configure
+3. **Stealthy**: Fake TCP headers to bypass firewall restrictions
+4. **Performance**: UDP transport avoids TCP-over-TCP meltdown
+5. **Simple**: Easy to deploy and configure
 
 ## Architecture
 
@@ -48,17 +49,19 @@ Lightweight Tunnel is a Go-based network tunnel implementation that provides sec
           │                                  │
           ▼                                  │
 ┌───────────────────────────────────────────────────────────────┐
-│                    TCP Disguise Layer                          │
-│          (Wraps UDP-like packets in TCP stream)               │
+│                    Fake TCP Layer                              │
+│      (Adds/Removes TCP headers to/from UDP packets)           │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │  Length Prefix (4 bytes) │ Packet Type (1 byte) │ Data  │ │
+│  │  TCP Header (20 bytes): Ports, SeqNum, AckNum, Flags   │ │
+│  │  + UDP Payload                                          │ │
 │  └─────────────────────────────────────────────────────────┘ │
 └───────────────────┬───────────────────────────────────────────┘
                     │
                     ▼
 ┌───────────────────────────────────────────────────────────────┐
-│                    TCP Connection                              │
+│                    UDP Connection                              │
 │                (Actual Network Transport)                      │
+│           Real UDP - No TCP retransmissions!                   │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,25 +79,41 @@ Lightweight Tunnel is a Go-based network tunnel implementation that provides sec
 - `Read()`: Reads IP packets from TUN device
 - `Write()`: Writes IP packets to TUN device
 
-### 2. TCP Disguise Layer (`pkg/tcp_disguise/tcp_disguise.go`)
+### 2. Fake TCP Layer (`pkg/faketcp/faketcp.go`)
 
-Wraps UDP-like packet semantics in a TCP connection:
+Creates the appearance of TCP while using UDP transport:
 
-- **Packet Framing**: Each packet is prefixed with a 4-byte length header
-- **Reliable Stream**: Uses TCP for underlying transport
-- **Packet Boundaries**: Maintains packet boundaries unlike raw TCP
+- **UDP Transport**: Uses actual UDP sockets for packet delivery
+- **TCP Headers**: Adds 20-byte TCP headers to each packet
+- **Firewall Bypass**: Packets appear as TCP to network devices
+- **No TCP Semantics**: No retransmissions, congestion control, or stream ordering
 
-**Packet Format:**
+**TCP Header Format:**
 ```
-┌──────────────┬──────────────┬──────────────────┐
-│   Length     │     Type     │      Payload     │
-│  (4 bytes)   │   (1 byte)   │   (variable)     │
-└──────────────┴──────────────┴──────────────────┘
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│  Src Port    │  Dst Port    │  Sequence Number            │
+│  (2 bytes)   │  (2 bytes)   │  (4 bytes)                  │
+├──────────────┴──────────────┴──────────────┴──────────────┤
+│  Ack Number               │  Flags  │  Window              │
+│  (4 bytes)                │  (1 B)  │  (2 bytes)           │
+├──────────────────────────┬┴─────────┴──────────────────────┤
+│  Checksum    │  Urgent Ptr │       Options (optional)      │
+│  (2 bytes)   │  (2 bytes)  │       (variable)              │
+└──────────────┴─────────────┴───────────────────────────────┘
 ```
 
-**Packet Types:**
-- `0x01`: Data packet (IP packet from TUN)
-- `0x02`: Keepalive packet (maintain connection)
+**Key Features:**
+- Sequence numbers increment with data sent (cosmetic only)
+- ACK numbers track received sequences (cosmetic only)
+- PSH+ACK flags set on data packets
+- Window size set to 65535
+- Checksum set to 0 (not validated)
+
+**Why This Works:**
+- Most firewalls do stateless inspection of packet headers
+- Deep packet inspection (DPI) may detect this is not real TCP
+- Provides basic firewall bypass for simple port-based filtering
+- More sophisticated than tinyfecVPN (no disguise) but simpler than udp2raw (full raw sockets)
 
 ### 3. FEC (Forward Error Correction) (`pkg/fec/fec.go`)
 
@@ -168,17 +187,34 @@ JSON-based configuration with sensible defaults:
 
 ### Current Implementation
 
-- **TCP Disguise**: Helps bypass simple firewall rules that block UDP
-- **TLS Encryption**: Optional TLS 1.2+ encryption for data confidentiality
-- **No Authentication**: Pre-shared key auth not yet implemented (coming soon)
+- **Fake TCP Headers**: Bypasses simple firewall rules that block UDP
+- **No Encryption**: Traffic is sent in plaintext by default
+- **No Authentication**: No built-in authentication mechanism
+
+### Why No TLS?
+
+TLS (Transport Layer Security) is designed for TCP streams and cannot be used with UDP. For UDP-based protocols, you would need:
+- **DTLS** (Datagram TLS) - More complex, not yet implemented
+- **Application-level encryption** - Encrypt payloads before tunneling
+- **IPsec** - OS-level VPN encryption
+- **WireGuard** - Modern VPN with built-in encryption
 
 ### Recommendations for Production
 
-1. **✅ Enable TLS/SSL**: Always use TLS encryption in production
-2. **Authentication**: Use certificate-based authentication
-3. **Rate Limiting**: Prevent DoS attacks
-4. **Connection Limits**: Limit number of connections per IP
-5. **Packet Validation**: Validate packet sizes and types
+1. **❌ No TLS**: TLS cannot be used with UDP transport
+2. **✅ Use IPsec or WireGuard**: OS-level encryption over the tunnel
+3. **✅ Application Encryption**: Encrypt sensitive data before sending
+4. **Authentication**: Consider adding pre-shared key authentication (future work)
+5. **Rate Limiting**: Prevent DoS attacks
+6. **Connection Limits**: Limit number of connections per IP
+7. **Packet Validation**: Validate packet sizes and types
+
+### Advantages Over Real TCP
+
+1. **No TCP-over-TCP**: Avoids the TCP-over-TCP meltdown problem
+2. **Lower Latency**: UDP has no head-of-line blocking
+3. **Better for Real-time**: No retransmissions delay subsequent packets
+4. **FEC Works Better**: Forward error correction designed for lossy datagram transport
 
 ## Performance Characteristics
 
@@ -186,27 +222,65 @@ JSON-based configuration with sensible defaults:
 
 - **Best Case**: Near line-rate with low overhead
 - **FEC Overhead**: ~30% for 10 data + 3 parity configuration
-- **TCP Overhead**: Standard TCP header (~40 bytes per packet)
+- **UDP Overhead**: Standard UDP header (~8 bytes) + Fake TCP header (~20 bytes)
+- **No TCP Overhead**: No TCP congestion control or retransmission delays
 
 ### Latency
 
 - **Additional Latency**: ~1-2ms for packet processing
-- **TCP Latency**: Standard TCP latency characteristics
-- **Queue Depth**: 100 packets (configurable)
+- **UDP Latency**: Lower than TCP (no connection setup, no retransmissions)
+- **No Head-of-Line Blocking**: Lost packets don't block subsequent packets
+- **Queue Depth**: 100-1000 packets (configurable)
 
 ### Resource Usage
 
 - **Memory**: ~10-20 MB per connection
 - **CPU**: Low (<5% on modern systems)
-- **Goroutines**: 5 per tunnel instance
+- **Goroutines**: 5 per tunnel instance (client) or per client connection (server)
+
+### Comparison: Fake TCP vs Real TCP
+
+| Feature | Fake TCP (This Implementation) | Real TCP | UDP (Plain) |
+|---------|-------------------------------|----------|-------------|
+| Firewall Bypass | ✅ Good | ✅ Best | ❌ Often Blocked |
+| Latency | ✅ Low | ❌ Higher | ✅ Lowest |
+| Head-of-Line Blocking | ✅ None | ❌ Yes | ✅ None |
+| TCP-over-TCP Issues | ✅ None | ❌ Severe | ✅ None |
+| FEC Compatibility | ✅ Excellent | ❌ Poor | ✅ Excellent |
+| Packet Loss Handling | FEC Only | Retransmission | None |
+| Congestion Control | None | Yes | None |
+| Ordered Delivery | No | Yes | No |
 
 ## Limitations
 
 1. **IPv4 Only**: No IPv6 support currently
 2. **Linux Only**: Uses Linux-specific TUN/TAP interfaces
-3. **No NAT Traversal**: Requires direct connectivity or port forwarding
+3. **No NAT Traversal**: Requires direct connectivity or port forwarding (use P2P mode for NAT traversal)
 4. **Simple FEC**: XOR-based FEC is less robust than Reed-Solomon
-5. **Centralized Routing**: All traffic flows through server (potential bottleneck)
+5. **No Encryption**: No built-in encryption (use IPsec or application-level encryption)
+6. **Fake TCP Detection**: DPI systems may detect this is not real TCP
+7. **No Congestion Control**: May flood network in high-loss scenarios
+
+## Comparison with Reference Projects
+
+### vs. udp2raw
+- **Similarity**: Both add fake TCP headers to UDP packets
+- **Difference**: udp2raw uses raw sockets (IPPROTO_RAW) for more authentic TCP packets
+- **Trade-off**: Our implementation is simpler but less sophisticated
+- **Detection**: udp2raw is harder to detect with DPI
+
+### vs. tinyfecVPN
+- **Similarity**: Both provide TUN/TAP VPN with FEC
+- **Difference**: tinyfecVPN uses plain UDP, we add fake TCP headers
+- **Advantage**: Our solution bypasses simple TCP-only firewalls
+- **Compatibility**: FEC implementation is similar
+
+### Combined Approach
+This implementation combines ideas from both:
+- TUN/TAP VPN with FEC (like tinyfecVPN)
+- Fake TCP headers for firewall bypass (inspired by udp2raw)
+- Pure Go implementation (no C dependencies)
+- Simpler than raw sockets (easier to deploy)
 
 ## Multi-Client Architecture (NEW)
 
