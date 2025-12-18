@@ -23,7 +23,7 @@ var (
 )
 
 const systemdUnitTemplate = `[Unit]
-Description=Lightweight Tunnel Service (%s)
+Description=Lightweight Tunnel Service (%q)
 After=network-online.target
 Wants=network-online.target
 
@@ -33,6 +33,10 @@ Type=simple
 ExecStart=%s -c %s
 Restart=on-failure
 RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=full
 
 [Install]
 WantedBy=multi-user.target
@@ -304,7 +308,7 @@ func manageServiceWithRunner(action, serviceName, configPath, dir string, runner
 
 		unitContent := fmt.Sprintf(systemdUnitTemplate, serviceName, quotedBin, quotedConfig)
 
-		if err := os.WriteFile(unitFile, []byte(unitContent), 0644); err != nil {
+		if err := os.WriteFile(unitFile, []byte(unitContent), 0640); err != nil {
 			return fmt.Errorf("failed to write service file: %w", err)
 		}
 
