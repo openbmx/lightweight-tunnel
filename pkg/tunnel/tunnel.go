@@ -886,6 +886,9 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						// Store this client's peer info for future clients
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
+						t.clientsMux.Unlock()
+
+						t.clientsMux.RLock()
 						peerInfos := make([]string, 0, len(t.clients))
 						broadcastTargets := make([]*ClientConnection, 0, len(t.clients))
 						for _, existing := range t.clients {
@@ -900,10 +903,10 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 								broadcastTargets = append(broadcastTargets, existing)
 							}
 						}
-						t.clientsMux.Unlock()
+						t.clientsMux.RUnlock()
 
 						// Broadcast this peer info to all other clients
-						t.broadcastPeerInfo(tunnelIP, peerInfoStr, broadcastTargets)
+						t.broadcastPeerInfo(peerInfoStr, broadcastTargets)
 
 						// Send existing peers to this client so it learns about them
 						t.sendExistingPeersToClient(client, peerInfos)
@@ -1363,7 +1366,7 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 }
 
 // broadcastPeerInfo broadcasts peer information to all connected clients (server mode)
-func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string, targets []*ClientConnection) {
+func (t *Tunnel) broadcastPeerInfo(peerInfo string, targets []*ClientConnection) {
 	if !t.config.P2PEnabled {
 		return
 	}
@@ -1384,7 +1387,7 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string, targets 
 				close(client.stopCh)
 			})
 		} else {
-			log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
+			log.Printf("Broadcasted peer info to client %s", client.clientIP)
 		}
 	}
 }
