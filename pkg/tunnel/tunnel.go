@@ -38,7 +38,7 @@ type ClientConnection struct {
 	sendQueue chan []byte
 	recvQueue chan []byte
 	clientIP  net.IP
-	peerInfo  string
+	peerInfo  string // Cached peer info string announced by this client
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	wg        sync.WaitGroup
@@ -886,8 +886,12 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 						// Store this client's peer info for future clients
 						t.clientsMux.Lock()
 						client.peerInfo = peerInfoStr
-						peerInfos := make([]string, 0, len(t.clients))
-						broadcastTargets := make([]*ClientConnection, 0, len(t.clients))
+						peerCapacity := len(t.clients) - 1
+						if peerCapacity < 0 {
+							peerCapacity = 0
+						}
+						peerInfos := make([]string, 0, peerCapacity)
+						broadcastTargets := make([]*ClientConnection, 0, peerCapacity)
 						for _, existing := range t.clients {
 							if existing == client {
 								continue
@@ -895,6 +899,7 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 							if existing.peerInfo != "" {
 								peerInfos = append(peerInfos, existing.peerInfo)
 							}
+							// Broadcast to all registered clients (even if they haven't announced peer info yet)
 							if existing.clientIP != nil {
 								broadcastTargets = append(broadcastTargets, existing)
 							}
