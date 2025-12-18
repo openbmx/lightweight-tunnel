@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/openbmx/lightweight-tunnel/internal/config"
@@ -15,6 +18,10 @@ import (
 var (
 	version                  = "1.0.0"
 	defaultServiceConfigPath = "/etc/lightweight-tunnel/config.json"
+	serviceDir               = "/etc/systemd/system"
+	runCommand               = func(name string, args ...string) ([]byte, error) {
+		return exec.Command(name, args...).CombinedOutput()
+	}
 )
 
 func main() {
@@ -238,5 +245,100 @@ func generateConfigFile(filename string) error {
 	}
 
 	fmt.Printf("Also generated client config example: %s\n", clientFilename)
+	return nil
+}
+
+func manageService(action, serviceName, configPath string) error {
+	if serviceName == "" {
+		return fmt.Errorf("service name is required")
+	}
+
+	unitName := normalizeServiceName(serviceName)
+	unitFile := filepath.Join(serviceDir, unitName)
+
+	switch action {
+	case "install":
+		if configPath == "" {
+			return fmt.Errorf("config file path is required for install")
+		}
+
+		absConfig, err := filepath.Abs(configPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve config path: %w", err)
+		}
+
+		if _, err := os.Stat(absConfig); err != nil {
+			return fmt.Errorf("config file not found: %w", err)
+		}
+
+		binPath, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("failed to locate binary: %w", err)
+		}
+
+		unitContent := fmt.Sprintf(`[Unit]
+Description=Lightweight Tunnel Service (%s)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%s -c %s
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+`, serviceName, fmt.Sprintf("%q", binPath), fmt.Sprintf("%q", absConfig))
+
+		if err := os.WriteFile(unitFile, []byte(unitContent), 0644); err != nil {
+			return fmt.Errorf("failed to write service file: %w", err)
+		}
+
+		commands := [][]string{
+			{"systemctl", "daemon-reload"},
+			{"systemctl", "enable", unitName},
+			{"systemctl", "start", unitName},
+		}
+		return runCommands(commands)
+
+	case "uninstall":
+		_, _ = runCommand("systemctl", "stop", unitName)
+		_, _ = runCommand("systemctl", "disable", unitName)
+		if err := os.Remove(unitFile); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove service file: %w", err)
+		}
+		_, err := runCommand("systemctl", "daemon-reload")
+		return err
+
+	case "start", "stop", "restart", "status":
+		out, err := runCommand("systemctl", action, unitName)
+		if err != nil {
+			return fmt.Errorf("systemctl %s failed: %v: %s", action, err, string(out))
+		}
+		if len(out) > 0 {
+			fmt.Print(string(out))
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown service action: %s", action)
+	}
+}
+
+func normalizeServiceName(name string) string {
+	if strings.HasSuffix(name, ".service") {
+		return name
+	}
+	return name + ".service"
+}
+
+func runCommands(commands [][]string) error {
+	for _, cmd := range commands {
+		out, err := runCommand(cmd[0], cmd[1:]...)
+		if err != nil {
+			return fmt.Errorf("%s %s failed: %v: %s", cmd[0], strings.Join(cmd[1:], " "), err, string(out))
+		}
+	}
 	return nil
 }

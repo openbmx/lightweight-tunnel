@@ -89,6 +89,7 @@ sudo ./lightweight-tunnel -service uninstall   # 需要时移除服务
 
 说明：
 - 默认服务名为 `lightweight-tunnel.service`，可通过 `-service-name` 自定义，多隧道部署时为每个配置指定不同名称。
+- 配置文件名可自定义，通过 `-service-config` 或 `-c` 指定任意路径和文件名。
 - 服务使用指定的配置文件开机自启，配置更新后运行 `sudo systemctl restart <服务名>` 生效。
 
 ### 基本使用
