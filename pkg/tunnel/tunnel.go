@@ -1330,6 +1330,10 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	// This avoids double-wrapping by clientNetWriter
 	if err := client.conn.WritePacket(encryptedPacket); err != nil {
 		log.Printf("Failed to send public address to client: %v", err)
+		// Signal client to disconnect on write error (consistent with clientNetWriter behavior)
+		client.stopOnce.Do(func() {
+			close(client.stopCh)
+		})
 		return
 	}
 	
@@ -1362,6 +1366,10 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 			// This avoids double-wrapping by clientNetWriter
 			if err := client.conn.WritePacket(encryptedPacket); err != nil {
 				log.Printf("Failed to broadcast peer info to %s: %v", client.clientIP, err)
+				// Signal this specific client to disconnect on write error
+				client.stopOnce.Do(func() {
+					close(client.stopCh)
+				})
 			} else {
 				log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
 			}
