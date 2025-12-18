@@ -69,6 +69,7 @@ type Conn struct {
 	mu          sync.Mutex
 	isConnected bool // true if UDP socket is connected, false if shared listener socket
 	recvQueue   chan []byte // for listener connections
+	closed      bool        // tracks if connection is closed
 }
 
 // NewConn creates a new fake TCP connection
@@ -260,8 +261,18 @@ func (c *Conn) WritePacket(data []byte) error {
 func (c *Conn) ReadPacket() ([]byte, error) {
 	if !c.isConnected {
 		// Listener connection - read from queue
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("connection closed")
+		}
+		c.mu.Unlock()
+		
 		select {
-		case payload := <-c.recvQueue:
+		case payload, ok := <-c.recvQueue:
+			if !ok {
+				return nil, fmt.Errorf("connection closed")
+			}
 			return payload, nil
 		case <-time.After(30 * time.Second):
 			return nil, fmt.Errorf("read timeout")
@@ -360,6 +371,15 @@ func parseTCPHeader(buf []byte) *TCPHeader {
 
 // Close closes the connection
 func (c *Conn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	// Avoid double-close
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	
 	// For connected sockets created with Dial(), close the UDP connection
 	if c.isConnected {
 		return c.udpConn.Close()
