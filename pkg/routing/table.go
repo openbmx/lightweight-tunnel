@@ -69,7 +69,7 @@ func (rt *RoutingTable) updateRouteForPeer(peer *p2p.PeerInfo) {
 	
 	// Check if direct P2P is available
 	if peer.Connected {
-		// Update peer to mark it's not going through server
+		// Update peer to mark its not going through server
 		peer.SetThroughServer(false)
 		rt.routes[ipStr] = &Route{
 			Destination: peer.TunnelIP,
