@@ -29,11 +29,13 @@ if [ ! -f "$BIN_PATH" ]; then
   exit 1
 fi
 
-INSTALLER="sudo install -m 755"
-if [ -w "$(dirname "$TARGET")" ] && { [ ! -e "$TARGET" ] || [ -w "$TARGET" ]; }; then
+INSTALLER=""
+if [ -w "$(dirname "$TARGET")" ]; then
   INSTALLER="install -m 755"
-elif ! command -v sudo >/dev/null 2>&1; then
-  echo "sudo is required to install to $TARGET."
+elif command -v sudo >/dev/null 2>&1; then
+  INSTALLER="sudo install -m 755"
+else
+  echo "Cannot install to $TARGET: insufficient permissions and sudo is not available."
   exit 1
 fi
 
