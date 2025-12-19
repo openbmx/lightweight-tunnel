@@ -487,7 +487,7 @@ func (t *Tunnel) connectClient() error {
 	)
 
 	if useLocalAddr {
-		log.Printf("Binding client to local address %s", t.config.LocalAddr)
+		log.Println("Binding client to configured local address")
 		conn, err = faketcp.DialWithLocalAddr(t.config.RemoteAddr, t.config.LocalAddr, timeout)
 	} else {
 		conn, err = faketcp.Dial(t.config.RemoteAddr, timeout)

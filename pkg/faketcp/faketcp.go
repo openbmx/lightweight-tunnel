@@ -105,7 +105,7 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 }
 
 // DialWithLocalAddr creates a fake TCP connection using a specific local address.
-// When localAddr is empty, the OS chooses an ephemeral port.
+// When localAddr is empty, the OS chooses the source IP and port automatically.
 func DialWithLocalAddr(remoteAddr, localAddr string, timeout time.Duration) (*Conn, error) {
 	// Parse remote address
 	raddr, err := net.ResolveUDPAddr("udp", remoteAddr)
