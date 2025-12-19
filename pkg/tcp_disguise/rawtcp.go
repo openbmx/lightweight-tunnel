@@ -25,8 +25,8 @@ const (
 	// Header sizes
 	IPHeaderSize  = 20
 	TCPHeaderSize = 20
-	MaxPacketSize = 1500
-	MaxPayloadSize = MaxPacketSize - IPHeaderSize - TCPHeaderSize
+	RawMaxPacketSize = 1500
+	MaxPayloadSize = RawMaxPacketSize - IPHeaderSize - TCPHeaderSize
 
 	// Timeouts
 	ReadTimeout       = 1 * time.Second
@@ -149,7 +149,7 @@ func Listen(addr string) (*RawListener, error) {
 
 // Accept accepts a new connection
 func (l *RawListener) Accept() (*RawConn, error) {
-	buf := make([]byte, MaxPacketSize)
+	buf := make([]byte, RawMaxPacketSize)
 
 	for {
 		// Check if stopped
@@ -386,7 +386,7 @@ func (c *RawConn) ReadPacket() ([]byte, error) {
 
 // receiver receives packets (for client connections)
 func (c *RawConn) receiver() {
-	buf := make([]byte, MaxPacketSize)
+	buf := make([]byte, RawMaxPacketSize)
 	for {
 		if atomic.LoadInt32(&c.closed) != 0 {
 			return
@@ -456,7 +456,7 @@ func (c *RawConn) receiver() {
 
 // receiverListener receives packets (for listener connections)
 func (c *RawConn) receiverListener(fd int, l *RawListener) {
-	buf := make([]byte, MaxPacketSize)
+	buf := make([]byte, RawMaxPacketSize)
 	for {
 		if atomic.LoadInt32(&c.closed) != 0 {
 			return
