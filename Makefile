@@ -74,8 +74,7 @@ install-service:
 		echo "Using existing binary at $(GOBIN)/$(BINARY_NAME)"; \
 	elif command -v $(GOCMD) >/dev/null 2>&1; then \
 		echo "Binary not found, building $(BINARY_NAME)..."; \
-		mkdir -p $(OUTPUT_DIR); \
-		$(GOBUILD) $(LDFLAGS) -o $(GOBIN)/$(BINARY_NAME) ./cmd/$(BINARY_NAME); \
+		$(MAKE) build; \
 	else \
 		echo "ERROR: $(GOBIN)/$(BINARY_NAME) not found and '$(GOCMD)' is not available. Please install Go or provide the prebuilt binary."; \
 		exit 1; \
