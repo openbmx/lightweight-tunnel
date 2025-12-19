@@ -38,9 +38,33 @@ const (
 	HandshakeTimeout = 5 * time.Second // 增加到5秒以适应网络抖动
 	// Channel close delay to allow pending writes to complete
 	ChannelCloseDelay = 100 * time.Millisecond
-	// Pending accepted connections buffer
-	ListenerQueueSize = 8
 )
+
+// Tuning controls runtime knobs for faketcp behavior.
+type Tuning struct {
+	ListenerQueueSize   int           // pending accept queue length
+	HandshakeMaxErrors  int           // max non-timeout handshake read errors before giving up
+	WritePacingMinDelay time.Duration // optional pacing delay between segments to reduce burst loss
+}
+
+var tunables = Tuning{
+	ListenerQueueSize:   8,
+	HandshakeMaxErrors:  2,
+	WritePacingMinDelay: 0,
+}
+
+// SetTuning applies runtime tuning (zero or negative values keep defaults).
+func SetTuning(t Tuning) {
+	if t.ListenerQueueSize > 0 {
+		tunables.ListenerQueueSize = t.ListenerQueueSize
+	}
+	if t.HandshakeMaxErrors > 0 {
+		tunables.HandshakeMaxErrors = t.HandshakeMaxErrors
+	}
+	if t.WritePacingMinDelay > 0 {
+		tunables.WritePacingMinDelay = t.WritePacingMinDelay
+	}
+}
 
 // TCPHeader represents a minimal TCP header
 type TCPHeader struct {
@@ -168,7 +192,7 @@ func (l *Listener) dispatch() {
 			select {
 			case l.newConnCh <- conn:
 			default:
-				log.Printf("accept queue full (%d), dropping connection from %s", ListenerQueueSize, connKey)
+				log.Printf("accept queue full (%d), dropping connection from %s", tunables.ListenerQueueSize, connKey)
 				l.mu.Lock()
 				delete(l.connMap, connKey)
 				l.mu.Unlock()
@@ -273,6 +297,7 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 
 	// Wait for SYN-ACK
 	buf := make([]byte, MaxPacketSize)
+	errorCount := 0
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
@@ -285,6 +310,10 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 			}
 			// Non-timeout errors are treated as best-effort; proceed without failing
 			log.Printf("handshake read error (best-effort): %v", err)
+			errorCount++
+			if tunables.HandshakeMaxErrors > 0 && errorCount >= tunables.HandshakeMaxErrors {
+				break
+			}
 			break
 		}
 		hdr := parseTCPHeader(buf[:n])
@@ -324,7 +353,7 @@ func Listen(addr string) (*Listener, error) {
 	l := &Listener{
 		udpConn:   udpConn,
 		connMap:   make(map[string]*Conn),
-		newConnCh: make(chan *Conn, ListenerQueueSize),
+		newConnCh: make(chan *Conn, tunables.ListenerQueueSize),
 	}
 
 	go l.dispatch()
@@ -394,6 +423,10 @@ func (c *Conn) WritePacket(data []byte) error {
 		// Update sequence number and counters
 		c.seqNum += uint32(len(seg))
 		sent += segLen
+
+		if tunables.WritePacingMinDelay > 0 {
+			time.Sleep(tunables.WritePacingMinDelay)
+		}
 	}
 
 	return nil
