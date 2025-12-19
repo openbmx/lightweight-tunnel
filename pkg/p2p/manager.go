@@ -132,11 +132,44 @@ func (m *Manager) SetPacketHandler(handler func(peerIP net.IP, data []byte)) {
 func (m *Manager) AddPeer(peer *PeerInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	ipStr := peer.TunnelIP.String()
-	m.peers[ipStr] = peer
-	
-	log.Printf("Added P2P peer: %s (public: %s, local: %s)", ipStr, peer.PublicAddr, peer.LocalAddr)
+	// If peer already exists, merge/replace fields (keep existing mutex/state)
+	if existing, ok := m.peers[ipStr]; ok {
+		existing.mu.Lock()
+		existing.PublicAddr = peer.PublicAddr
+		existing.LocalAddr = peer.LocalAddr
+		existing.NATType = peer.NATType
+		existing.mu.Unlock()
+	} else {
+		m.peers[ipStr] = peer
+	}
+
+	log.Printf("Added/Updated P2P peer: %s (public: %s, local: %s)", ipStr, peer.PublicAddr, peer.LocalAddr)
+
+	// If we already have a connection object for this peer, update its RemoteAddr
+	if conn, exists := m.connections[ipStr]; exists {
+		// Prefer local address when available (same LAN)
+		var targetAddr string
+		if peer.LocalAddr != "" && peer.LocalAddr != peer.PublicAddr {
+			targetAddr = peer.LocalAddr
+			conn.IsLocalNetwork = true
+		} else if peer.PublicAddr != "" {
+			targetAddr = peer.PublicAddr
+			conn.IsLocalNetwork = false
+		}
+
+		if targetAddr != "" {
+			if raddr, err := net.ResolveUDPAddr("udp4", targetAddr); err == nil {
+				conn.RemoteAddr = raddr
+				log.Printf("Updated connection remote address for %s -> %s", ipStr, raddr)
+				// Start handshake to refresh NAT mapping
+				go m.performHandshake(conn, conn.IsLocalNetwork)
+			} else {
+				log.Printf("Failed to resolve updated peer address %s: %v", targetAddr, err)
+			}
+		}
+	}
 }
 
 // ConnectToPeer establishes a P2P connection to a peer

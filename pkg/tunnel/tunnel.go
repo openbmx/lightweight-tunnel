@@ -78,6 +78,7 @@ type Tunnel struct {
 	myTunnelIP    net.IP                // My tunnel IP address
 	publicAddr    string                // Public address as seen by server (for NAT traversal)
 	publicAddrMux sync.RWMutex          // Protects publicAddr
+	connMux       sync.Mutex           // Protects t.conn during reconnects
 }
 
 // NewTunnel creates a new tunnel instance
@@ -429,6 +430,53 @@ func (t *Tunnel) connectClient() error {
 	return nil
 }
 
+// reconnectToServer attempts to reconnect to the server with exponential backoff.
+// It is safe to call from multiple goroutines; only one will perform the reconnect.
+func (t *Tunnel) reconnectToServer() error {
+	// Quick check: if tunnel is stopping, don't attempt reconnect
+	select {
+	case <-t.stopCh:
+		return fmt.Errorf("tunnel stopping")
+	default:
+	}
+
+	t.connMux.Lock()
+	// If another goroutine already reconnected, use that connection
+	if t.conn != nil {
+		t.connMux.Unlock()
+		return nil
+	}
+
+	defer t.connMux.Unlock()
+
+	backoff := 1
+	timeout := time.Duration(t.config.Timeout) * time.Second
+	for {
+		select {
+		case <-t.stopCh:
+			return fmt.Errorf("tunnel stopping")
+		default:
+		}
+
+		log.Printf("Attempting to reconnect to server at %s (backoff %ds)", t.config.RemoteAddr, backoff)
+		conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+		if err == nil {
+			t.conn = conn
+			log.Printf("Reconnected to server: %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
+			return nil
+		}
+
+		log.Printf("Reconnect attempt failed: %v", err)
+
+		// Sleep with exponential backoff capped
+		time.Sleep(time.Duration(backoff) * time.Second)
+		backoff *= 2
+		if backoff > 32 {
+			backoff = 32
+		}
+	}
+}
+
 // startServer starts the server and accepts multiple clients
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
@@ -692,19 +740,42 @@ func (t *Tunnel) netReader() {
 		default:
 		}
 
+		// Ensure we have a live connection
+		if t.conn == nil {
+			if err := t.reconnectToServer(); err != nil {
+				// Tunnel stopping or cannot reconnect
+				return
+			}
+		}
+
 		packet, err := t.conn.ReadPacket()
 		if err != nil {
 			// Check if it's a timeout - if so, continue to allow checking stopCh
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
+
 			select {
 			case <-t.stopCh:
 				// Tunnel is stopping, no need to log
 			default:
 				log.Printf("Network read error: %v", err)
 			}
-			return
+
+			// Close and clear current connection, then attempt reconnect
+			t.connMux.Lock()
+			if t.conn != nil {
+				_ = t.conn.Close()
+				t.conn = nil
+			}
+			t.connMux.Unlock()
+
+			if err := t.reconnectToServer(); err != nil {
+				return
+			}
+
+			// Successfully reconnected, continue reading
+			continue
 		}
 
 		if len(packet) < 1 {
@@ -814,6 +885,13 @@ func (t *Tunnel) netWriter() {
 				continue
 			}
 
+			// Ensure we have a live connection before writing
+			if t.conn == nil {
+				if err := t.reconnectToServer(); err != nil {
+					return
+				}
+			}
+
 			if err := t.conn.WritePacket(encryptedPacket); err != nil {
 				select {
 				case <-t.stopCh:
@@ -821,7 +899,26 @@ func (t *Tunnel) netWriter() {
 				default:
 					log.Printf("Network write error: %v", err)
 				}
-				return
+
+				// Close and clear connection then try to reconnect and retry once
+				t.connMux.Lock()
+				if t.conn != nil {
+					_ = t.conn.Close()
+					t.conn = nil
+				}
+				t.connMux.Unlock()
+
+				if err := t.reconnectToServer(); err != nil {
+					return
+				}
+
+				// Try writing once more after reconnect
+				if t.conn != nil {
+					if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
+						log.Printf("Network write retry failed: %v", err2)
+						return
+					}
+				}
 			}
 		}
 	}
@@ -847,6 +944,13 @@ func (t *Tunnel) keepalive() {
 				log.Printf("Keepalive encryption error: %v", err)
 				continue
 			}
+			// Ensure we have a live connection
+			if t.conn == nil {
+				if err := t.reconnectToServer(); err != nil {
+					return
+				}
+			}
+
 			if err := t.conn.WritePacket(encryptedPacket); err != nil {
 				select {
 				case <-t.stopCh:
@@ -854,7 +958,19 @@ func (t *Tunnel) keepalive() {
 				default:
 					log.Printf("Keepalive error: %v", err)
 				}
-				return
+
+				// Close and clear connection then attempt reconnect
+				t.connMux.Lock()
+				if t.conn != nil {
+					_ = t.conn.Close()
+					t.conn = nil
+				}
+				t.connMux.Unlock()
+
+				if err := t.reconnectToServer(); err != nil {
+					return
+				}
+				// don't return; let loop continue
 			}
 		}
 	}
