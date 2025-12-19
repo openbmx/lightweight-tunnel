@@ -180,7 +180,7 @@ func SaveConfig(filename string, config *Config) error {
 		return err
 	}
 
-	return os.WriteFile(filename, data, 0644)
+	return os.WriteFile(filename, data, 0600)
 }
 
 // UpdateConfigKey updates only the key field in an existing config file while preserving other fields.
@@ -206,5 +206,5 @@ func UpdateConfigKey(filename string, newKey string) error {
 		return err
 	}
 
-	return os.WriteFile(filename, updated, 0644)
+	return os.WriteFile(filename, updated, 0600)
 }

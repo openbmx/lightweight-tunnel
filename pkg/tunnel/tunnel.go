@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2407,11 +2408,11 @@ func (t *Tunnel) persistKeyToConfigFile(newKey string) {
 	}
 
 	if err := config.UpdateConfigKey(path, newKey); err != nil {
-		log.Printf("Failed to update config file %s with new key: %v", path, err)
+		log.Printf("Failed to update config file with new key: %v", err)
 		return
 	}
 
-	log.Printf("Updated config file %s with rotated key", path)
+	log.Printf("Updated config file (%s) with rotated key", filepath.Base(path))
 }
 
 func (t *Tunnel) expirePrevCipher(prev *crypto.Cipher) {
