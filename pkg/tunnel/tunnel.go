@@ -1428,6 +1428,9 @@ func GetPeerIP(tunnelAddr string) (string, error) {
 	}
 
 	lastOctet := ip4[3]
+	if lastOctet == 0 || lastOctet == 255 {
+		return "", errors.New("tunnel address must not use 0 or 255 for peer derivation")
+	}
 	if lastOctet == 1 {
 		ip4[3] = 2
 	} else {
