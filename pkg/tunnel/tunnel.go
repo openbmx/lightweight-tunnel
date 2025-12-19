@@ -1693,11 +1693,6 @@ func buildTLSLikeFrame(payload []byte, maxPadding int) ([]byte, error) {
 		return nil, fmt.Errorf("invalid obfuscation padding: %d", maxPadding)
 	}
 
-	// Ensure we always have room for the header + length field
-	if len(payload)+tlsRecordHeaderLen+tlsObfsLengthField > maxObfsFrameSize {
-		return nil, fmt.Errorf("packet too large for obfuscation (%d bytes)", len(payload))
-	}
-
 	padding := 0
 	if maxPadding > 0 {
 		var padByte [1]byte
@@ -1708,13 +1703,14 @@ func buildTLSLikeFrame(payload []byte, maxPadding int) ([]byte, error) {
 	}
 
 	bodyLen := tlsObfsLengthField + len(payload) + padding
+	maxBodyLen := maxObfsFrameSize - tlsRecordHeaderLen
 
 	// Enforce TLS record length limit and MTU-aligned cap
-	if bodyLen+tlsRecordHeaderLen > maxObfsFrameSize {
+	if bodyLen > maxBodyLen {
 		// Trim padding to fit into the frame budget (payload itself may be fine but random padding can exceed MTU)
-		padding = maxObfsFrameSize - tlsRecordHeaderLen - tlsObfsLengthField - len(payload)
+		padding = maxBodyLen - tlsObfsLengthField - len(payload)
 		if padding < 0 {
-			padding = 0
+			return nil, fmt.Errorf("packet too large for obfuscation (%d bytes)", len(payload))
 		}
 		bodyLen = tlsObfsLengthField + len(payload) + padding
 	}
@@ -1747,6 +1743,9 @@ func parseTLSLikeFrame(frame []byte) ([]byte, error) {
 	}
 
 	bodyLen := int(binary.BigEndian.Uint16(frame[3:]))
+	if bodyLen <= tlsObfsLengthField {
+		return nil, fmt.Errorf("obfuscation frame too small")
+	}
 	if bodyLen > maxObfsFrameSize-tlsRecordHeaderLen {
 		return nil, fmt.Errorf("obfuscation frame exceeds allowed size")
 	}
