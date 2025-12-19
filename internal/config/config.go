@@ -36,9 +36,6 @@ type Config struct {
 	RouteUpdateInterval int  `json:"route_update_interval"` // Route quality check interval in seconds (default 30)
 	P2PTimeout          int  `json:"p2p_timeout"`           // P2P connection timeout in seconds (default 5)
 	EnableNATDetection  bool `json:"enable_nat_detection"`  // Enable automatic NAT type detection (default true)
-
-	// ConfigPath stores the source config file path (not persisted to JSON)
-	ConfigPath string `json:"-"`
 }
 
 // DefaultConfig returns a default configuration
@@ -144,7 +141,6 @@ func LoadConfig(filename string) (*Config, error) {
 		config.EnableNATDetection = true
 	}
 
-	config.ConfigPath = filename
 	return &config, nil
 }
 

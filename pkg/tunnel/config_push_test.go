@@ -125,7 +125,7 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 	client.setCipherWithGen(oldCipher, tun.cipherGen)
 	tun.trackClientConnection(client)
 
-	if err := tun.rotateCipher("new-key"); err != nil {
+	if err := tun.rotateCipher("new-key-rotation"); err != nil {
 		t.Fatalf("rotateCipher failed: %v", err)
 	}
 

@@ -98,28 +98,29 @@ func (c *ClientConnection) getCipher() (*crypto.Cipher, uint64) {
 
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
-	config        *config.Config
-	fec           *fec.FEC
-	cipher        *crypto.Cipher // Encryption cipher (nil if no key)
-	cipherGen     uint64
-	prevCipher    *crypto.Cipher
-	prevCipherGen uint64
-	prevCipherExp time.Time
-	cipherMux     sync.RWMutex
-	configMux     sync.RWMutex
-	conn          faketcp.ConnAdapter          // Used in client mode (interface for both modes)
-	listener      faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
-	clients       map[string]*ClientConnection // Used in server mode (key: IP address)
-	clientsMux    sync.RWMutex
-	allClients    map[*ClientConnection]struct{} // Tracks all active clients (including those without registered tunnel IP)
-	allClientsMux sync.RWMutex
-	tunName       string
-	tunFile       *TunDevice
-	stopCh        chan struct{}
-	stopOnce      sync.Once // Ensures Stop() is only executed once
-	wg            sync.WaitGroup
-	sendQueue     chan []byte // Used in client mode
-	recvQueue     chan []byte // Used in client mode
+	config         *config.Config
+	configFilePath string
+	fec            *fec.FEC
+	cipher         *crypto.Cipher // Encryption cipher (nil if no key)
+	cipherGen      uint64
+	prevCipher     *crypto.Cipher
+	prevCipherGen  uint64
+	prevCipherExp  time.Time
+	cipherMux      sync.RWMutex
+	configMux      sync.RWMutex
+	conn           faketcp.ConnAdapter          // Used in client mode (interface for both modes)
+	listener       faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
+	clients        map[string]*ClientConnection // Used in server mode (key: IP address)
+	clientsMux     sync.RWMutex
+	allClients     map[*ClientConnection]struct{} // Tracks all active clients (including those without registered tunnel IP)
+	allClientsMux  sync.RWMutex
+	tunName        string
+	tunFile        *TunDevice
+	stopCh         chan struct{}
+	stopOnce       sync.Once // Ensures Stop() is only executed once
+	wg             sync.WaitGroup
+	sendQueue      chan []byte // Used in client mode
+	recvQueue      chan []byte // Used in client mode
 
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
@@ -135,7 +136,7 @@ type Tunnel struct {
 }
 
 // NewTunnel creates a new tunnel instance
-func NewTunnel(cfg *config.Config) (*Tunnel, error) {
+func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Force rawtcp mode - this is the only supported transport now
 	cfg.Transport = "rawtcp"
 	faketcp.SetMode(faketcp.ModeRaw)
@@ -220,13 +221,14 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	}
 
 	t := &Tunnel{
-		config:       cfg,
-		fec:          fecCodec,
-		cipher:       cipher,
-		stopCh:       make(chan struct{}),
-		myTunnelIP:   myIP,
-		clientRoutes: make(map[*ClientConnection][]string),
-		allClients:   make(map[*ClientConnection]struct{}),
+		config:         cfg,
+		configFilePath: configFilePath,
+		fec:            fecCodec,
+		cipher:         cipher,
+		stopCh:         make(chan struct{}),
+		myTunnelIP:     myIP,
+		clientRoutes:   make(map[*ClientConnection][]string),
+		allClients:     make(map[*ClientConnection]struct{}),
 	}
 
 	if cipher != nil {
@@ -2366,6 +2368,9 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 	if newKey == "" {
 		return errors.New("new key is empty")
 	}
+	if len(newKey) < 16 {
+		return errors.New("new key must be at least 16 characters")
+	}
 	newCipher, err := crypto.NewCipher(newKey)
 	if err != nil {
 		return err
@@ -2399,10 +2404,7 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 }
 
 func (t *Tunnel) persistKeyToConfigFile(newKey string) {
-	t.configMux.RLock()
-	path := t.config.ConfigPath
-	t.configMux.RUnlock()
-
+	path := t.configFilePath
 	if path == "" {
 		return
 	}

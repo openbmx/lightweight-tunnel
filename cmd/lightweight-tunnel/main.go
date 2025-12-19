@@ -144,7 +144,7 @@ func main() {
 	}
 
 	// Create tunnel
-	tun, err := tunnel.NewTunnel(cfg)
+	tun, err := tunnel.NewTunnel(cfg, *configFile)
 	if err != nil {
 		log.Fatalf("Failed to create tunnel: %v", err)
 	}
