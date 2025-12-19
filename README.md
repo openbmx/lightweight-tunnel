@@ -46,6 +46,8 @@ flowchart LR
 
 - ✅ **TLS 传输模式**：现已支持 `-tls` 与证书/密钥，满足需要纯 TCP/TLS 的场景，可配合 `-tls-skip-verify` 在测试环境跳过校验。
 - ✅ **P2P 连接超时可配置**：新增 `-p2p-timeout`（默认 5s），直连超过超时会自动回退到服务器转发，避免长时间等待。
+- ✅ **动态密钥轮换**：服务端可通过 `-key-rotate` 周期性下发 30 位随机密钥，客户端收到后自动切换并确认，旧密钥在宽限期后失效。
+- ✅ **无 TLS 场景的 DPI/GFW 混淆**：当关闭 TLS 但启用 `-k` 时默认自动套用 TLS-like 混淆与随机填充，凭借密钥即可绕过常见 DPI/GFW 检测。
 
 ## 适用场景
 
@@ -103,7 +105,7 @@ sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24
 
 ```bash
 # 克隆仓库
-git clone https://github.com/openbmx/lightweight-tunnel.git
+git clone https://github.com/C018/lightweight-tunnel.git
 cd lightweight-tunnel
 
 # 编译

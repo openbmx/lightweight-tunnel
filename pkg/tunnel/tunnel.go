@@ -12,17 +12,17 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/openbmx/lightweight-tunnel/internal/config"
-	"github.com/openbmx/lightweight-tunnel/pkg/crypto"
-	"github.com/openbmx/lightweight-tunnel/pkg/faketcp"
-	"github.com/openbmx/lightweight-tunnel/pkg/fec"
-	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
-	"github.com/openbmx/lightweight-tunnel/pkg/routing"
-	"github.com/openbmx/lightweight-tunnel/pkg/tcp_disguise"
+	"github.com/C018/lightweight-tunnel/internal/config"
+	"github.com/C018/lightweight-tunnel/pkg/faketcp"
+	"github.com/C018/lightweight-tunnel/pkg/fec"
+	"github.com/C018/lightweight-tunnel/pkg/p2p"
+	"github.com/C018/lightweight-tunnel/pkg/routing"
+	"github.com/C018/lightweight-tunnel/pkg/tcp_disguise"
 )
 
 const (
@@ -31,6 +31,8 @@ const (
 	PacketTypePeerInfo   = 0x03 // Peer discovery/advertisement
 	PacketTypeRouteInfo  = 0x04 // Route information exchange
 	PacketTypePublicAddr = 0x05 // Server tells client its public address
+	PacketTypeKeyUpdate  = 0x06 // Server rotates shared secret
+	PacketTypeKeyAck     = 0x07 // Client confirms new secret applied
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -107,7 +109,7 @@ type ClientConnection struct {
 type Tunnel struct {
 	config       *config.Config
 	fec          *fec.FEC
-	cipher       *crypto.Cipher               // Encryption cipher (nil if no key)
+	keyMgr       *keyManager                  // Handles encryption keys and rotation
 	conn         packetConn                   // Used in client mode
 	listener     packetListener               // Used in server mode
 	clients      map[string]*ClientConnection // Used in server mode (key: IP address)
@@ -123,13 +125,17 @@ type Tunnel struct {
 	sendQueue    chan []byte // Used in client mode
 	recvQueue    chan []byte // Used in client mode
 
+	keyAckMux sync.Mutex     // Protects keyAck map
+	keyAck    map[string]int // Tracks last acknowledged key version per client
+
 	// P2P and routing
-	p2pManager    *p2p.Manager          // P2P connection manager
-	routingTable  *routing.RoutingTable // Routing table
-	myTunnelIP    net.IP                // My tunnel IP address
-	publicAddr    string                // Public address as seen by server (for NAT traversal)
-	publicAddrMux sync.RWMutex          // Protects publicAddr
-	natType       p2p.NATType           // Detected NAT type for connection strategy
+	p2pManager     *p2p.Manager          // P2P connection manager
+	routingTable   *routing.RoutingTable // Routing table
+	myTunnelIP     net.IP                // My tunnel IP address
+	serverTunnelIP net.IP                // Expected peer IP for server endpoint (client mode)
+	publicAddr     string                // Public address as seen by server (for NAT traversal)
+	publicAddrMux  sync.RWMutex          // Protects publicAddr
+	natType        p2p.NATType           // Detected NAT type for connection strategy
 }
 
 func isDefaultClientLocalAddr(addr string) bool {
@@ -150,23 +156,33 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		return nil, fmt.Errorf("failed to parse tunnel address: %v", err)
 	}
 
-	// Create encryption cipher if key is provided
-	var cipher *crypto.Cipher
-	if cfg.Key != "" {
-		cipher, err = crypto.NewCipher(cfg.Key)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create encryption cipher: %v", err)
-		}
+	// Create encryption/key manager (handles rotation)
+	keyMgr, err := newKeyManager(cfg.Key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create encryption cipher: %v", err)
+	}
+	if keyMgr.hasCipher() {
 		log.Println("Encryption enabled with AES-256-GCM")
 	}
 
+	var serverIP net.IP
+	if cfg.Mode == "client" {
+		if peerAddr, peerErr := GetPeerIP(cfg.TunnelAddr); peerErr == nil {
+			if ip, _, parseErr := net.ParseCIDR(peerAddr); parseErr == nil {
+				serverIP = ip
+			}
+		}
+	}
+
 	t := &Tunnel{
-		config:     cfg,
-		fec:        fecCodec,
-		cipher:     cipher,
-		stopCh:     make(chan struct{}),
-		myTunnelIP: myIP,
-		natType:    p2p.NATUnknown,
+		config:         cfg,
+		fec:            fecCodec,
+		keyMgr:         keyMgr,
+		stopCh:         make(chan struct{}),
+		myTunnelIP:     myIP,
+		natType:        p2p.NATUnknown,
+		keyAck:         make(map[string]int),
+		serverTunnelIP: serverIP,
 	}
 
 	// Initialize P2P manager if enabled
@@ -174,6 +190,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		t.p2pManager = p2p.NewManager(cfg.P2PPort)
 		t.p2pManager.SetHandshakeTimeout(time.Duration(cfg.P2PTimeout) * time.Second)
 		t.routingTable = routing.NewRoutingTable(cfg.MaxHops)
+		t.registerServerRoute()
 	}
 
 	if cfg.Mode == "client" {
@@ -190,6 +207,16 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	}
 
 	return t, nil
+}
+
+func (t *Tunnel) registerServerRoute() {
+	if t.routingTable == nil || t.serverTunnelIP == nil {
+		return
+	}
+
+	serverPeer := p2p.NewPeerInfo(t.serverTunnelIP)
+	serverPeer.SetThroughServer(true)
+	t.routingTable.AddPeer(serverPeer)
 }
 
 // parseTunnelIP extracts the IP address from tunnel address (e.g., "10.0.0.2/24" -> 10.0.0.2)
@@ -284,6 +311,12 @@ func (t *Tunnel) Start() error {
 		if err := t.startServer(); err != nil {
 			t.tunFile.Close()
 			return fmt.Errorf("failed to start as server: %v", err)
+		}
+
+		// Automatic key rotation (server only)
+		if t.shouldRotateKeys() {
+			t.wg.Add(1)
+			go t.keyRotationLoop()
 		}
 	}
 
@@ -1069,6 +1102,15 @@ func (t *Tunnel) netReader() {
 		case PacketTypeRouteInfo:
 			// Receive server-advertised routes and install them locally
 			t.handleServerRouteInfo(payload)
+		case PacketTypeKeyUpdate:
+			version, newKey, err := parseKeyUpdatePayload(payload)
+			if err != nil {
+				log.Printf("Invalid key update payload: %v", err)
+				continue
+			}
+			t.handleKeyUpdate(version, newKey)
+		case PacketTypeKeyAck:
+			// Not expected from server; ignore
 		}
 	}
 }
@@ -1287,6 +1329,10 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 				continue
 			}
 			t.updateClientRoutes(tunnelIP, routes)
+		case PacketTypeKeyAck:
+			t.handleKeyAck(client, payload)
+		case PacketTypeKeyUpdate:
+			// Clients should not initiate key rotations toward server
 		}
 	}
 }
@@ -1660,6 +1706,228 @@ func (t *Tunnel) sendViaServer(packet []byte) error {
 	}
 }
 
+func (t *Tunnel) shouldRotateKeys() bool {
+	return t.config != nil &&
+		t.config.Mode == "server" &&
+		t.config.KeyRotateSeconds > 0 &&
+		t.keyMgr != nil &&
+		t.keyMgr.hasCipher()
+}
+
+func (t *Tunnel) keyRotationLoop() {
+	defer t.wg.Done()
+
+	interval := time.Duration(t.config.KeyRotateSeconds) * time.Second
+	if interval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-ticker.C:
+			t.rotateKeyOnce()
+		}
+	}
+}
+
+func (t *Tunnel) rotateKeyOnce() {
+	if t.keyMgr == nil || !t.keyMgr.hasCipher() {
+		return
+	}
+
+	if t.keyMgr.pendingVersionValue() != 0 {
+		log.Printf("Key rotation skipped: pending version %d still activating", t.keyMgr.pendingVersionValue())
+		return
+	}
+
+	newKey, err := generateRandomKey(30)
+	if err != nil {
+		log.Printf("Failed to generate rotated key: %v", err)
+		return
+	}
+
+	version, err := t.keyMgr.preparePendingKey(newKey, 0)
+	if err != nil {
+		log.Printf("Failed to prepare rotated key: %v", err)
+		return
+	}
+
+	clientCount := 0
+	if t.clients != nil {
+		t.clientsMux.RLock()
+		clientCount = len(t.clients)
+		t.clientsMux.RUnlock()
+	}
+	log.Printf("Generated new shared key (version %d); distributing to %d client(s)", version, clientCount)
+	t.broadcastKeyUpdate(newKey, version)
+	t.scheduleKeyActivation(version, newKey)
+}
+
+func (t *Tunnel) scheduleKeyActivation(version int, newKey string) {
+	grace := time.Duration(t.config.KeyRotateGrace) * time.Second
+	go func() {
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+
+		select {
+		case <-t.stopCh:
+			return
+		case <-timer.C:
+		}
+
+		if t.activatePendingKey(version) {
+			log.Printf("Activated rotated key version %d; old key fallback window %s", version, grace)
+		}
+	}()
+}
+
+func (t *Tunnel) broadcastKeyUpdate(newKey string, version int) {
+	payload := fmt.Sprintf("%d|%s", version, newKey)
+	fullPacket := make([]byte, len(payload)+1)
+	fullPacket[0] = PacketTypeKeyUpdate
+	copy(fullPacket[1:], []byte(payload))
+
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt key update: %v", err)
+		return
+	}
+
+	t.clientsMux.RLock()
+	defer t.clientsMux.RUnlock()
+
+	for _, client := range t.clients {
+		if err := client.conn.WritePacket(encryptedPacket); err != nil {
+			log.Printf("Failed to deliver rotated key to %s: %v", client.conn.RemoteAddr(), err)
+		}
+	}
+}
+
+func (t *Tunnel) handleKeyUpdate(version int, newKey string) {
+	if t.keyMgr == nil {
+		log.Printf("Key update ignored: encryption disabled")
+		return
+	}
+
+	if _, err := t.keyMgr.preparePendingKey(newKey, version); err != nil {
+		log.Printf("Key update rejected (v%d): %v", version, err)
+		return
+	}
+
+	if t.activatePendingKey(version) {
+		log.Printf("Applied rotated key version %d from server", version)
+	}
+
+	t.sendKeyAck(version)
+}
+
+func (t *Tunnel) sendKeyAck(version int) {
+	if t.conn == nil {
+		return
+	}
+
+	payload := []byte(strconv.Itoa(version))
+	fullPacket := make([]byte, len(payload)+1)
+	fullPacket[0] = PacketTypeKeyAck
+	copy(fullPacket[1:], payload)
+
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt key ack: %v", err)
+		return
+	}
+
+	if err := t.conn.WritePacket(encryptedPacket); err != nil {
+		log.Printf("Failed to send key ack: %v", err)
+	}
+}
+
+func (t *Tunnel) handleKeyAck(client *ClientConnection, payload []byte) {
+	version, err := parseKeyAckPayload(payload)
+	if err != nil {
+		log.Printf("Invalid key ack from %s: %v", client.conn.RemoteAddr(), err)
+		return
+	}
+
+	addr := client.conn.RemoteAddr().String()
+	t.keyAckMux.Lock()
+	t.keyAck[addr] = version
+	t.keyAckMux.Unlock()
+
+	if t.keyMgr != nil && version == t.keyMgr.pendingVersionValue() {
+		if t.activatePendingKey(version) {
+			log.Printf("Activated rotated key version %d after ack from %s", version, addr)
+		}
+	}
+}
+
+func (t *Tunnel) activatePendingKey(version int) bool {
+	if t.keyMgr == nil {
+		return false
+	}
+
+	grace := time.Duration(t.config.KeyRotateGrace) * time.Second
+	newKey, switched := t.keyMgr.activatePending(version, grace)
+	if switched && newKey != "" && t.config != nil {
+		t.config.Key = newKey
+	}
+	return switched
+}
+
+func parseKeyUpdatePayload(payload []byte) (int, string, error) {
+	parts := strings.SplitN(string(payload), "|", 2)
+	if len(parts) != 2 {
+		return 0, "", errors.New("invalid key update payload")
+	}
+
+	version, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid key version: %w", err)
+	}
+
+	if version <= 0 {
+		return 0, "", errors.New("key version must be positive")
+	}
+
+	if len(parts[1]) == 0 {
+		return 0, "", errors.New("empty key value in update")
+	}
+
+	return version, parts[1], nil
+}
+
+func parseKeyAckPayload(payload []byte) (int, error) {
+	version, err := strconv.Atoi(string(payload))
+	if err != nil {
+		return 0, fmt.Errorf("invalid key ack payload: %w", err)
+	}
+	return version, nil
+}
+
+func generateRandomKey(length int) (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	if length <= 0 {
+		return "", errors.New("invalid key length")
+	}
+
+	buf := make([]byte, length)
+	random := make([]byte, length)
+	if _, err := rand.Read(random); err != nil {
+		return "", err
+	}
+
+	for i := 0; i < length; i++ {
+		buf[i] = charset[int(random[i])%len(charset)]
+	}
+
+	return string(buf), nil
+}
+
 // Helper to get local IP for the other peer
 func GetPeerIP(tunnelAddr string) (string, error) {
 	parts := strings.Split(tunnelAddr, "/")
@@ -1769,12 +2037,12 @@ func parseTLSLikeFrame(frame []byte) ([]byte, error) {
 
 // encryptPacket encrypts a packet if cipher is available
 func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
-	if t.cipher != nil {
-		encrypted, err := t.cipher.Encrypt(data)
+	var err error
+	if t.keyMgr != nil {
+		data, err = t.keyMgr.encrypt(data)
 		if err != nil {
 			return nil, err
 		}
-		data = encrypted
 	}
 
 	if t.config != nil && t.config.ObfsTLSRecord {
@@ -1795,10 +2063,10 @@ func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
 		}
 	}
 
-	if t.cipher == nil {
+	if t.keyMgr == nil {
 		return data, nil
 	}
-	return t.cipher.Decrypt(data)
+	return t.keyMgr.decrypt(data)
 }
 
 // announcePeerInfo sends peer information to server (client mode)

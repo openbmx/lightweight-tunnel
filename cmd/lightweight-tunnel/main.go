@@ -12,8 +12,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/openbmx/lightweight-tunnel/internal/config"
-	"github.com/openbmx/lightweight-tunnel/pkg/tunnel"
+	"github.com/C018/lightweight-tunnel/internal/config"
+	"github.com/C018/lightweight-tunnel/pkg/tunnel"
 )
 
 var (
@@ -80,6 +80,8 @@ func main() {
 	tlsKeyFile := flag.String("tls-key", "", "TLS private key file (server mode)")
 	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "Skip TLS certificate verification (client mode, insecure)")
 	key := flag.String("k", "", "Encryption key for tunnel traffic (required for secure communication)")
+	keyRotateSeconds := flag.Int("key-rotate", 0, "Automatic key rotation interval in seconds (server mode, 0 = disabled)")
+	keyRotateGrace := flag.Int("key-rotate-grace", 5, "Grace window in seconds to allow clients to swap to new key")
 	obfsTLSRecord := flag.Bool("obfs", false, "Wrap packets in TLS-like records with random padding to evade DPI/GFW (enable on both ends)")
 	obfsPaddingBytes := flag.Int("obfs-padding", 16, "Maximum random padding bytes when obfuscation is enabled")
 
@@ -143,6 +145,8 @@ func main() {
 			TunName:             *tunName,
 			AdvertisedRoutes:    splitAndCleanList(*advertisedRoutes),
 			Key:                 *key,
+			KeyRotateSeconds:    *keyRotateSeconds,
+			KeyRotateGrace:      *keyRotateGrace,
 			ObfsTLSRecord:       *obfsTLSRecord,
 			ObfsPaddingBytes:    *obfsPaddingBytes,
 			TLSEnabled:          *tlsEnabled,
@@ -164,6 +168,11 @@ func main() {
 	// Validate configuration
 	if err := validateConfig(cfg); err != nil {
 		log.Fatalf("Invalid configuration: %v", err)
+	}
+
+	if !cfg.TLSEnabled && cfg.Key != "" && !cfg.ObfsTLSRecord {
+		cfg.ObfsTLSRecord = true
+		log.Println("Auto-enabled TLS-like obfuscation for key-only mode to resist DPI/GFW")
 	}
 
 	// Print configuration
@@ -192,6 +201,9 @@ func main() {
 	}
 	if cfg.ObfsTLSRecord {
 		log.Printf("🎭  Obfuscation: TLS-like framing with up to %d padding bytes", cfg.ObfsPaddingBytes)
+	}
+	if cfg.Mode == "server" && cfg.KeyRotateSeconds > 0 {
+		log.Printf("🔁  Key rotation: every %d seconds (grace %d seconds)", cfg.KeyRotateSeconds, cfg.KeyRotateGrace)
 	}
 
 	// Create tunnel
@@ -248,6 +260,15 @@ func validateConfig(cfg *config.Config) error {
 	}
 	if cfg.P2PTimeout > 86400 {
 		return fmt.Errorf("P2P timeout too large (max 86400 seconds)")
+	}
+	if cfg.KeyRotateSeconds < 0 {
+		return fmt.Errorf("key rotate interval must be zero or positive")
+	}
+	if cfg.KeyRotateGrace < 0 {
+		return fmt.Errorf("key rotate grace must be zero or positive")
+	}
+	if cfg.KeyRotateSeconds > 0 && cfg.Key == "" {
+		return fmt.Errorf("key rotation requires an encryption key (-k)")
 	}
 
 	// TLS validation
