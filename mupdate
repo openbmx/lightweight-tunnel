@@ -46,9 +46,14 @@ if ! install -m 755 "$BIN_PATH" "$TARGET"; then
   fi
 fi
 echo "Update completed."
-restart_msg="Restart the lightweight-tunnel systemd service to load the new binary (e.g., sudo systemctl restart lightweight-tunnel; replace with your service name such as lightweight-tunnel-server)."
-if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service --state=running | grep -qE '^[[:space:]]*lightweight-tunnel[[:alnum:]_-]*\\.service'; then
-  echo "Detected running lightweight-tunnel systemd service. $restart_msg"
+restart_msg="Restart the lightweight-tunnel systemd service to load the new binary."
+restart_example="For example: sudo systemctl restart lightweight-tunnel (or your custom service name, such as lightweight-tunnel-server)."
+if command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service --state=running | grep -q 'lightweight-tunnel.*\\.service'; then
+  echo "Detected running lightweight-tunnel systemd service."
+  echo "$restart_msg"
+  echo "$restart_example"
 else
-  echo "If a lightweight-tunnel systemd service is running, $restart_msg"
+  echo "If a lightweight-tunnel systemd service is running:"
+  echo "$restart_msg"
+  echo "$restart_example"
 fi
