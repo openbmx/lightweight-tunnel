@@ -39,6 +39,9 @@ const (
 	P2PHandshakeWaitTime   = 2 * time.Second        // Time to wait for P2P handshake to complete before updating routes
 	P2PMaxRetries          = 5
 	P2PMaxBackoffSeconds   = 32 // Maximum backoff delay in seconds
+	
+	// Queue management constants
+	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 )
 
 // ClientConnection represents a single client connection
@@ -765,8 +768,8 @@ func (t *Tunnel) tunReaderServer() {
 			case client.sendQueue <- packet:
 			case <-t.stopCh:
 				return
-			case <-time.After(100 * time.Millisecond):
-				// Wait up to 100ms for queue space before logging and dropping
+			case <-time.After(QueueSendTimeout):
+				// Wait for queue space before logging and dropping
 				select {
 				case client.sendQueue <- packet:
 				case <-t.stopCh:
@@ -1144,8 +1147,8 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 							return
 						case <-client.stopCh:
 							return
-						case <-time.After(100 * time.Millisecond):
-							// Wait up to 100ms for queue space
+						case <-time.After(QueueSendTimeout):
+							// Wait for queue space
 							select {
 							case targetClient.sendQueue <- payload:
 							case <-t.stopCh:
@@ -1705,8 +1708,8 @@ func (t *Tunnel) sendViaServer(packet []byte) error {
 		return nil
 	case <-t.stopCh:
 		return errors.New("tunnel stopped")
-	case <-time.After(100 * time.Millisecond):
-		// Wait up to 100ms for queue space before dropping
+	case <-time.After(QueueSendTimeout):
+		// Wait for queue space before giving up
 		// This handles temporary bursts without immediately dropping packets
 		select {
 		case t.sendQueue <- packet:

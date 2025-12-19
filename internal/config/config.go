@@ -138,7 +138,10 @@ func LoadConfig(filename string) (*Config, error) {
 }
 
 // SaveConfig saves configuration to a file
-// Only saves essential fields for cleaner config files
+// Only saves essential fields for cleaner config files.
+// Note: This function saves a minimal subset of configuration fields.
+// Additional fields in config files are preserved on load but will be lost on save.
+// To preserve all fields, modify the config file manually and avoid regenerating it.
 func SaveConfig(filename string, config *Config) error {
 	// Create a minimal config map with only essential fields
 	minimalConfig := make(map[string]interface{})
