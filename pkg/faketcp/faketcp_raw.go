@@ -303,6 +303,13 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 	// Segment data into smaller chunks if needed
 	const maxSegment = 1400
 	
+	// Log warning if data will be segmented (indicates potential encryption issue)
+	if len(data) > maxSegment {
+		log.Printf("⚠️  WARNING: Packet size %d exceeds maxSegment %d, will be segmented into %d parts. "+
+			"This may cause decryption errors if data is encrypted. Consider reducing MTU.",
+			len(data), maxSegment, (len(data)+maxSegment-1)/maxSegment)
+	}
+	
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

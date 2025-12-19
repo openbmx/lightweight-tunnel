@@ -124,6 +124,25 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 			return nil, fmt.Errorf("failed to create encryption cipher: %v", err)
 		}
 		log.Println("Encryption enabled with AES-256-GCM")
+		
+		// Adjust MTU to prevent TCP segmentation of encrypted packets in raw TCP mode
+		// In raw TCP mode, WritePacket segments data into 1400-byte chunks.
+		// To avoid segmenting encrypted packets (which breaks decryption), we must ensure:
+		// encrypted_size = plaintext_size + overhead <= 1400
+		// plaintext_size = packet_data + 1 (packet type byte)
+		// Therefore: MTU + 1 + overhead <= 1400
+		// MTU <= 1400 - 1 - overhead
+		if cfg.Transport == "rawtcp" || cfg.Transport == "raw" {
+			const maxRawTCPSegment = 1400
+			const packetTypeOverhead = 1
+			encryptionOverhead := cipher.Overhead()
+			maxSafeMTU := maxRawTCPSegment - packetTypeOverhead - encryptionOverhead
+			
+			if cfg.MTU > maxSafeMTU {
+				log.Printf("⚠️  Adjusting MTU from %d to %d to prevent TCP segmentation of encrypted packets", cfg.MTU, maxSafeMTU)
+				cfg.MTU = maxSafeMTU
+			}
+		}
 	}
 
 	t := &Tunnel{
