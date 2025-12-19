@@ -37,6 +37,7 @@ const (
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
 
+// Matches the LocalAddr value from DefaultConfig; used to detect explicit client overrides.
 const defaultLocalAddr = "0.0.0.0:9000"
 
 // ClientConnection represents a single client connection
