@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,8 @@ const (
 	P2PMaxRetries        = 5
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
+
+var ifaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
@@ -484,7 +487,10 @@ func (t *Tunnel) applyHostRoute(action string, route *net.IPNet) error {
 	if routeStr == "" || strings.ContainsAny(routeStr, " \t\n") {
 		return fmt.Errorf("invalid route string: %q", routeStr)
 	}
-	if trimmed := strings.TrimSpace(t.tunName); trimmed == "" || strings.ContainsAny(trimmed, " \t\n") {
+	if _, _, err := net.ParseCIDR(routeStr); err != nil {
+		return fmt.Errorf("invalid CIDR route string %q: %w", routeStr, err)
+	}
+	if trimmed := strings.TrimSpace(t.tunName); trimmed == "" || !ifaceNamePattern.MatchString(trimmed) {
 		return fmt.Errorf("invalid tunnel interface name: %q", t.tunName)
 	}
 
