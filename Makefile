@@ -107,30 +107,30 @@ install-service:
 	echo "Installing binary to $(INSTALL_BIN_DIR)..."; \
 	sudo install -m 755 $(GOBIN)/$(BINARY_NAME) $(INSTALL_BIN_DIR)/$(BINARY_NAME); \
 	echo "Creating systemd unit $(SYSTEMD_UNIT)..."; \
-	cat <<-'EOF' | sudo tee $(SYSTEMD_UNIT) > /dev/null
-	[Unit]
-	Description=Lightweight Tunnel Service ($(SERVICE_NAME))
-	After=network-online.target
-	Wants=network-online.target
-
-	[Service]
-	Type=simple
-	ExecStart=$(INSTALL_BIN_DIR)/$(BINARY_NAME) -c $(CONFIG_PATH)
-	Restart=on-failure
-	RestartSec=5s
-	User=$(SERVICE_USER)
-	Group=$(SERVICE_GROUP)
-	AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-	CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-	NoNewPrivileges=yes
-	# PrivateNetwork disabled because the tunnel requires host network access
-	PrivateNetwork=no
-	PrivateTmp=yes
-	ProtectHome=yes
-
-	[Install]
-	WantedBy=multi-user.target
-	EOF
+	{ \
+		echo "[Unit]"; \
+		echo "Description=Lightweight Tunnel Service ($(SERVICE_NAME))"; \
+		echo "After=network-online.target"; \
+		echo "Wants=network-online.target"; \
+		echo ""; \
+		echo "[Service]"; \
+		echo "Type=simple"; \
+		echo "ExecStart=$(INSTALL_BIN_DIR)/$(BINARY_NAME) -c $(CONFIG_PATH)"; \
+		echo "Restart=on-failure"; \
+		echo "RestartSec=5s"; \
+		echo "User=$(SERVICE_USER)"; \
+		echo "Group=$(SERVICE_GROUP)"; \
+		echo "AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW"; \
+		echo "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW"; \
+		echo "NoNewPrivileges=yes"; \
+		echo "# PrivateNetwork disabled because the tunnel requires host network access"; \
+		echo "PrivateNetwork=no"; \
+		echo "PrivateTmp=yes"; \
+		echo "ProtectHome=yes"; \
+		echo ""; \
+		echo "[Install]"; \
+		echo "WantedBy=multi-user.target"; \
+	} | sudo tee $(SYSTEMD_UNIT) > /dev/null; \
 	sudo systemctl daemon-reload; \
 	sudo systemctl enable $(SERVICE_NAME); \
 	echo "Service installed. Start it with: sudo systemctl start $(SERVICE_NAME)"
