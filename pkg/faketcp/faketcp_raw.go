@@ -69,7 +69,7 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 		dstPort:       remotePort,
 		seqNum:        isn,
 		ackNum:        0,
-		isConnected:   isClient,
+		isConnected:   false, // 握手未完成，初始为false
 		recvQueue:     make(chan []byte, 100),
 		iptablesMgr:   iptablesMgr,
 		stopCh:        make(chan struct{}),
@@ -186,6 +186,10 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					if err != nil {
 						return fmt.Errorf("failed to send ACK: %v", err)
 					}
+					// 握手成功，标记为已连接
+					c.mu.Lock()
+					c.isConnected = true
+					c.mu.Unlock()
 					return nil
 				}
 			case <-time.After(200 * time.Millisecond):
