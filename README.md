@@ -244,6 +244,10 @@ sudo chmod 640 /etc/lightweight-tunnel/config-server.json
 # 启动与查看状态
 sudo systemctl start lightweight-tunnel-server
 sudo systemctl status lightweight-tunnel-server
+
+# （可选）一键更新：在仓库根目录执行，自动 git pull + make build，并替换 /usr/local/bin/lightweight-tunnel
+./mupdate
+# 如果服务正在运行，更新后请重启对应的 systemd 服务，例如：sudo systemctl restart lightweight-tunnel（自定义 SERVICE_NAME 的请替换为实际服务名，如 lightweight-tunnel-server）
 ```
 
 ---
