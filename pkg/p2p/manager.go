@@ -11,26 +11,42 @@ import (
 )
 
 const (
-	// HandshakeAttempts is the number of handshake packets to send
-	HandshakeAttempts = 5
-	// HandshakeInterval is the delay between handshake packets
-	HandshakeInterval = 200 * time.Millisecond
+	// HandshakeAttempts is the number of handshake packets to send in initial burst
+	// Increased from 5 to 20 for better NAT traversal success rate
+	HandshakeAttempts = 20
+	// HandshakeInterval is the delay between handshake packets in initial burst
+	// Reduced from 200ms to 100ms for faster hole punching
+	HandshakeInterval = 100 * time.Millisecond
+	// HandshakeContinuousRetries is the number of additional retry phases after initial burst
+	HandshakeContinuousRetries = 3
+	// HandshakeRetryInterval is the delay between retry phases
+	HandshakeRetryInterval = 1 * time.Second
 	// ReadTimeout is the timeout for UDP read operations
 	ReadTimeout = 1 * time.Second
 	// LocalConnectionTimeout is the timeout to wait for local connection before trying public
 	LocalConnectionTimeout = 2 * time.Second
+	// KeepaliveInterval is the interval for sending keepalive packets to maintain NAT mappings
+	KeepaliveInterval = 15 * time.Second
+	// ConnectionStaleTimeout is the timeout after which a connection is considered stale
+	ConnectionStaleTimeout = 60 * time.Second
 )
 
 // Connection represents a P2P UDP connection to a peer
 type Connection struct {
-	LocalAddr       *net.UDPAddr
-	RemoteAddr      *net.UDPAddr
-	Conn            *net.UDPConn
-	PeerIP          net.IP // Tunnel IP of the peer
-	IsLocalNetwork  bool   // Whether this connection is via local network
-	sendQueue       chan []byte
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
+	LocalAddr          *net.UDPAddr
+	RemoteAddr         *net.UDPAddr
+	Conn               *net.UDPConn
+	PeerIP             net.IP // Tunnel IP of the peer
+	IsLocalNetwork     bool   // Whether this connection is via local network
+	sendQueue          chan []byte
+	stopCh             chan struct{}
+	wg                 sync.WaitGroup
+	lastHandshakeTime  time.Time   // Last time a handshake was sent
+	lastKeepaliveTime  time.Time   // Last time a keepalive was sent
+	lastReceivedTime   time.Time   // Last time data was received
+	estimatedRTT       time.Duration // Estimated round-trip time
+	handshakeStartTime time.Time   // When handshake started (for RTT measurement)
+	mu                 sync.RWMutex // Protects connection state
 }
 
 // Manager manages P2P connections
@@ -85,6 +101,10 @@ func (m *Manager) Start() error {
 	// Start packet receiver
 	m.wg.Add(1)
 	go m.receivePackets()
+	
+	// Start keepalive sender
+	m.wg.Add(1)
+	go m.keepaliveLoop()
 	
 	return nil
 }
@@ -168,11 +188,11 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	myNATType := m.GetNATType()
 	peerNATType := peer.GetNATType()
 	
-	// If both are symmetric NAT, skip P2P attempt and use server relay
+	// If both are symmetric NAT, try port prediction approach
 	if myNATType == nat.NATSymmetric && peerNATType == nat.NATSymmetric {
-		log.Printf("Both peers have Symmetric NAT (%s and %s) - skipping P2P, will use server relay",
-			ipStr, peerTunnelIP)
-		return fmt.Errorf("symmetric NAT detected on both sides, P2P not feasible")
+		log.Printf("Both peers have Symmetric NAT - attempting port prediction strategy for %s", ipStr)
+		// Don't skip, try port prediction instead
+		return m.connectWithPortPrediction(peer, peerTunnelIP)
 	}
 	
 	// Check if we should initiate based on NAT levels
@@ -192,11 +212,13 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		if err == nil {
 			// Create connection object with local address (highest priority)
 			conn := &Connection{
-				RemoteAddr:     localAddr,
-				PeerIP:         peerTunnelIP,
-				IsLocalNetwork: true,
-				sendQueue:      make(chan []byte, 100),
-				stopCh:         make(chan struct{}),
+				RemoteAddr:         localAddr,
+				PeerIP:             peerTunnelIP,
+				IsLocalNetwork:     true,
+				sendQueue:          make(chan []byte, 100),
+				stopCh:             make(chan struct{}),
+				handshakeStartTime: time.Now(),
+				lastHandshakeTime:  time.Now(),
 			}
 			m.connections[ipStr] = conn
 			
@@ -217,11 +239,13 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	
 	// Create connection with public address
 	conn := &Connection{
-		RemoteAddr:     remoteAddr,
-		PeerIP:         peerTunnelIP,
-		IsLocalNetwork: false,
-		sendQueue:      make(chan []byte, 100),
-		stopCh:         make(chan struct{}),
+		RemoteAddr:         remoteAddr,
+		PeerIP:             peerTunnelIP,
+		IsLocalNetwork:     false,
+		sendQueue:          make(chan []byte, 100),
+		stopCh:             make(chan struct{}),
+		handshakeStartTime: time.Now(),
+		lastHandshakeTime:  time.Now(),
 	}
 	m.connections[ipStr] = conn
 	
@@ -295,18 +319,69 @@ func (m *Manager) tryHandshakeWithTimeout(conn *Connection, timeout time.Duratio
 	return false
 }
 
-// performHandshake performs NAT hole punching handshake
+// performHandshake performs NAT hole punching handshake with aggressive retry strategy
 func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
-	// Send multiple handshake packets to establish NAT mapping
+	// Initial burst: Send multiple handshake packets rapidly to establish NAT mapping
 	handshakeMsg := []byte("P2P_HANDSHAKE")
 	
+	log.Printf("Starting aggressive handshake to %s (%d attempts, %v interval)", 
+		conn.PeerIP, HandshakeAttempts, HandshakeInterval)
+	
+	// Phase 1: Initial rapid burst
 	for i := 0; i < HandshakeAttempts; i++ {
+		conn.mu.Lock()
+		conn.lastHandshakeTime = time.Now()
+		conn.mu.Unlock()
+		
 		_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
 		if err != nil {
 			log.Printf("Handshake send error to %s: %v", conn.PeerIP, err)
 		}
+		
+		// Check if connection established during burst
+		if i > 0 && i%5 == 0 {
+			m.mu.RLock()
+			connected := m.isPeerConnected(conn.PeerIP.String())
+			m.mu.RUnlock()
+			if connected {
+				log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
+				return
+			}
+		}
+		
 		time.Sleep(HandshakeInterval)
 	}
+	
+	// Phase 2: Continuous retries with backoff
+	for retry := 0; retry < HandshakeContinuousRetries; retry++ {
+		// Check if already connected
+		m.mu.RLock()
+		connected := m.isPeerConnected(conn.PeerIP.String())
+		m.mu.RUnlock()
+		if connected {
+			log.Printf("P2P connection established during retry phase %d", retry+1)
+			return
+		}
+		
+		// Wait before next retry
+		time.Sleep(HandshakeRetryInterval)
+		
+		// Send another burst
+		log.Printf("Retry phase %d/%d for %s", retry+1, HandshakeContinuousRetries, conn.PeerIP)
+		for i := 0; i < HandshakeAttempts/2; i++ {
+			conn.mu.Lock()
+			conn.lastHandshakeTime = time.Now()
+			conn.mu.Unlock()
+			
+			_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
+			if err != nil {
+				log.Printf("Handshake retry send error to %s: %v", conn.PeerIP, err)
+			}
+			time.Sleep(HandshakeInterval * 2) // Slightly slower in retry phase
+		}
+	}
+	
+	log.Printf("Handshake attempts completed for %s, waiting for peer response", conn.PeerIP)
 }
 
 // SendPacket sends a packet to a peer via P2P
@@ -362,6 +437,12 @@ func (m *Manager) receivePackets() {
 				continue
 			}
 			
+			// Handle keepalive messages
+			if string(data) == "P2P_KEEPALIVE" {
+				m.handleKeepalive(remoteAddr)
+				continue
+			}
+			
 			// Find which peer this packet is from
 			peerIP := m.findPeerByAddr(remoteAddr)
 			if peerIP != nil {
@@ -403,7 +484,18 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 			// Update to the address that successfully sent us a packet
 			conn.RemoteAddr = remoteAddr
 			conn.IsLocalNetwork = isLocalConnection
+			
+			// Measure RTT
+			conn.mu.Lock()
+			if !conn.handshakeStartTime.IsZero() {
+				rtt := time.Since(conn.handshakeStartTime)
+				conn.estimatedRTT = rtt
+				log.Printf("P2P RTT to %s: %v", ipStr, rtt)
+			}
+			conn.lastReceivedTime = time.Now()
+			conn.mu.Unlock()
 		}
+		
 		// Mark peer as connected and track connection type
 		if peer, exists := m.peers[ipStr]; exists {
 			// Only log on transition from not-connected -> connected to avoid log spam
@@ -425,6 +517,28 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 		
 		// Send handshake response
 		m.listener.WriteToUDP([]byte("P2P_HANDSHAKE"), remoteAddr)
+	}
+}
+
+// handleKeepalive handles incoming keepalive packets
+func (m *Manager) handleKeepalive(remoteAddr *net.UDPAddr) {
+	// Find if this is from a known peer
+	peerIP := m.findPeerByAddr(remoteAddr)
+	if peerIP != nil {
+		// Update peer's last seen time
+		m.updatePeerLastSeen(peerIP)
+		
+		// Update connection state
+		m.mu.RLock()
+		if conn, exists := m.connections[peerIP.String()]; exists {
+			conn.mu.Lock()
+			conn.lastReceivedTime = time.Now()
+			conn.mu.Unlock()
+		}
+		m.mu.RUnlock()
+		
+		// Send keepalive response
+		m.listener.WriteToUDP([]byte("P2P_KEEPALIVE"), remoteAddr)
 	}
 }
 
@@ -626,4 +740,130 @@ func (m *Manager) CanEstablishP2PWith(peerIP net.IP) bool {
 	}
 	
 	return canTraverse
+}
+
+// connectWithPortPrediction attempts connection using port prediction for symmetric NAT
+// Uses "birthday paradox" approach: try multiple predicted ports simultaneously
+func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP) error {
+	ipStr := peerTunnelIP.String()
+	
+	// Parse the peer's public address to get base IP and port
+	publicAddr, err := net.ResolveUDPAddr("udp4", peer.PublicAddr)
+	if err != nil {
+		return fmt.Errorf("failed to resolve peer public address: %v", err)
+	}
+	
+	basePort := publicAddr.Port
+	log.Printf("Symmetric NAT port prediction: trying ports around %d for %s", basePort, ipStr)
+	
+	// Try a range of ports around the known port
+	// Symmetric NATs often allocate ports sequentially
+	const portRange = 20 // Try +/- 20 ports
+	
+	var connections []*Connection
+	
+	// Create multiple connection attempts with predicted ports
+	for offset := -portRange; offset <= portRange; offset++ {
+		predictedPort := basePort + offset
+		if predictedPort < 1024 || predictedPort > 65535 {
+			continue // Skip invalid ports
+		}
+		
+		predictedAddr := &net.UDPAddr{
+			IP:   publicAddr.IP,
+			Port: predictedPort,
+		}
+		
+		conn := &Connection{
+			RemoteAddr:         predictedAddr,
+			PeerIP:             peerTunnelIP,
+			IsLocalNetwork:     false,
+			sendQueue:          make(chan []byte, 100),
+			stopCh:             make(chan struct{}),
+			handshakeStartTime: time.Now(),
+			lastHandshakeTime:  time.Now(),
+		}
+		
+		connections = append(connections, conn)
+	}
+	
+	// Store the primary connection (base port)
+	if len(connections) > portRange {
+		m.connections[ipStr] = connections[portRange] // Middle one is base port
+	}
+	
+	// Start handshake to all predicted ports simultaneously
+	log.Printf("Starting simultaneous handshake to %d predicted ports for %s", len(connections), ipStr)
+	for _, conn := range connections {
+		go m.performHandshake(conn, false)
+	}
+	
+	return nil
+}
+
+// keepaliveLoop sends periodic keepalive packets to all connected peers
+// This maintains NAT mappings and detects stale connections
+func (m *Manager) keepaliveLoop() {
+	defer m.wg.Done()
+	
+	ticker := time.NewTicker(KeepaliveInterval)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.sendKeepalives()
+		}
+	}
+}
+
+// sendKeepalives sends keepalive packets to all connected peers
+func (m *Manager) sendKeepalives() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	keepaliveMsg := []byte("P2P_KEEPALIVE")
+	now := time.Now()
+	
+	for ipStr, conn := range m.connections {
+		peer, exists := m.peers[ipStr]
+		if !exists {
+			continue
+		}
+		
+		// Check if peer is connected
+		peer.mu.RLock()
+		connected := peer.Connected
+		lastSeen := peer.LastSeen
+		peer.mu.RUnlock()
+		
+		if !connected {
+			continue
+		}
+		
+		// Check if connection is stale
+		if now.Sub(lastSeen) > ConnectionStaleTimeout {
+			log.Printf("P2P connection to %s is stale (last seen %v ago), attempting refresh", 
+				ipStr, now.Sub(lastSeen))
+			
+			// Mark as disconnected and will trigger reconnection
+			peer.SetConnected(false)
+			
+			// Retry handshake
+			go m.performHandshake(conn, conn.IsLocalNetwork)
+			continue
+		}
+		
+		// Send keepalive
+		conn.mu.Lock()
+		conn.lastKeepaliveTime = now
+		conn.mu.Unlock()
+		
+		_, err := m.listener.WriteToUDP(keepaliveMsg, conn.RemoteAddr)
+		if err != nil {
+			log.Printf("Keepalive send error to %s: %v", ipStr, err)
+		}
+	}
 }
