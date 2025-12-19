@@ -22,7 +22,8 @@ var (
 	serviceDir               = "/etc/systemd/system"
 )
 
-const systemdUnitTemplate = `[Unit]
+const (
+	systemdUnitTemplate = `[Unit]
 Description=Lightweight Tunnel Service (%q)
 After=network-online.target
 Wants=network-online.target
@@ -41,6 +42,8 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 `
+	maxObfsPaddingBytes = 4096
+)
 
 type commandRunner func(name string, args ...string) ([]byte, error)
 
@@ -253,8 +256,8 @@ func validateConfig(cfg *config.Config) error {
 			return fmt.Errorf("TLS enabled in server mode but certificate or key file not specified")
 		}
 	}
-	if cfg.ObfsPaddingBytes < 0 || cfg.ObfsPaddingBytes > 4096 {
-		return fmt.Errorf("obfs padding must be between 0 and 4096 bytes")
+	if cfg.ObfsPaddingBytes < 0 || cfg.ObfsPaddingBytes > maxObfsPaddingBytes {
+		return fmt.Errorf("obfs padding must be between 0 and %d bytes", maxObfsPaddingBytes)
 	}
 
 	return nil
