@@ -289,6 +289,8 @@ sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24 \
   "local_addr": "0.0.0.0:9000",
   "tunnel_addr": "10.0.0.1/24",
   "key": "your-secret-key",
+  "key_rotate_seconds": 900,
+  "key_rotate_grace": 5,
   "mtu": 1400,
   "fec_data": 10,
   "fec_parity": 3,
@@ -304,6 +306,7 @@ sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24 \
 
 **重要说明：**
 - `key`：加密密钥，服务端和客户端必须相同
+- `key_rotate_seconds` / `key_rotate_grace`：动态密钥轮换间隔与宽限期（服务端），设置为 `0` 表示关闭
 - `multi_client`：未指定时默认为 `true`，允许多个客户端同时连接
 - 如需限制为单客户端模式，显式设置为 `false`
 
