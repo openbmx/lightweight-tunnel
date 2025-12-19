@@ -1,8 +1,10 @@
 package tunnel
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -40,6 +42,14 @@ const (
 	P2PRegistrationDelay = 100 * time.Millisecond // Delay to ensure peer registration completes
 	P2PMaxRetries        = 5
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
+
+	// TLS-like obfuscation framing
+	tlsRecordHeaderLen   = 5
+	tlsObfsLengthField   = 2
+	maxObfsFrameSize     = faketcp.MaxPayloadSize // keep within faketcp/tcp disguise budgets
+	tlsContentTypeApp    = 0x17
+	tlsVersionMajor      = 0x03
+	tlsVersionMinorTLS12 = 0x03
 )
 
 // packetConn defines the subset of methods shared by fake TCP and TLS transports.
@@ -1678,16 +1688,110 @@ func GetPeerIP(tunnelAddr string) (string, error) {
 	return fmt.Sprintf("%s/%s", ip4.String(), parts[1]), nil
 }
 
+func buildTLSLikeFrame(payload []byte, maxPadding int) ([]byte, error) {
+	if maxPadding < 0 {
+		return nil, fmt.Errorf("invalid obfuscation padding: %d", maxPadding)
+	}
+
+	// Ensure we always have room for the header + length field
+	if len(payload)+tlsRecordHeaderLen+tlsObfsLengthField > maxObfsFrameSize {
+		return nil, fmt.Errorf("packet too large for obfuscation (%d bytes)", len(payload))
+	}
+
+	padding := 0
+	if maxPadding > 0 {
+		var padByte [1]byte
+		if _, err := rand.Read(padByte[:]); err != nil {
+			return nil, fmt.Errorf("failed to generate obfuscation padding: %w", err)
+		}
+		padding = int(padByte[0]) % (maxPadding + 1)
+	}
+
+	bodyLen := tlsObfsLengthField + len(payload) + padding
+
+	// Enforce TLS record length limit and MTU-aligned cap
+	if bodyLen+tlsRecordHeaderLen > maxObfsFrameSize {
+		// Trim padding to fit into the frame budget
+		padding = maxObfsFrameSize - tlsRecordHeaderLen - tlsObfsLengthField - len(payload)
+		if padding < 0 {
+			return nil, fmt.Errorf("packet too large for obfuscation after trim (%d bytes)", len(payload))
+		}
+		bodyLen = tlsObfsLengthField + len(payload) + padding
+	}
+	if bodyLen > int(^uint16(0)) {
+		return nil, fmt.Errorf("obfuscation frame too large (%d bytes)", bodyLen)
+	}
+
+	frame := make([]byte, tlsRecordHeaderLen+bodyLen)
+	frame[0] = tlsContentTypeApp
+	frame[1] = tlsVersionMajor
+	frame[2] = tlsVersionMinorTLS12
+	binary.BigEndian.PutUint16(frame[3:], uint16(bodyLen))
+
+	// Store the real payload length so padding can be stripped
+	binary.BigEndian.PutUint16(frame[tlsRecordHeaderLen:], uint16(len(payload)))
+	copy(frame[tlsRecordHeaderLen+tlsObfsLengthField:], payload)
+
+	if padding > 0 {
+		if _, err := rand.Read(frame[tlsRecordHeaderLen+tlsObfsLengthField+len(payload):]); err != nil {
+			return nil, fmt.Errorf("failed to generate obfuscation padding bytes: %w", err)
+		}
+	}
+
+	return frame, nil
+}
+
+func parseTLSLikeFrame(frame []byte) ([]byte, error) {
+	if len(frame) < tlsRecordHeaderLen+tlsObfsLengthField {
+		return nil, fmt.Errorf("obfuscation frame too short (%d bytes)", len(frame))
+	}
+
+	if frame[0] != tlsContentTypeApp || frame[1] != tlsVersionMajor || frame[2] != tlsVersionMinorTLS12 {
+		return nil, fmt.Errorf("invalid obfuscation frame header")
+	}
+
+	bodyLen := int(binary.BigEndian.Uint16(frame[3:]))
+	if len(frame) < tlsRecordHeaderLen+bodyLen {
+		return nil, fmt.Errorf("obfuscation frame length mismatch")
+	}
+
+	body := frame[tlsRecordHeaderLen : tlsRecordHeaderLen+bodyLen]
+	actualLen := int(binary.BigEndian.Uint16(body[:tlsObfsLengthField]))
+	if actualLen < 0 || actualLen > len(body)-tlsObfsLengthField {
+		return nil, fmt.Errorf("invalid obfuscation payload length")
+	}
+
+	return body[tlsObfsLengthField : tlsObfsLengthField+actualLen], nil
+}
+
 // encryptPacket encrypts a packet if cipher is available
 func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
-	if t.cipher == nil {
-		return data, nil
+	if t.cipher != nil {
+		encrypted, err := t.cipher.Encrypt(data)
+		if err != nil {
+			return nil, err
+		}
+		data = encrypted
 	}
-	return t.cipher.Encrypt(data)
+
+	if t.config != nil && t.config.ObfsTLSRecord {
+		return buildTLSLikeFrame(data, t.config.ObfsPaddingBytes)
+	}
+
+	return data, nil
 }
 
 // decryptPacket decrypts a packet if cipher is available
 func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
+	var err error
+
+	if t.config != nil && t.config.ObfsTLSRecord {
+		data, err = parseTLSLikeFrame(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if t.cipher == nil {
 		return data, nil
 	}

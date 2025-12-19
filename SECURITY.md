@@ -48,7 +48,7 @@
 
 3. **✅ Additional Security Layers**
    - Use in combination with VPN for defense in depth
-   - Consider obfuscation techniques for traffic pattern hiding
+   - Enable TLS record obfuscation (`-obfs` with optional `-obfs-padding`) to make traffic resemble HTTPS and resist DPI/GFW detection
    - Implement rate limiting and connection filtering
 
 4. **✅ Monitor and Audit**
@@ -203,7 +203,7 @@ sudo ./lightweight-tunnel -m client -k "strong-random-key-here" -r SERVER_IP:900
 
 3. **✅ 额外的安全层**
    - 与 VPN 结合使用以实现纵深防御
-   - 考虑流量混淆技术以隐藏流量模式
+   - 启用 TLS 记录混淆（`-obfs` 与可选 `-obfs-padding`）让流量更像常规 HTTPS，降低 DPI/GFW 检测概率
    - 实施速率限制和连接过滤
 
 4. **✅ 监控和审计**

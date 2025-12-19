@@ -369,6 +369,8 @@ sudo ./lightweight-tunnel -c config.json
 | `-tls-cert` | TLS 证书文件（服务端必填，客户端可用于自签 CA/客户端证书） | - |
 | `-tls-key` | TLS 私钥文件（服务端必填；与 `-tls-cert` 搭配可用于客户端双向认证） | - |
 | `-tls-skip-verify` | 跳过证书验证（客户端，不安全，仅测试时使用） | false |
+| `-obfs` | 启用 TLS 记录混淆（两端都要开启，用于抗 DPI/GFW） | false |
+| `-obfs-padding` | 混淆时的最大随机填充字节数 | 16 |
 | `-tun` | 指定 TUN 设备名（为空则自动分配 tun0、tun1...） | - |
 | `-routes` | 逗号分隔的 CIDR 列表，表示可经由本节点访问的其他网段（例如本地网卡或其他 TUN） | - |
 | `-service` | systemd 服务操作：install/uninstall/start/stop/restart/status | - |
@@ -612,7 +614,7 @@ sudo kill -9 PID
 - 仅支持 Linux 系统
 - P2P 流量不使用 TCP 伪装（使用纯 UDP），但仍然加密
 - P2P 需要 UDP 端口支持（可能被防火墙阻止）
-- TCP 伪装可能被深度包检测（DPI）识破
+- TCP 伪装可能被深度包检测（DPI）识破，推荐同时开启 `-k` 与 `-obfs` 以使用 TLS 记录混淆
 
 ## 多隧道场景与 TUN 设备
 
