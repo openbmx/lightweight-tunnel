@@ -259,7 +259,6 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
   "mode": "client",
   "remote_addr": "<服务器IP>:9000",
   "tunnel_addr": "10.0.0.2/24",
-  "advertised_routes": ["192.168.1.0/24"],
   "key": "your-secret-key",
   "mtu": 1400,
   "fec_data": 10,
