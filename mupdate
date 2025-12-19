@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_DIR"
+
+echo "Pulling latest changes..."
+git pull
+
+echo "Building lightweight-tunnel..."
+make build
+
+BIN_PATH="$REPO_DIR/bin/lightweight-tunnel"
+TARGET="/usr/local/bin/lightweight-tunnel"
+
+if [ ! -f "$BIN_PATH" ]; then
+  echo "Build output not found at $BIN_PATH"
+  exit 1
+fi
+
+echo "Installing binary to $TARGET (requires sudo)..."
+sudo install -m 755 "$BIN_PATH" "$TARGET"
+echo "Update completed."
