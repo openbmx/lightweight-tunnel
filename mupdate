@@ -16,7 +16,7 @@ fi
 
 echo "Pulling latest changes..."
 if ! git pull --ff-only; then
-  echo "git pull failed. Ensure the repository is clean, branches are not diverged (fast-forward only), resolve any issues, and verify network connectivity before rerunning this script."
+  echo "git pull failed. This may be due to branch divergence or network issues. Please resolve and rerun."
   exit 1
 fi
 
@@ -35,15 +35,13 @@ if [ ! -f "$BIN_PATH" ]; then
 fi
 
 echo "Installing binary to $TARGET..."
+install_error="Installation failed. Please check permissions for $TARGET."
 if ! install -m 755 "$BIN_PATH" "$TARGET"; then
   if command -v sudo >/dev/null 2>&1; then
     echo "Retrying with sudo..."
-    if ! sudo install -m 755 "$BIN_PATH" "$TARGET"; then
-      echo "Installation failed even with sudo. Please check permissions for $TARGET."
-      exit 1
-    fi
+    sudo install -m 755 "$BIN_PATH" "$TARGET" || { echo "$install_error"; exit 1; }
   else
-    echo "Installation failed and sudo is not available. Please check permissions for $TARGET."
+    echo "$install_error Sudo is not available."
     exit 1
   fi
 fi
