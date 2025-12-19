@@ -33,25 +33,27 @@ type Connection struct {
 
 // Manager manages P2P connections
 type Manager struct {
-	localPort   int
-	connections map[string]*Connection // Key: peer tunnel IP string
-	listener    *net.UDPConn
-	peers       map[string]*PeerInfo // Peer information
-	mu          sync.RWMutex
-	stopCh      chan struct{}
-	localNAT    NATType
-	wg          sync.WaitGroup
-	onPacket    func(peerIP net.IP, data []byte) // Callback for received packets
+	localPort        int
+	connections      map[string]*Connection // Key: peer tunnel IP string
+	listener         *net.UDPConn
+	peers            map[string]*PeerInfo // Peer information
+	mu               sync.RWMutex
+	stopCh           chan struct{}
+	localNAT         NATType
+	wg               sync.WaitGroup
+	onPacket         func(peerIP net.IP, data []byte) // Callback for received packets
+	handshakeTimeout time.Duration
 }
 
 // NewManager creates a new P2P connection manager
 func NewManager(port int) *Manager {
 	return &Manager{
-		localPort:   port,
-		connections: make(map[string]*Connection),
-		peers:       make(map[string]*PeerInfo),
-		stopCh:      make(chan struct{}),
-		localNAT:    NATUnknown,
+		localPort:        port,
+		connections:      make(map[string]*Connection),
+		peers:            make(map[string]*PeerInfo),
+		stopCh:           make(chan struct{}),
+		localNAT:         NATUnknown,
+		handshakeTimeout: 5 * time.Second,
 	}
 }
 
@@ -111,6 +113,15 @@ func (m *Manager) SetPacketHandler(handler func(peerIP net.IP, data []byte)) {
 	m.onPacket = handler
 }
 
+// SetHandshakeTimeout sets the maximum time to wait for a P2P connection before falling back to server routing.
+func (m *Manager) SetHandshakeTimeout(timeout time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if timeout > 0 {
+		m.handshakeTimeout = timeout
+	}
+}
+
 // SetLocalNATType sets the detected NAT type for local side to guide initiation priority.
 func (m *Manager) SetLocalNATType(n NATType) {
 	m.mu.Lock()
@@ -127,6 +138,16 @@ func (m *Manager) AddPeer(peer *PeerInfo) {
 	m.peers[ipStr] = peer
 
 	log.Printf("Added P2P peer: %s (public: %s, local: %s)", ipStr, peer.PublicAddr, peer.LocalAddr)
+}
+
+func (m *Manager) getHandshakeTimeout() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.handshakeTimeout > 0 {
+		return m.handshakeTimeout
+	}
+	return LocalConnectionTimeout
 }
 
 // ConnectToPeer establishes a P2P connection to a peer
@@ -198,6 +219,7 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 				}
 				m.performHandshakeWithFallback(conn, peer)
 			}(delay)
+			go m.monitorConnectionTimeout(ipStr)
 			return nil
 		}
 	}
@@ -227,6 +249,7 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		}
 		m.performHandshake(conn, false)
 	}(delay)
+	go m.monitorConnectionTimeout(ipStr)
 
 	return nil
 }
@@ -238,7 +261,7 @@ func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo)
 	// First: Try local address with timeout
 	log.Printf("P2P: Trying local address %s for peer %s", conn.RemoteAddr, ipStr)
 
-	localSuccess := m.tryHandshakeWithTimeout(conn, LocalConnectionTimeout)
+	localSuccess := m.tryHandshakeWithTimeout(conn, m.getHandshakeTimeout())
 
 	if localSuccess {
 		log.Printf("P2P: Local connection SUCCEEDED to %s via %s", ipStr, conn.RemoteAddr)
@@ -291,6 +314,34 @@ func (m *Manager) tryHandshakeWithTimeout(conn *Connection, timeout time.Duratio
 	}
 
 	return false
+}
+
+func (m *Manager) monitorConnectionTimeout(ipStr string) {
+	timeout := m.getHandshakeTimeout()
+	if timeout <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-m.stopCh:
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.isPeerConnected(ipStr) {
+		return
+	}
+
+	if peer, exists := m.peers[ipStr]; exists {
+		peer.SetThroughServer(true)
+		log.Printf("P2P connection to %s timed out after %s, falling back to server routing", ipStr, timeout)
+	}
 }
 
 // performHandshake performs NAT hole punching handshake

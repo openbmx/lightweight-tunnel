@@ -1,10 +1,13 @@
 package tunnel
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -17,6 +20,7 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/fec"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
+	"github.com/openbmx/lightweight-tunnel/pkg/tcp_disguise"
 )
 
 const (
@@ -38,11 +42,49 @@ const (
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
 
+// packetConn defines the subset of methods shared by fake TCP and TLS transports.
+type packetConn interface {
+	WritePacket([]byte) error
+	ReadPacket() ([]byte, error)
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
+type packetListener interface {
+	Accept() (packetConn, error)
+	Close() error
+}
+
+type fakeTCPListener struct {
+	*faketcp.Listener
+}
+
+func (l fakeTCPListener) Accept() (packetConn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+type tlsListener struct {
+	*tcp_disguise.Listener
+}
+
+func (l tlsListener) Accept() (packetConn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
 var ifaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn      *faketcp.Conn
+	conn      packetConn
 	sendQueue chan []byte
 	recvQueue chan []byte
 	clientIP  net.IP
@@ -56,8 +98,8 @@ type Tunnel struct {
 	config       *config.Config
 	fec          *fec.FEC
 	cipher       *crypto.Cipher               // Encryption cipher (nil if no key)
-	conn         *faketcp.Conn                // Used in client mode
-	listener     *faketcp.Listener            // Used in server mode
+	conn         packetConn                   // Used in client mode
+	listener     packetListener               // Used in server mode
 	clients      map[string]*ClientConnection // Used in server mode (key: IP address)
 	clientsMux   sync.RWMutex
 	routeMux     sync.RWMutex
@@ -120,6 +162,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	// Initialize P2P manager if enabled
 	if cfg.P2PEnabled && cfg.Mode == "client" {
 		t.p2pManager = p2p.NewManager(cfg.P2PPort)
+		t.p2pManager.SetHandshakeTimeout(time.Duration(cfg.P2PTimeout) * time.Second)
 		t.routingTable = routing.NewRoutingTable(cfg.MaxHops)
 	}
 
@@ -571,22 +614,26 @@ func (t *Tunnel) connectClient() error {
 	timeout := time.Duration(t.config.Timeout) * time.Second
 	useLocalAddr := !isDefaultClientLocalAddr(t.config.LocalAddr)
 
-	// TLS is not supported with UDP-based fake TCP
-	if t.config.TLSEnabled {
-		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
-	}
-
-	log.Println("Using UDP with fake TCP headers for firewall bypass")
 	var (
-		conn *faketcp.Conn
+		conn packetConn
 		err  error
 	)
 
-	if useLocalAddr {
-		log.Println("Binding client to configured local address")
-		conn, err = faketcp.DialWithLocalAddr(t.config.RemoteAddr, t.config.LocalAddr, timeout)
+	if t.config.TLSEnabled {
+		tlsCfg, tlsErr := t.buildClientTLSConfig()
+		if tlsErr != nil {
+			return tlsErr
+		}
+		log.Println("Using TLS over TCP for transport (AES payload encryption still available)")
+		conn, err = tcp_disguise.DialTLS(t.config.RemoteAddr, timeout, tlsCfg)
 	} else {
-		conn, err = faketcp.Dial(t.config.RemoteAddr, timeout)
+		log.Println("Using UDP with fake TCP headers for firewall bypass")
+		if useLocalAddr {
+			log.Println("Binding client to configured local address")
+			conn, err = faketcp.DialWithLocalAddr(t.config.RemoteAddr, t.config.LocalAddr, timeout)
+		} else {
+			conn, err = faketcp.Dial(t.config.RemoteAddr, timeout)
+		}
 	}
 	if err != nil {
 		return err
@@ -597,19 +644,80 @@ func (t *Tunnel) connectClient() error {
 	return nil
 }
 
+func (t *Tunnel) buildServerTLSConfig() (*tls.Config, error) {
+	if t.config.TLSCertFile == "" || t.config.TLSKeyFile == "" {
+		return nil, fmt.Errorf("TLS enabled but certificate or key file not specified")
+	}
+
+	cert, err := tls.LoadX509KeyPair(t.config.TLSCertFile, t.config.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificate or key: %w", err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+func (t *Tunnel) buildClientTLSConfig() (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify: t.config.TLSSkipVerify, //nolint:gosec // user-controlled for testing environments
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	if host, _, err := net.SplitHostPort(t.config.RemoteAddr); err == nil {
+		cfg.ServerName = host
+	}
+
+	// Optional custom CA / client cert support (reuse cert/key when provided)
+	if t.config.TLSCertFile != "" {
+		caData, err := os.ReadFile(t.config.TLSCertFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read TLS cert file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caData) {
+			return nil, fmt.Errorf("failed to parse TLS cert file")
+		}
+		cfg.RootCAs = pool
+	}
+
+	if t.config.TLSCertFile != "" && t.config.TLSKeyFile != "" {
+		clientCert, err := tls.LoadX509KeyPair(t.config.TLSCertFile, t.config.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load client certificate: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{clientCert}
+	}
+
+	return cfg, nil
+}
+
 // startServer starts the server and accepts multiple clients
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 
-	// TLS is not supported with UDP-based fake TCP
-	if t.config.TLSEnabled {
-		return fmt.Errorf("TLS is not supported with UDP-based fake TCP tunnel. For encryption, use IPsec, WireGuard, or application-level encryption")
-	}
+	var listener packetListener
 
-	log.Println("Using UDP with fake TCP headers for firewall bypass")
-	listener, err := faketcp.Listen(t.config.LocalAddr)
-	if err != nil {
-		return err
+	if t.config.TLSEnabled {
+		tlsCfg, tlsErr := t.buildServerTLSConfig()
+		if tlsErr != nil {
+			return tlsErr
+		}
+		log.Println("Using TLS over TCP transport for server listener")
+		l, listenErr := tcp_disguise.ListenTLS(t.config.LocalAddr, tlsCfg)
+		if listenErr != nil {
+			return listenErr
+		}
+		listener = tlsListener{l}
+	} else {
+		log.Println("Using UDP with fake TCP headers for firewall bypass")
+		l, listenErr := faketcp.Listen(t.config.LocalAddr)
+		if listenErr != nil {
+			return listenErr
+		}
+		listener = fakeTCPListener{l}
 	}
 
 	// Store listener for later cleanup
@@ -621,7 +729,7 @@ func (t *Tunnel) startServer() error {
 
 	// Start accepting clients in a goroutine
 	t.wg.Add(1)
-	go t.acceptClients(listener)
+	go t.acceptClients()
 
 	if t.config.MultiClient {
 		log.Printf("Multi-client mode enabled (max: %d clients)", t.config.MaxClients)
@@ -634,7 +742,7 @@ func (t *Tunnel) startServer() error {
 }
 
 // acceptClients accepts multiple client connections
-func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
+func (t *Tunnel) acceptClients() {
 	defer t.wg.Done()
 
 	for {
@@ -644,7 +752,7 @@ func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
 		default:
 		}
 
-		conn, err := listener.Accept()
+		conn, err := t.listener.Accept()
 		if err != nil {
 			select {
 			case <-t.stopCh:
@@ -678,7 +786,7 @@ func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
 }
 
 // handleClient handles a single client connection
-func (t *Tunnel) handleClient(conn *faketcp.Conn) {
+func (t *Tunnel) handleClient(conn packetConn) {
 	log.Printf("Client connected: %s", conn.RemoteAddr())
 
 	client := &ClientConnection{
