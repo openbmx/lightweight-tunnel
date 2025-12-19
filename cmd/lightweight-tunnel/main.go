@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/openbmx/lightweight-tunnel/internal/config"
@@ -33,6 +34,9 @@ func main() {
 	multiClient := flag.Bool("multi-client", true, "Enable multi-client support (server mode)")
 	maxClients := flag.Int("max-clients", 100, "Maximum number of concurrent clients (server mode)")
 	clientIsolation := flag.Bool("client-isolation", false, "Enable client isolation mode (clients cannot communicate with each other)")
+	tunName := flag.String("tun-name", "", "TUN device name (empty = auto)")
+	routeList := flag.String("routes", "", "Comma-separated list of CIDR routes to advertise to peers")
+	configPushInterval := flag.Int("config-push-interval", 0, "Server: interval in seconds to push new config/key to clients (0=disabled)")
 	p2pEnabled := flag.Bool("p2p", true, "Enable P2P direct connections")
 	p2pPort := flag.Int("p2p-port", 0, "UDP port for P2P connections (0 = auto)")
 	enableMeshRouting := flag.Bool("mesh-routing", true, "Enable mesh routing through other clients")
@@ -73,19 +77,22 @@ func main() {
 	} else {
 		// Use command line arguments
 		cfg = &config.Config{
-			Mode:              *mode,
-			Transport:         "rawtcp", // Fixed to rawtcp mode only
-			LocalAddr:         *localAddr,
-			RemoteAddr:        *remoteAddr,
-			TunnelAddr:        *tunnelAddr,
-			MTU:               *mtu,
-			FECDataShards:     *fecData,
-			FECParityShards:   *fecParity,
-			Timeout:           30,
-			KeepaliveInterval: 10,
-			SendQueueSize:     *sendQueueSize,
-			RecvQueueSize:     *recvQueueSize,
-			Key:               *key,
+			Mode:               *mode,
+			Transport:          "rawtcp", // Fixed to rawtcp mode only
+			LocalAddr:          *localAddr,
+			RemoteAddr:         *remoteAddr,
+			TunnelAddr:         *tunnelAddr,
+			MTU:                *mtu,
+			FECDataShards:      *fecData,
+			FECParityShards:    *fecParity,
+			Timeout:            30,
+			KeepaliveInterval:  10,
+			SendQueueSize:      *sendQueueSize,
+			RecvQueueSize:      *recvQueueSize,
+			Key:                *key,
+			TunName:            *tunName,
+			Routes:             parseRoutes(*routeList),
+			ConfigPushInterval: *configPushInterval,
 			// TLS configuration is available via config file only; CLI flags were removed
 			MultiClient:         *multiClient,
 			MaxClients:          *maxClients,
@@ -246,4 +253,20 @@ func normalizeTunnelAddr(cfg *config.Config, configFromFile bool) error {
 		cfg.TunnelAddr = peerAddr
 	}
 	return nil
+}
+
+// parseRoutes splits comma-separated routes and trims spaces
+func parseRoutes(raw string) []string {
+	if raw == "" {
+		return []string{}
+	}
+	parts := strings.Split(raw, ",")
+	routes := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			routes = append(routes, p)
+		}
+	}
+	return routes
 }

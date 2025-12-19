@@ -7,53 +7,59 @@ import (
 
 // Config holds the tunnel configuration
 type Config struct {
-	Mode          string `json:"mode"`           // "client" or "server"
-	Transport     string `json:"transport"`      // "rawtcp" only (true TCP disguise, requires root)
-	LocalAddr     string `json:"local_addr"`     // Local address to listen on
-	RemoteAddr    string `json:"remote_addr"`    // Remote address to connect to (client mode)
-	TunnelAddr    string `json:"tunnel_addr"`    // Tunnel network address (e.g., "10.0.0.1/24")
-	MTU           int    `json:"mtu"`            // MTU size (0 = auto-detect)
-	FECDataShards int    `json:"fec_data"`       // Number of FEC data shards
-	FECParityShards int  `json:"fec_parity"`     // Number of FEC parity shards
-	Timeout       int    `json:"timeout"`        // Connection timeout in seconds
-	KeepaliveInterval int `json:"keepalive"`    // Keepalive interval in seconds
-	SendQueueSize int    `json:"send_queue_size"` // Size of send queue buffer (default 1000)
-	RecvQueueSize int    `json:"recv_queue_size"` // Size of receive queue buffer (default 1000)
-	Key           string `json:"key"`            // Encryption key for tunnel traffic (required for secure communication)
-	MultiClient   bool   `json:"multi_client"`   // Enable multi-client support (server mode, default true)
-	MaxClients    int    `json:"max_clients"`    // Maximum number of concurrent clients (default 100)
-	ClientIsolation bool `json:"client_isolation"` // Enable client isolation (clients cannot communicate with each other)
-	
+	Mode               string   `json:"mode"`                 // "client" or "server"
+	Transport          string   `json:"transport"`            // "rawtcp" only (true TCP disguise, requires root)
+	LocalAddr          string   `json:"local_addr"`           // Local address to listen on
+	RemoteAddr         string   `json:"remote_addr"`          // Remote address to connect to (client mode)
+	TunnelAddr         string   `json:"tunnel_addr"`          // Tunnel network address (e.g., "10.0.0.1/24")
+	MTU                int      `json:"mtu"`                  // MTU size (0 = auto-detect)
+	FECDataShards      int      `json:"fec_data"`             // Number of FEC data shards
+	FECParityShards    int      `json:"fec_parity"`           // Number of FEC parity shards
+	Timeout            int      `json:"timeout"`              // Connection timeout in seconds
+	KeepaliveInterval  int      `json:"keepalive"`            // Keepalive interval in seconds
+	SendQueueSize      int      `json:"send_queue_size"`      // Size of send queue buffer (default 1000)
+	RecvQueueSize      int      `json:"recv_queue_size"`      // Size of receive queue buffer (default 1000)
+	Key                string   `json:"key"`                  // Encryption key for tunnel traffic (required for secure communication)
+	TunName            string   `json:"tun_name"`             // Optional TUN device name (empty = auto)
+	Routes             []string `json:"routes"`               // Additional routes to advertise to peers
+	ConfigPushInterval int      `json:"config_push_interval"` // Interval (seconds) for server to push new config/key (0=disabled)
+	MultiClient        bool     `json:"multi_client"`         // Enable multi-client support (server mode, default true)
+	MaxClients         int      `json:"max_clients"`          // Maximum number of concurrent clients (default 100)
+	ClientIsolation    bool     `json:"client_isolation"`     // Enable client isolation (clients cannot communicate with each other)
+
 	// P2P and routing configuration
-	P2PEnabled         bool   `json:"p2p_enabled"`          // Enable P2P direct connections (default true)
-	P2PPort            int    `json:"p2p_port"`             // UDP port for P2P connections (default 0 = auto)
-	EnableMeshRouting  bool   `json:"enable_mesh_routing"`  // Enable mesh routing through other clients (default true)
-	MaxHops            int    `json:"max_hops"`             // Maximum hops for mesh routing (default 3)
-	RouteUpdateInterval int   `json:"route_update_interval"` // Route quality check interval in seconds (default 30)
-	P2PTimeout         int    `json:"p2p_timeout"`          // P2P connection timeout in seconds (default 5)
-	EnableNATDetection bool   `json:"enable_nat_detection"` // Enable automatic NAT type detection (default true)
+	P2PEnabled          bool `json:"p2p_enabled"`           // Enable P2P direct connections (default true)
+	P2PPort             int  `json:"p2p_port"`              // UDP port for P2P connections (default 0 = auto)
+	EnableMeshRouting   bool `json:"enable_mesh_routing"`   // Enable mesh routing through other clients (default true)
+	MaxHops             int  `json:"max_hops"`              // Maximum hops for mesh routing (default 3)
+	RouteUpdateInterval int  `json:"route_update_interval"` // Route quality check interval in seconds (default 30)
+	P2PTimeout          int  `json:"p2p_timeout"`           // P2P connection timeout in seconds (default 5)
+	EnableNATDetection  bool `json:"enable_nat_detection"`  // Enable automatic NAT type detection (default true)
 }
 
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Mode:              "server",
-		Transport:         "rawtcp",  // Fixed to rawtcp for true TCP disguise
-		LocalAddr:         "0.0.0.0:9000",
-		RemoteAddr:        "",
-		TunnelAddr:        "10.0.0.1/24",
-		MTU:               1400,
-		FECDataShards:     10,
-		FECParityShards:   3,
-		Timeout:           30,
-		KeepaliveInterval: 10,
-		SendQueueSize:     5000,  // Increased from 1000 to prevent queue full errors
-		RecvQueueSize:     5000,  // Increased from 1000 to handle burst traffic
+		Mode:                "server",
+		Transport:           "rawtcp", // Fixed to rawtcp for true TCP disguise
+		LocalAddr:           "0.0.0.0:9000",
+		RemoteAddr:          "",
+		TunnelAddr:          "10.0.0.1/24",
+		MTU:                 1400,
+		FECDataShards:       10,
+		FECParityShards:     3,
+		Timeout:             30,
+		KeepaliveInterval:   10,
+		SendQueueSize:       5000, // Increased from 1000 to prevent queue full errors
+		RecvQueueSize:       5000, // Increased from 1000 to handle burst traffic
+		TunName:             "",
+		Routes:              []string{},
+		ConfigPushInterval:  0,
 		MultiClient:         true,
 		MaxClients:          100,
 		ClientIsolation:     false,
 		P2PEnabled:          true,
-		P2PPort:             0,  // Auto-select
+		P2PPort:             0, // Auto-select
 		EnableMeshRouting:   true,
 		MaxHops:             3,
 		RouteUpdateInterval: 30,
@@ -97,10 +103,10 @@ func LoadConfig(filename string) (*Config, error) {
 		config.KeepaliveInterval = 10
 	}
 	if config.SendQueueSize == 0 {
-		config.SendQueueSize = 5000  // Increased default from 1000
+		config.SendQueueSize = 5000 // Increased default from 1000
 	}
 	if config.RecvQueueSize == 0 {
-		config.RecvQueueSize = 5000  // Increased default from 1000
+		config.RecvQueueSize = 5000 // Increased default from 1000
 	}
 	if config.MaxClients == 0 {
 		config.MaxClients = 100
@@ -114,7 +120,7 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.P2PTimeout == 0 {
 		config.P2PTimeout = 5
 	}
-	
+
 	// Default multi_client to true for server mode if not explicitly set
 	// This matches the command-line default and expected behavior
 	if config.Mode == "server" {
@@ -122,7 +128,7 @@ func LoadConfig(filename string) (*Config, error) {
 			config.MultiClient = true
 		}
 	}
-	
+
 	// Default P2P and mesh routing to true if not explicitly set
 	if _, exists := rawConfig["p2p_enabled"]; !exists {
 		config.P2PEnabled = true
@@ -145,25 +151,25 @@ func LoadConfig(filename string) (*Config, error) {
 func SaveConfig(filename string, config *Config) error {
 	// Create a minimal config map with only essential fields
 	minimalConfig := make(map[string]interface{})
-	
+
 	// Always include mode
 	minimalConfig["mode"] = config.Mode
-	
+
 	// Server-specific fields
 	if config.Mode == "server" {
 		minimalConfig["local_addr"] = config.LocalAddr
 	}
-	
+
 	// Client-specific fields
 	if config.Mode == "client" {
 		minimalConfig["remote_addr"] = config.RemoteAddr
 	}
-	
+
 	// Common essential fields
 	minimalConfig["tunnel_addr"] = config.TunnelAddr
 	minimalConfig["key"] = config.Key
 	minimalConfig["mtu"] = config.MTU
-	
+
 	data, err := json.MarshalIndent(minimalConfig, "", "  ")
 	if err != nil {
 		return err

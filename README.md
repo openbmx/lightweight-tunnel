@@ -390,6 +390,12 @@ sudo ./lightweight-tunnel -c config-client.json
 可选参数：
   -mtu int
         最大传输单元（默认：1400，设置为 0 启用自动检测）
+  -tun-name string
+        指定 TUN 网卡名称（默认自动分配，如 tun0、tun1）
+  -routes string
+        以逗号分隔的 CIDR 路由列表，自动宣告给对端
+  -config-push-interval int
+        服务端定期下发新配置/密钥的间隔（秒，0=关闭）
   -send-queue int
         发送队列大小（默认：5000）
   -recv-queue int
