@@ -33,9 +33,10 @@ const (
 	IPv4MinHeaderLen = 20
 
 	// P2P timing constants
-	P2PRegistrationDelay = 100 * time.Millisecond // Delay to ensure peer registration completes
-	P2PMaxRetries        = 5
-	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
+	P2PRegistrationDelay   = 100 * time.Millisecond // Delay to ensure peer registration completes
+	P2PHandshakeWaitTime   = 2 * time.Second        // Time to wait for P2P handshake to complete before updating routes
+	P2PMaxRetries          = 5
+	P2PMaxBackoffSeconds   = 32 // Maximum backoff delay in seconds
 )
 
 // ClientConnection represents a single client connection
@@ -1142,17 +1143,8 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 		go func() {
 			time.Sleep(P2PRegistrationDelay)
 			t.p2pManager.ConnectToPeer(tunnelIP)
-			// After attempting connection, give it time to establish then update routes
-			time.Sleep(2 * time.Second)
-			if t.routingTable != nil {
-				t.routingTable.UpdateRoutes()
-				route := t.routingTable.GetRoute(tunnelIP)
-				if route != nil && route.Type == routing.RouteDirect {
-					log.Printf("✓ P2P direct route established to %s", tunnelIP)
-				} else {
-					log.Printf("⚠ P2P connection to %s not established, will use server relay", tunnelIP)
-				}
-			}
+			// Update routes after P2P handshake attempt
+			t.updateRoutesAfterP2PAttempt(tunnelIP, "peer advertisement")
 		}()
 	}
 
@@ -1210,18 +1202,8 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 		go func() {
 			time.Sleep(P2PRegistrationDelay)
 			t.p2pManager.ConnectToPeer(tunnelIP)
-			// After attempting connection, give it time to establish then update routes
-			// This ensures routes reflect the actual P2P connection status
-			time.Sleep(2 * time.Second) // Wait for handshake to complete
-			if t.routingTable != nil {
-				t.routingTable.UpdateRoutes()
-				route := t.routingTable.GetRoute(tunnelIP)
-				if route != nil && route.Type == routing.RouteDirect {
-					log.Printf("✓ P2P direct route established to %s", tunnelIP)
-				} else {
-					log.Printf("⚠ P2P connection to %s not established, will use server relay", tunnelIP)
-				}
-			}
+			// Update routes after P2P handshake attempt
+			t.updateRoutesAfterP2PAttempt(tunnelIP, "server broadcast")
 		}()
 	}
 
@@ -1262,15 +1244,8 @@ func (t *Tunnel) handlePunchFromServer(data []byte) {
 		t.p2pManager.AddPeer(peer)
 		go func() {
 			t.p2pManager.ConnectToPeer(tunnelIP)
-			// After attempting connection, give it time to establish then update routes
-			time.Sleep(2 * time.Second)
-			if t.routingTable != nil {
-				t.routingTable.UpdateRoutes()
-				route := t.routingTable.GetRoute(tunnelIP)
-				if route != nil && route.Type == routing.RouteDirect {
-					log.Printf("✓ P2P direct route established to %s (via PUNCH)", tunnelIP)
-				}
-			}
+			// Update routes after P2P handshake attempt
+			t.updateRoutesAfterP2PAttempt(tunnelIP, "PUNCH")
 		}()
 	}
 
@@ -1435,6 +1410,23 @@ func (t *Tunnel) markPeerFallbackToServer(dstIP net.IP) {
 		peer.SetConnected(false)
 		peer.SetThroughServer(true)
 		t.routingTable.UpdateRoutes()
+	}
+}
+
+// updateRoutesAfterP2PAttempt waits for P2P handshake to complete and updates routes accordingly.
+// This should be called in a goroutine after ConnectToPeer is initiated.
+func (t *Tunnel) updateRoutesAfterP2PAttempt(tunnelIP net.IP, source string) {
+	// Wait for P2P handshake to complete
+	time.Sleep(P2PHandshakeWaitTime)
+	
+	if t.routingTable != nil {
+		t.routingTable.UpdateRoutes()
+		route := t.routingTable.GetRoute(tunnelIP)
+		if route != nil && route.Type == routing.RouteDirect {
+			log.Printf("✓ P2P direct route established to %s (via %s)", tunnelIP, source)
+		} else {
+			log.Printf("⚠ P2P connection to %s not established, will use server relay", tunnelIP)
+		}
 	}
 }
 
