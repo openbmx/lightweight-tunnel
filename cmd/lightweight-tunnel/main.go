@@ -218,7 +218,7 @@ func normalizeTunnelAddr(cfg *config.Config, configFromFile bool) error {
 	if cfg.TunnelAddr == defaultServerTunnel {
 		peerAddr, err := tunnel.GetPeerIP(cfg.TunnelAddr)
 		if err != nil {
-			return fmt.Errorf("derive peer tunnel IP: %w", err)
+			return fmt.Errorf("failed to derive peer tunnel IP: %w", err)
 		}
 		log.Printf("Client tunnel address %s conflicts with server default; auto-switching to %s", cfg.TunnelAddr, peerAddr)
 		cfg.TunnelAddr = peerAddr
