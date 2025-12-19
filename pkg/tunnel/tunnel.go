@@ -421,7 +421,7 @@ func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
 	ipStr := clientIP.String()
 
 	t.routeMux.Lock()
-	oldRoutes := t.clientRoutes[ipStr]
+	oldRoutes := append([]*net.IPNet(nil), t.clientRoutes[ipStr]...)
 	if routeCount == 0 {
 		delete(t.clientRoutes, ipStr)
 		t.routeMux.Unlock()
@@ -442,7 +442,7 @@ func (t *Tunnel) removeClientRoutes(clientIP net.IP) {
 		return
 	}
 	t.routeMux.Lock()
-	oldRoutes := t.clientRoutes[clientIP.String()]
+	oldRoutes := append([]*net.IPNet(nil), t.clientRoutes[clientIP.String()]...)
 	delete(t.clientRoutes, clientIP.String())
 	t.routeMux.Unlock()
 	t.applyHostRouteChanges(nil, oldRoutes)
@@ -487,7 +487,7 @@ func (t *Tunnel) cleanupHostRoutes() {
 		t.routeMux.Lock()
 		allRoutes := make([][]*net.IPNet, 0, len(t.clientRoutes))
 		for _, routes := range t.clientRoutes {
-			allRoutes = append(allRoutes, routes)
+			allRoutes = append(allRoutes, append([]*net.IPNet(nil), routes...))
 		}
 		for k := range t.clientRoutes {
 			delete(t.clientRoutes, k)
@@ -1368,15 +1368,16 @@ func (t *Tunnel) handleServerRouteInfo(data []byte) {
 	}
 
 	t.routeMux.Lock()
-	oldRoutes := t.serverRoutes
-	t.serverRoutes = valid
+	oldRoutes := append([]*net.IPNet(nil), t.serverRoutes...)
+	newRoutes := append([]*net.IPNet(nil), valid...)
+	t.serverRoutes = newRoutes
 	t.routeMux.Unlock()
 
-	toAdd, toDel := diffIPNets(oldRoutes, valid)
+	toAdd, toDel := diffIPNets(oldRoutes, newRoutes)
 	t.applyHostRouteChanges(toAdd, toDel)
 
-	if len(valid) > 0 {
-		log.Printf("Applied %d server-advertised route(s) from %s", len(valid), tunnelIP)
+	if len(newRoutes) > 0 {
+		log.Printf("Applied %d server-advertised route(s) from %s", len(newRoutes), tunnelIP)
 	}
 }
 
