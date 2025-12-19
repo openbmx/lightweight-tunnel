@@ -77,6 +77,7 @@ type Tunnel struct {
 	myTunnelIP    net.IP                // My tunnel IP address
 	publicAddr    string                // Public address as seen by server (for NAT traversal)
 	publicAddrMux sync.RWMutex          // Protects publicAddr
+	natType       p2p.NATType           // Detected NAT type for connection strategy
 }
 
 func isDefaultClientLocalAddr(addr string) bool {
@@ -113,6 +114,7 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		cipher:     cipher,
 		stopCh:     make(chan struct{}),
 		myTunnelIP: myIP,
+		natType:    p2p.NATUnknown,
 	}
 
 	// Initialize P2P manager if enabled
@@ -909,7 +911,15 @@ func (t *Tunnel) netReader() {
 			t.publicAddrMux.Lock()
 			t.publicAddr = publicAddr
 			t.publicAddrMux.Unlock()
-			log.Printf("Received public address from server: %s", publicAddr)
+			localAddrStr := ""
+			if t.conn != nil && t.conn.LocalAddr() != nil {
+				localAddrStr = t.conn.LocalAddr().String()
+			}
+			t.natType = p2p.DetectNATType(localAddrStr, publicAddr)
+			if t.p2pManager != nil {
+				t.p2pManager.SetLocalNATType(t.natType)
+			}
+			log.Printf("Received public address from server: %s (local %s, NAT=%s)", publicAddr, localAddrStr, t.natType)
 
 			// Now announce P2P info with the correct public address
 			if t.p2pManager != nil {
@@ -1287,7 +1297,7 @@ func (t *Tunnel) handleP2PPacket(peerIP net.IP, data []byte) {
 // handlePeerInfoPacket handles peer information advertisements
 func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 	// Parse peer information from packet
-	// Format: TunnelIP|PublicAddr|LocalAddr
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType
 	info := string(data)
 	parts := strings.Split(info, "|")
 	if len(parts) < 3 {
@@ -1302,6 +1312,9 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 	peer := p2p.NewPeerInfo(tunnelIP)
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
+	if len(parts) >= 4 {
+		peer.SetNATType(p2p.ParseNATType(parts[3]))
+	}
 
 	// Add to routing table FIRST before P2P manager
 	if t.routingTable != nil {
@@ -1325,7 +1338,7 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 // handlePeerInfoFromServer handles peer info received from server (client mode)
 func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	// Parse peer information from packet
-	// Format: TunnelIP|PublicAddr|LocalAddr
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType
 	info := string(data)
 	parts := strings.Split(info, "|")
 	if len(parts) < 2 {
@@ -1359,6 +1372,9 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	peer := p2p.NewPeerInfo(tunnelIP)
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
+	if len(parts) >= 4 {
+		peer.SetNATType(p2p.ParseNATType(parts[3]))
+	}
 
 	// Add to routing table FIRST before P2P manager
 	if t.routingTable != nil {
@@ -1616,7 +1632,7 @@ func (t *Tunnel) announcePeerInfo() error {
 
 	// Format: TunnelIP|PublicAddr|LocalAddr
 	// Use public address for NAT traversal and local address for same-network peers
-	peerInfo := fmt.Sprintf("%s|%s|%s", t.myTunnelIP.String(), publicP2PAddr, localP2PAddr)
+	peerInfo := fmt.Sprintf("%s|%s|%s|%s", t.myTunnelIP.String(), publicP2PAddr, localP2PAddr, t.natType)
 
 	// Create peer info packet
 	fullPacket := make([]byte, len(peerInfo)+1)

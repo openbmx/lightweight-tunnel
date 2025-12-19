@@ -8,17 +8,18 @@ import (
 
 // PeerInfo contains information about a peer
 type PeerInfo struct {
-	TunnelIP     net.IP    // Tunnel IP address (e.g., 10.0.0.2)
-	PublicAddr   string    // Public address for P2P (IP:Port)
-	LocalAddr    string    // Local address behind NAT
-	LastSeen     time.Time // Last time we received data from this peer
-	Latency      time.Duration // Measured latency to this peer
-	PacketLoss   float64   // Packet loss rate (0.0 - 1.0)
-	Connected    bool      // Whether P2P connection is established
-	ThroughServer bool     // Whether currently routing through server
-	IsLocalConnection bool // Whether connection is via local network (not NAT)
-	RelayPeers   []net.IP  // List of peers that can relay to this peer
-	mu           sync.RWMutex
+	TunnelIP          net.IP        // Tunnel IP address (e.g., 10.0.0.2)
+	PublicAddr        string        // Public address for P2P (IP:Port)
+	LocalAddr         string        // Local address behind NAT
+	LastSeen          time.Time     // Last time we received data from this peer
+	NATType           NATType       // Detected NAT type (heuristic)
+	Latency           time.Duration // Measured latency to this peer
+	PacketLoss        float64       // Packet loss rate (0.0 - 1.0)
+	Connected         bool          // Whether P2P connection is established
+	ThroughServer     bool          // Whether currently routing through server
+	IsLocalConnection bool          // Whether connection is via local network (not NAT)
+	RelayPeers        []net.IP      // List of peers that can relay to this peer
+	mu                sync.RWMutex
 }
 
 // NewPeerInfo creates a new peer information structure
@@ -27,6 +28,7 @@ func NewPeerInfo(tunnelIP net.IP) *PeerInfo {
 		TunnelIP:   tunnelIP,
 		LastSeen:   time.Now(),
 		RelayPeers: make([]net.IP, 0),
+		NATType:    NATUnknown,
 	}
 }
 
@@ -55,6 +57,20 @@ func (p *PeerInfo) SetConnected(connected bool) {
 	}
 }
 
+// SetNATType records the detected NAT type for this peer.
+func (p *PeerInfo) SetNATType(n NATType) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.NATType = n
+}
+
+// GetNATType returns the NAT type of this peer.
+func (p *PeerInfo) GetNATType() NATType {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.NATType
+}
+
 // SetLocalConnection marks whether the connection is via local network
 func (p *PeerInfo) SetLocalConnection(isLocal bool) {
 	p.mu.Lock()
@@ -73,14 +89,14 @@ func (p *PeerInfo) SetThroughServer(through bool) {
 func (p *PeerInfo) AddRelayPeer(relayIP net.IP) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
+
 	// Check if already in list
 	for _, ip := range p.RelayPeers {
 		if ip.Equal(relayIP) {
 			return
 		}
 	}
-	
+
 	p.RelayPeers = append(p.RelayPeers, relayIP)
 }
 
@@ -88,44 +104,44 @@ func (p *PeerInfo) AddRelayPeer(relayIP net.IP) {
 func (p *PeerInfo) GetQualityScore() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	// Quality scoring constants
 	const (
-		latencyPenaltyDivisor    = 10    // Divide latency by this to get penalty groups
-		latencyPenaltyMultiplier = 5     // Multiply penalty groups by this value
-		packetLossPenaltyScale   = 1000  // Scale packet loss to penalty points
-		p2pQualityBonus          = 20    // Bonus points for P2P connection
-		localConnectionBonus     = 30    // Bonus points for local network connection (highest priority)
-		serverRoutePenalty       = 30    // Penalty points for server routing
+		latencyPenaltyDivisor    = 10   // Divide latency by this to get penalty groups
+		latencyPenaltyMultiplier = 5    // Multiply penalty groups by this value
+		packetLossPenaltyScale   = 1000 // Scale packet loss to penalty points
+		p2pQualityBonus          = 20   // Bonus points for P2P connection
+		localConnectionBonus     = 30   // Bonus points for local network connection (highest priority)
+		serverRoutePenalty       = 30   // Penalty points for server routing
 	)
-	
+
 	// Base score
 	score := 100
-	
+
 	// Deduct for latency (every 10ms reduces score by 5)
 	latencyPenalty := int(p.Latency.Milliseconds() / latencyPenaltyDivisor * latencyPenaltyMultiplier)
 	score -= latencyPenalty
-	
+
 	// Deduct for packet loss (1% loss = 10 points)
 	lossPenalty := int(p.PacketLoss * packetLossPenaltyScale)
 	score -= lossPenalty
-	
+
 	// Bonus for direct P2P connection
 	if p.Connected {
 		score += p2pQualityBonus
 	}
-	
+
 	// Extra bonus for local network connection (highest priority)
 	// This ensures local connections are preferred over public NAT traversal
 	if p.IsLocalConnection {
 		score += localConnectionBonus
 	}
-	
+
 	// Penalty for going through server
 	if p.ThroughServer {
 		score -= serverRoutePenalty
 	}
-	
+
 	// Ensure score is in valid range
 	// Allow scores above 100 for local connection bonus to ensure proper prioritization
 	if score < 0 {
@@ -134,7 +150,7 @@ func (p *PeerInfo) GetQualityScore() int {
 	if score > 150 {
 		score = 150
 	}
-	
+
 	return score
 }
 
@@ -149,11 +165,12 @@ func (p *PeerInfo) IsStale(timeout time.Duration) bool {
 func (p *PeerInfo) Clone() *PeerInfo {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	
+
 	clone := &PeerInfo{
 		TunnelIP:          p.TunnelIP,
 		PublicAddr:        p.PublicAddr,
 		LocalAddr:         p.LocalAddr,
+		NATType:           p.NATType,
 		LastSeen:          p.LastSeen,
 		Latency:           p.Latency,
 		PacketLoss:        p.PacketLoss,
@@ -163,6 +180,6 @@ func (p *PeerInfo) Clone() *PeerInfo {
 		RelayPeers:        make([]net.IP, len(p.RelayPeers)),
 	}
 	copy(clone.RelayPeers, p.RelayPeers)
-	
+
 	return clone
 }
