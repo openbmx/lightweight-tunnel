@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const testLocalBindAddr = "127.0.0.1:0"
+
 func TestTCPHeaderSerialization(t *testing.T) {
 	conn := &Conn{
 		srcPort: 12345,
@@ -193,7 +195,7 @@ func TestDialWithLocalAddrBindsPort(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	localAddr := "127.0.0.1:0"
+	localAddr := testLocalBindAddr
 
 	client, err := DialWithLocalAddr(listenerAddr, localAddr, 5*time.Second)
 	if err != nil {
