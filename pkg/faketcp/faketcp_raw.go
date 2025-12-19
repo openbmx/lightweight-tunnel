@@ -17,24 +17,24 @@ import (
 
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)
 type ConnRaw struct {
-	rawSocket   *rawsocket.RawSocket
-	localIP     net.IP
-	localPort   uint16
-	remoteIP    net.IP
-	remotePort  uint16
-	srcPort     uint16
-	dstPort     uint16
-	seqNum      uint32
-	ackNum      uint32
-	mu          sync.Mutex
-	isConnected bool // true if client connection, false if server listener connection
-	recvQueue   chan []byte
-	closed      int32
-	closeOnce   sync.Once
-	iptablesMgr *iptables.IPTablesManager
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	isListener  bool // true表示这是listener接受的连接，不需要启动recvLoop
+	rawSocket     *rawsocket.RawSocket
+	localIP       net.IP
+	localPort     uint16
+	remoteIP      net.IP
+	remotePort    uint16
+	srcPort       uint16
+	dstPort       uint16
+	seqNum        uint32
+	ackNum        uint32
+	mu            sync.Mutex
+	isConnected   bool // true if client connection, false if server listener connection
+	recvQueue     chan []byte
+	closed        int32
+	closeOnce     sync.Once
+	iptablesMgr   *iptables.IPTablesManager
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	isListener    bool // true表示这是listener接受的连接，不需要启动recvLoop
 	ownsResources bool // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
 }
 
@@ -145,16 +145,16 @@ func DialRaw(remoteAddr string, timeout time.Duration) (*ConnRaw, error) {
 func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 	// Build TCP options
 	tcpOptions := c.buildTCPOptions()
-	
+
 	// Retry mechanism for SYN
 	maxRetries := 3
 	retryInterval := 500 * time.Millisecond
-	
+
 	for retry := 0; retry < maxRetries; retry++ {
 		if retry > 0 {
 			time.Sleep(retryInterval)
 		}
-		
+
 		// Send SYN
 		err := c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
 			c.seqNum, 0, SYN, tcpOptions, nil)
@@ -190,7 +190,7 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					c.mu.Lock()
 					c.isConnected = true
 					c.mu.Unlock()
-					
+
 					// 清空recvQueue中的握手包（可能有重传的SYN-ACK等）
 					for {
 						select {
@@ -229,7 +229,7 @@ func (c *ConnRaw) recvLoop() {
 		}
 
 		// Set read timeout to allow checking stopCh
-		c.rawSocket.SetReadTimeout(0, 100000)  // 100ms = 100000 microseconds
+		c.rawSocket.SetReadTimeout(0, 100000) // 100ms = 100000 microseconds
 
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := c.rawSocket.RecvPacket(buf)
 		if err != nil {
@@ -253,11 +253,20 @@ func (c *ConnRaw) recvLoop() {
 			}
 		}
 
-		// Update ack number
+		// Update ack number and immediately acknowledge payload to keep TCP disguise realistic
 		if len(payload) > 0 {
 			c.mu.Lock()
 			c.ackNum = seq + uint32(len(payload))
+			ackToSend := c.ackNum
+			seqToUse := c.seqNum
 			c.mu.Unlock()
+
+			if c.isConnected {
+				if err := c.rawSocket.SendPacket(c.localIP, c.srcPort, c.remoteIP, c.dstPort,
+					seqToUse, ackToSend, ACK, c.buildTCPOptions(), nil); err != nil {
+					log.Printf("Failed to send ACK to %s:%d: %v", c.remoteIP, c.remotePort, err)
+				}
+			}
 		}
 
 		// 只在已连接状态下过滤payload=0的包
@@ -277,7 +286,7 @@ func (c *ConnRaw) recvLoop() {
 			Flags:      flags,
 			Window:     65535,
 		}
-		
+
 		headerBytes := serializeTCPHeaderStatic(tcpHdr)
 		fullData := make([]byte, len(headerBytes)+len(payload))
 		copy(fullData, headerBytes)
@@ -302,7 +311,7 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 
 	// Segment data into smaller chunks if needed
 	const maxSegment = 1400
-	
+
 	// Log warning if data will be segmented (indicates potential encryption issue)
 	if len(data) > maxSegment {
 		log.Printf("⚠️  WARNING: Packet size %d exceeds maxSegment %d, will be segmented into %d parts. "+
@@ -311,7 +320,7 @@ func (c *ConnRaw) WritePacket(data []byte) error {
 			"Check if MTU was manually set too high or if auto-adjustment was bypassed.",
 			len(data), maxSegment, (len(data)+maxSegment-1)/maxSegment, maxSegment-29) // 29 = 1 packet type + 28 encryption overhead
 	}
-	
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -391,7 +400,7 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			return []byte{}, nil
 		}
 		return data[headerLen:], nil
-	case <-time.After(30 * time.Second):  // 30秒超时，适合隧道长连接
+	case <-time.After(30 * time.Second): // 30秒超时，适合隧道长连接
 		return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 	}
 }
@@ -580,7 +589,7 @@ func (l *ListenerRaw) acceptLoop() {
 		default:
 		}
 
-		l.rawSocket.SetReadTimeout(0, 100000)  // 100ms
+		l.rawSocket.SetReadTimeout(0, 100000) // 100ms
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := l.rawSocket.RecvPacket(buf)
 		if err != nil {
 			continue
@@ -595,11 +604,11 @@ func (l *ListenerRaw) acceptLoop() {
 
 		l.mu.Lock()
 		conn, exists := l.connMap[connKey]
-		
+
 		// 1. 处理新连接的SYN
 		if !exists && (flags&SYN != 0) && (flags&ACK == 0) {
 			isn, _ := randomUint32()
-			
+
 			newConn := &ConnRaw{
 				rawSocket:     l.rawSocket,
 				localIP:       dstIP,
@@ -626,13 +635,13 @@ func (l *ListenerRaw) acceptLoop() {
 				l.mu.Unlock()
 				continue
 			}
-			
+
 			newConn.seqNum++ // SYN consumes sequence number
 			l.connMap[connKey] = newConn
 			l.mu.Unlock()
 			continue
 		}
-		
+
 		// 2. 处理握手的ACK（第三次握手）
 		if exists && !conn.isConnected && (flags&ACK != 0) && (flags&SYN == 0) {
 			conn.isConnected = true
@@ -640,7 +649,7 @@ func (l *ListenerRaw) acceptLoop() {
 			conn.ackNum = seq + uint32(len(payload))
 			conn.mu.Unlock()
 			l.mu.Unlock()
-			
+
 			// 放入acceptQueue（非阻塞方式）
 			go func(c *ConnRaw) {
 				select {
@@ -651,7 +660,7 @@ func (l *ListenerRaw) acceptLoop() {
 					l.mu.Unlock()
 				}
 			}(conn)
-			
+
 			// 如果ACK带了数据，也要处理
 			if len(payload) > 0 {
 				tcpHdr := &TCPHeader{
@@ -667,7 +676,7 @@ func (l *ListenerRaw) acceptLoop() {
 				fullData := make([]byte, len(headerBytes)+len(payload))
 				copy(fullData, headerBytes)
 				copy(fullData[len(headerBytes):], payload)
-				
+
 				select {
 				case conn.recvQueue <- fullData:
 				default:
@@ -675,11 +684,23 @@ func (l *ListenerRaw) acceptLoop() {
 			}
 			continue
 		}
-		
+
 		// 3. 处理已连接的数据包（只处理有payload的包）
 		if exists && conn.isConnected {
 			// 只处理有实际数据的包，忽略纯ACK、keepalive等控制包
 			if len(payload) > 0 {
+				conn.mu.Lock()
+				conn.ackNum = seq + uint32(len(payload))
+				ackToSend := conn.ackNum
+				seqToUse := conn.seqNum
+				conn.mu.Unlock()
+
+				// 立即回 ACK，避免长时间无反向流量导致被误判为异常
+				if err := l.rawSocket.SendPacket(conn.localIP, conn.srcPort, conn.remoteIP, conn.dstPort,
+					seqToUse, ackToSend, ACK, conn.buildTCPOptions(), nil); err != nil {
+					log.Printf("Failed to send ACK to %s:%d: %v", conn.remoteIP, conn.remotePort, err)
+				}
+
 				tcpHdr := &TCPHeader{
 					SrcPort:    srcPort,
 					DstPort:    dstPort,
@@ -689,7 +710,7 @@ func (l *ListenerRaw) acceptLoop() {
 					Flags:      flags,
 					Window:     65535,
 				}
-				
+
 				headerBytes := serializeTCPHeaderStatic(tcpHdr)
 				fullData := make([]byte, len(headerBytes)+len(payload))
 				copy(fullData, headerBytes)
@@ -705,7 +726,7 @@ func (l *ListenerRaw) acceptLoop() {
 			l.mu.Unlock()
 			continue
 		}
-		
+
 		// 其他情况：未知连接或无效状态的包，直接忽略
 		l.mu.Unlock()
 	}

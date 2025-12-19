@@ -214,6 +214,11 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	if cfg.Mode == "client" {
 		t.sendQueue = make(chan []byte, cfg.SendQueueSize)
 		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
+		// Register server as a peer in the routing table so stats show the
+		// server route even when no other clients are present.
+		if t.routingTable != nil {
+			t.registerServerPeer()
+		}
 	} else {
 		// Server mode: multi-client support
 		t.clients = make(map[string]*ClientConnection)
@@ -951,10 +956,10 @@ func (t *Tunnel) netReader() {
 
 			// Successfully reconnected, continue reading
 			log.Printf("Reconnection successful, resuming packet reception")
-			
+
 			// Re-announce P2P info after reconnection to re-establish P2P connections
 			t.reannounceP2PInfoAfterReconnect()
-			
+
 			continue
 		}
 
@@ -1102,10 +1107,10 @@ func (t *Tunnel) netWriter() {
 
 				// Try writing once more after reconnect
 				log.Printf("Reconnection successful, retrying packet send")
-				
+
 				// Re-announce P2P info after reconnection to re-establish P2P connections
 				t.reannounceP2PInfoAfterReconnect()
-				
+
 				if t.conn != nil {
 					if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
 						log.Printf("Network write retry failed: %v, packet will be lost", err2)
@@ -1172,10 +1177,10 @@ func (t *Tunnel) keepalive() {
 				}
 
 				log.Printf("Reconnection successful, keepalive will resume")
-				
+
 				// Re-announce P2P info after reconnection to re-establish P2P connections
 				t.reannounceP2PInfoAfterReconnect()
-				
+
 				// Don't return; let loop continue with the next tick
 			}
 		}
@@ -2182,6 +2187,28 @@ func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
 	return c.Decrypt(data)
 }
 
+// registerServerPeer seeds the routing table with the server endpoint so stats
+// are meaningful even before peer info is exchanged.
+func (t *Tunnel) registerServerPeer() {
+	serverTunnel, err := GetPeerIP(t.config.TunnelAddr)
+	if err != nil {
+		log.Printf("Failed to derive server tunnel IP: %v", err)
+		return
+	}
+	parts := strings.Split(serverTunnel, "/")
+	if len(parts) == 0 {
+		return
+	}
+	ip := net.ParseIP(parts[0])
+	if ip == nil {
+		return
+	}
+
+	peer := p2p.NewPeerInfo(ip)
+	peer.SetThroughServer(true)
+	t.routingTable.AddPeer(peer)
+}
+
 // rotateCipher replaces the active cipher and config key.
 func (t *Tunnel) rotateCipher(newKey string) error {
 	if newKey == "" {
@@ -2206,15 +2233,15 @@ func (t *Tunnel) reannounceP2PInfoAfterReconnect() {
 	if !t.config.P2PEnabled || t.p2pManager == nil {
 		return
 	}
-	
+
 	go func() {
 		// Wait for public address to be received again after reconnection
 		time.Sleep(P2PReconnectPublicAddrWaitTime)
-		
+
 		retries := 0
 		for retries < P2PMaxRetries {
 			if err := t.announcePeerInfo(); err != nil {
-				log.Printf("Failed to re-announce P2P info after reconnection (attempt %d/%d): %v", 
+				log.Printf("Failed to re-announce P2P info after reconnection (attempt %d/%d): %v",
 					retries+1, P2PMaxRetries, err)
 				retries++
 				backoffSeconds := 1 << uint(retries)
