@@ -23,6 +23,8 @@ type Config struct {
 	SendQueueSize     int      `json:"send_queue_size"`    // Size of send queue buffer (default 1000)
 	RecvQueueSize     int      `json:"recv_queue_size"`    // Size of receive queue buffer (default 1000)
 	Key               string   `json:"key"`                // Encryption key for tunnel traffic (required for secure communication)
+	KeyRotateSeconds  int      `json:"key_rotate_seconds"` // Automatic key rotation interval (seconds, server mode; 0 = disabled)
+	KeyRotateGrace    int      `json:"key_rotate_grace"`   // Grace window (seconds) for switching to new key
 	ObfsTLSRecord     bool     `json:"obfs_tls_record"`    // Wrap packets in TLS-like records to evade DPI/GFW (must be enabled on both ends)
 	ObfsPaddingBytes  int      `json:"obfs_padding_bytes"` // Maximum random padding bytes added when obfuscation is enabled
 	TLSEnabled        bool     `json:"tls_enabled"`        // Enable TLS encryption
@@ -58,6 +60,7 @@ func DefaultConfig() *Config {
 		KeepaliveInterval:   10,
 		SendQueueSize:       1000,
 		RecvQueueSize:       1000,
+		KeyRotateGrace:      5,
 		ObfsPaddingBytes:    16,
 		MultiClient:         true,
 		MaxClients:          100,
@@ -110,6 +113,11 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if config.RecvQueueSize == 0 {
 		config.RecvQueueSize = 1000
+	}
+	if config.KeyRotateGrace == 0 {
+		if _, exists := rawConfig["key_rotate_grace"]; !exists {
+			config.KeyRotateGrace = 5
+		}
 	}
 	if config.MaxClients == 0 {
 		config.MaxClients = 100

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
+	"github.com/C018/lightweight-tunnel/pkg/p2p"
 )
 
 const (
