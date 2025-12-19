@@ -70,3 +70,29 @@ func chooseRouteClient(dst net.IP, routes map[string][]*net.IPNet) string {
 
 	return bestClient
 }
+
+// diffIPNets returns the routes that should be added and removed when moving
+// from oldRoutes to newRoutes, using string representations for comparison.
+func diffIPNets(oldRoutes, newRoutes []*net.IPNet) (toAdd, toDel []*net.IPNet) {
+	oldMap := make(map[string]*net.IPNet, len(oldRoutes))
+	newMap := make(map[string]*net.IPNet, len(newRoutes))
+
+	for _, r := range oldRoutes {
+		oldMap[r.String()] = r
+	}
+	for _, r := range newRoutes {
+		newMap[r.String()] = r
+	}
+
+	for key, route := range newMap {
+		if _, exists := oldMap[key]; !exists {
+			toAdd = append(toAdd, route)
+		}
+	}
+	for key, route := range oldMap {
+		if _, exists := newMap[key]; !exists {
+			toDel = append(toDel, route)
+		}
+	}
+	return toAdd, toDel
+}

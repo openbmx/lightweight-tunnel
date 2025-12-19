@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,8 @@ const (
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
 
+var ifaceNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
 // ClientConnection represents a single client connection
 type ClientConnection struct {
 	conn      *faketcp.Conn
@@ -59,6 +62,7 @@ type Tunnel struct {
 	clientsMux   sync.RWMutex
 	routeMux     sync.RWMutex
 	clientRoutes map[string][]*net.IPNet // Advertised routes from clients (server mode)
+	serverRoutes []*net.IPNet            // Advertised routes received from server (client mode)
 	tunName      string
 	tunFile      *TunDevice
 	stopCh       chan struct{}
@@ -280,6 +284,9 @@ func (t *Tunnel) Stop() {
 			t.p2pManager.Stop()
 		}
 
+		// Clean up host routes
+		t.cleanupHostRoutes()
+
 		// Now wait for all goroutines to finish
 		t.wg.Wait()
 		log.Println("Tunnel stopped")
@@ -414,16 +421,22 @@ func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
 		log.Printf("Ignoring invalid advertised routes from %s: %v", clientIP, invalid)
 	}
 	routeCount := len(valid)
+	ipStr := clientIP.String()
 
 	t.routeMux.Lock()
-	defer t.routeMux.Unlock()
-
+	oldRoutes := copyIPNetSlice(t.clientRoutes[ipStr])
 	if routeCount == 0 {
-		delete(t.clientRoutes, clientIP.String())
+		delete(t.clientRoutes, ipStr)
+		t.routeMux.Unlock()
+		t.applyHostRouteChanges(nil, oldRoutes)
 		return
 	}
-	t.clientRoutes[clientIP.String()] = valid
+	t.clientRoutes[ipStr] = valid
 	log.Printf("Registered %d advertised route(s) for client %s", routeCount, clientIP)
+	t.routeMux.Unlock()
+
+	toAdd, toDel := diffIPNets(oldRoutes, valid)
+	t.applyHostRouteChanges(toAdd, toDel)
 }
 
 // removeClientRoutes removes all advertised routes for a client
@@ -432,8 +445,89 @@ func (t *Tunnel) removeClientRoutes(clientIP net.IP) {
 		return
 	}
 	t.routeMux.Lock()
+	oldRoutes := copyIPNetSlice(t.clientRoutes[clientIP.String()])
 	delete(t.clientRoutes, clientIP.String())
 	t.routeMux.Unlock()
+	t.applyHostRouteChanges(nil, oldRoutes)
+}
+
+func copyIPNetSlice(routes []*net.IPNet) []*net.IPNet {
+	if len(routes) == 0 {
+		return nil
+	}
+	return append([]*net.IPNet(nil), routes...)
+}
+
+// applyHostRouteChanges installs or removes routes on the host pointing to the tunnel.
+func (t *Tunnel) applyHostRouteChanges(toAdd, toDel []*net.IPNet) {
+	if t.tunName == "" {
+		return
+	}
+	if trimmed := strings.TrimSpace(t.tunName); trimmed == "" || !ifaceNamePattern.MatchString(trimmed) {
+		log.Printf("Skipping route change due to invalid tunnel interface name: %q", t.tunName)
+		return
+	}
+	for _, r := range toDel {
+		if err := t.applyHostRoute("del", r); err != nil {
+			log.Print(err)
+		}
+	}
+	for _, r := range toAdd {
+		if err := t.applyHostRoute("replace", r); err != nil {
+			log.Print(err)
+		}
+	}
+}
+
+// applyHostRoute executes a host route change command and logs errors.
+func (t *Tunnel) applyHostRoute(action string, route *net.IPNet) error {
+	if route == nil {
+		return nil
+	}
+	if action != "del" && action != "replace" {
+		return fmt.Errorf("unsupported route action: %s", action)
+	}
+	routeStr := strings.TrimSpace(route.String())
+	if routeStr == "" || strings.ContainsAny(routeStr, " \t\n") {
+		return fmt.Errorf("invalid route string: %q", routeStr)
+	}
+	if _, _, err := net.ParseCIDR(routeStr); err != nil {
+		return fmt.Errorf("invalid CIDR route string %q: %w", routeStr, err)
+	}
+	if trimmed := strings.TrimSpace(t.tunName); trimmed == "" || !ifaceNamePattern.MatchString(trimmed) {
+		return fmt.Errorf("invalid tunnel interface name: %q", t.tunName)
+	}
+
+	cmd := exec.Command("ip", "route", action, routeStr, "dev", t.tunName)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to %s route %s via %s: %w (output: %s)", action, route, t.tunName, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// cleanupHostRoutes removes any remaining routes associated with the tunnel.
+func (t *Tunnel) cleanupHostRoutes() {
+	if t.tunName == "" {
+		return
+	}
+
+	if t.config.Mode == "server" {
+		t.routeMux.Lock()
+		routesToRemove := make([]*net.IPNet, 0)
+		for _, routes := range t.clientRoutes {
+			routesToRemove = append(routesToRemove, routes...)
+		}
+		t.clientRoutes = make(map[string][]*net.IPNet)
+		t.routeMux.Unlock()
+
+		t.applyHostRouteChanges(nil, routesToRemove)
+	} else {
+		t.routeMux.Lock()
+		routes := t.serverRoutes
+		t.serverRoutes = nil
+		t.routeMux.Unlock()
+		t.applyHostRouteChanges(nil, routes)
+	}
 }
 
 // configureTUN configures the TUN device with IP address
@@ -595,6 +689,11 @@ func (t *Tunnel) handleClient(conn *faketcp.Conn) {
 	// Send client's public address for NAT traversal (if P2P enabled)
 	if t.config.P2PEnabled {
 		go t.sendPublicAddrToClient(client)
+	}
+
+	// Advertise server-side routes to the client
+	if len(t.config.AdvertisedRoutes) > 0 {
+		go t.sendServerRoutesToClient(client)
 	}
 
 	// Start client goroutines
@@ -839,6 +938,9 @@ func (t *Tunnel) netReader() {
 			if t.config.P2PEnabled && t.p2pManager != nil {
 				t.handlePeerInfoFromServer(payload)
 			}
+		case PacketTypeRouteInfo:
+			// Receive server-advertised routes and install them locally
+			t.handleServerRouteInfo(payload)
 		}
 	}
 }
@@ -1277,6 +1379,32 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	log.Printf("Received peer info from server: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
 }
 
+// handleServerRouteInfo installs routes advertised by the server locally on the client.
+func (t *Tunnel) handleServerRouteInfo(data []byte) {
+	tunnelIP, routes := parseRouteInfoPayload(data)
+	if tunnelIP == nil {
+		return
+	}
+
+	valid, invalid := parseCIDRList(routes)
+	if len(invalid) > 0 {
+		log.Printf("Ignoring invalid server routes from %s: %v", tunnelIP, invalid)
+	}
+
+	t.routeMux.Lock()
+	oldRoutes := copyIPNetSlice(t.serverRoutes)
+	newRoutes := copyIPNetSlice(valid)
+	t.serverRoutes = newRoutes
+	t.routeMux.Unlock()
+
+	toAdd, toDel := diffIPNets(oldRoutes, newRoutes)
+	t.applyHostRouteChanges(toAdd, toDel)
+
+	if len(newRoutes) > 0 {
+		log.Printf("Applied %d server-advertised route(s) from %s", len(newRoutes), tunnelIP)
+	}
+}
+
 // handlePeerDisconnect handles notification that a peer has disconnected
 func (t *Tunnel) handlePeerDisconnect(peerIP net.IP) {
 	log.Printf("Peer %s disconnected, removing from routing table", peerIP)
@@ -1581,6 +1709,41 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	}
 
 	log.Printf("Sent public address %s to client", publicAddrStr)
+}
+
+// sendServerRoutesToClient advertises server-side routes to a connected client.
+func (t *Tunnel) sendServerRoutesToClient(client *ClientConnection) {
+	if len(t.config.AdvertisedRoutes) == 0 || t.myTunnelIP == nil {
+		return
+	}
+
+	valid, invalid := parseCIDRList(t.config.AdvertisedRoutes)
+	if len(invalid) > 0 {
+		log.Printf("Ignoring invalid server advertised routes: %v", invalid)
+	}
+	if len(valid) == 0 {
+		return
+	}
+
+	routeStrings := make([]string, 0, len(valid))
+	for _, n := range valid {
+		routeStrings = append(routeStrings, n.String())
+	}
+
+	payloadStr := fmt.Sprintf("%s|%s", t.myTunnelIP.String(), strings.Join(routeStrings, ","))
+	fullPacket := make([]byte, len(payloadStr)+1)
+	fullPacket[0] = PacketTypeRouteInfo
+	copy(fullPacket[1:], []byte(payloadStr))
+
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt server route advertisement: %v", err)
+		return
+	}
+
+	if err := client.conn.WritePacket(encryptedPacket); err != nil {
+		log.Printf("Failed to send server route advertisement: %v", err)
+	}
 }
 
 // broadcastPeerInfo broadcasts peer information to all connected clients (server mode)
