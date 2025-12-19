@@ -52,7 +52,7 @@ test:
 	$(GOTEST) -v ./...
 
 ## install-service: Install systemd service (CONFIG_PATH=/path/to/config.json SERVICE_NAME=name)
-install-service: build
+install-service:
 	@set -e; \
 	if [ -z "$(CONFIG_PATH)" ]; then \
 		echo "ERROR: CONFIG_PATH is required. Example: make install-service CONFIG_PATH=/etc/lightweight-tunnel/config.json"; \
@@ -68,6 +68,16 @@ install-service: build
 	fi; \
 	if printf "%s" "$(CONFIG_PATH)" | grep -Eq '[;|&`$<>]'; then \
 		echo "ERROR: CONFIG_PATH contains unsupported characters ( ; | & ` $ < > )."; \
+		exit 1; \
+	fi; \
+	if [ -x "$(GOBIN)/$(BINARY_NAME)" ]; then \
+		echo "Using existing binary at $(GOBIN)/$(BINARY_NAME)"; \
+	elif command -v $(GOCMD) >/dev/null 2>&1; then \
+		echo "Binary not found, building $(BINARY_NAME)..."; \
+		mkdir -p $(OUTPUT_DIR); \
+		$(GOBUILD) $(LDFLAGS) -o $(GOBIN)/$(BINARY_NAME) ./cmd/$(BINARY_NAME); \
+	else \
+		echo "ERROR: $(GOBIN)/$(BINARY_NAME) not found and '$(GOCMD)' is not available. Please install Go or provide the prebuilt binary."; \
 		exit 1; \
 	fi; \
 	sudo -n true >/dev/null 2>&1 || { \
