@@ -37,6 +37,8 @@ const (
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
 
+var defaultLocalAddr = config.DefaultConfig().LocalAddr
+
 // ClientConnection represents a single client connection
 type ClientConnection struct {
 	conn      *faketcp.Conn
@@ -469,6 +471,7 @@ func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
 
 	timeout := time.Duration(t.config.Timeout) * time.Second
+	useLocalAddr := t.config.LocalAddr != "" && t.config.LocalAddr != defaultLocalAddr
 
 	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
@@ -476,7 +479,17 @@ func (t *Tunnel) connectClient() error {
 	}
 
 	log.Println("Using UDP with fake TCP headers for firewall bypass")
-	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+	var (
+		conn *faketcp.Conn
+		err  error
+	)
+
+	if useLocalAddr {
+		log.Printf("Binding client to local address %s", t.config.LocalAddr)
+		conn, err = faketcp.DialWithLocalAddr(t.config.RemoteAddr, t.config.LocalAddr, timeout)
+	} else {
+		conn, err = faketcp.Dial(t.config.RemoteAddr, timeout)
+	}
 	if err != nil {
 		return err
 	}
