@@ -14,7 +14,6 @@ import (
 	"github.com/openbmx/lightweight-tunnel/internal/config"
 	"github.com/openbmx/lightweight-tunnel/pkg/crypto"
 	"github.com/openbmx/lightweight-tunnel/pkg/faketcp"
-	"github.com/openbmx/lightweight-tunnel/pkg/tcp_disguise"
 	"github.com/openbmx/lightweight-tunnel/pkg/fec"
 	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
@@ -42,50 +41,9 @@ const (
 	P2PMaxBackoffSeconds   = 32 // Maximum backoff delay in seconds
 )
 
-// PacketConn is the interface that both faketcp.Conn and tcp_disguise.RawConn implement
-type PacketConn interface {
-	WritePacket([]byte) error
-	ReadPacket() ([]byte, error)
-	Close() error
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
-}
-
-// PacketListener is the interface for listeners
-type PacketListener interface {
-	Accept() (PacketConn, error)
-	Close() error
-	Addr() net.Addr
-}
-
-// Adapter types to wrap concrete implementations
-type fakeTCPListenerAdapter struct {
-	*faketcp.Listener
-}
-
-func (f *fakeTCPListenerAdapter) Accept() (PacketConn, error) {
-	conn, err := f.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-
-type rawTCPListenerAdapter struct {
-	*tcp_disguise.RawListener
-}
-
-func (r *rawTCPListenerAdapter) Accept() (PacketConn, error) {
-	conn, err := r.RawListener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
-}
-
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn      PacketConn
+	conn      *faketcp.Conn
 	sendQueue chan []byte
 	recvQueue chan []byte
 	clientIP  net.IP
@@ -102,8 +60,8 @@ type Tunnel struct {
 	config     *config.Config
 	fec        *fec.FEC
 	cipher     *crypto.Cipher               // Encryption cipher (nil if no key)
-	conn       PacketConn                   // Used in client mode
-	listener   PacketListener               // Used in server mode
+	conn       *faketcp.Conn                // Used in client mode
+	listener   *faketcp.Listener            // Used in server mode
 	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
 	clientsMux sync.RWMutex
 	tunName    string
@@ -459,38 +417,12 @@ func (t *Tunnel) configureTUN() error {
 func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
 
-	// Use a short handshake timeout for the fake-TCP Dial so the initial
-	// three-way handshake does not add a full application-level RTT to the
-	// first data packet. The overall connection timeout (used elsewhere)
-	// remains `t.config.Timeout`.
-	handshakeTimeout := 500 * time.Millisecond
+	timeout := time.Duration(t.config.Timeout) * time.Second
 
-	var conn PacketConn
-	var err error
-
-	switch t.config.Transport {
-	case "rawtcp":
-		log.Println("Using Raw Socket TCP (requires root) - TRUE TCP disguise")
-		conn, err = tcp_disguise.Dial(t.config.RemoteAddr, handshakeTimeout)
-		if err != nil {
-			return fmt.Errorf("raw TCP dial failed: %v (did you run as root?)", err)
-		}
-	case "faketcp":
-		log.Println("Using UDP with fake TCP headers for firewall bypass")
-		conn, err = faketcp.Dial(t.config.RemoteAddr, handshakeTimeout)
-		if err != nil {
-			return err
-		}
-	case "udp":
-		log.Println("Using plain UDP (no disguise)")
-		// For UDP mode, we can still use faketcp but skip the TCP header construction
-		// Or implement a plain UDP version - for now use faketcp
-		conn, err = faketcp.Dial(t.config.RemoteAddr, handshakeTimeout)
-		if err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unknown transport mode: %s (use: udp, faketcp, or rawtcp)", t.config.Transport)
+	log.Println("Using UDP with fake TCP headers for firewall bypass")
+	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+	if err != nil {
+		return err
 	}
 
 	t.conn = conn
@@ -518,8 +450,7 @@ func (t *Tunnel) reconnectToServer() error {
 	defer t.connMux.Unlock()
 
 	backoff := 1
-	handshakeTimeout := 500 * time.Millisecond
-
+	timeout := time.Duration(t.config.Timeout) * time.Second
 	for {
 		select {
 		case <-t.stopCh:
@@ -528,19 +459,7 @@ func (t *Tunnel) reconnectToServer() error {
 		}
 
 		log.Printf("Attempting to reconnect to server at %s (backoff %ds)", t.config.RemoteAddr, backoff)
-		
-		var conn PacketConn
-		var err error
-
-		switch t.config.Transport {
-		case "rawtcp":
-			conn, err = tcp_disguise.Dial(t.config.RemoteAddr, handshakeTimeout)
-		case "faketcp", "udp":
-			conn, err = faketcp.Dial(t.config.RemoteAddr, handshakeTimeout)
-		default:
-			return fmt.Errorf("unknown transport: %s", t.config.Transport)
-		}
-
+		conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
 		if err == nil {
 			t.conn = conn
 			log.Printf("Reconnected to server: %s -> %s", conn.LocalAddr(), conn.RemoteAddr())
@@ -562,36 +481,10 @@ func (t *Tunnel) reconnectToServer() error {
 func (t *Tunnel) startServer() error {
 	log.Printf("Listening on %s...", t.config.LocalAddr)
 
-	var listener PacketListener
-	var err error
-
-	switch t.config.Transport {
-	case "rawtcp":
-		log.Println("Using Raw Socket TCP (requires root) - TRUE TCP disguise")
-		var rawListener *tcp_disguise.RawListener
-		rawListener, err = tcp_disguise.Listen(t.config.LocalAddr)
-		if err != nil {
-			return fmt.Errorf("raw TCP listen failed: %v (did you run as root?)", err)
-		}
-		listener = &rawTCPListenerAdapter{RawListener: rawListener}
-	case "faketcp":
-		log.Println("Using UDP with fake TCP headers for firewall bypass")
-		var ftListener *faketcp.Listener
-		ftListener, err = faketcp.Listen(t.config.LocalAddr)
-		if err != nil {
-			return err
-		}
-		listener = &fakeTCPListenerAdapter{Listener: ftListener}
-	case "udp":
-		log.Println("Using plain UDP (no disguise)")
-		var ftListener *faketcp.Listener
-		ftListener, err = faketcp.Listen(t.config.LocalAddr)
-		if err != nil {
-			return err
-		}
-		listener = &fakeTCPListenerAdapter{Listener: ftListener}
-	default:
-		return fmt.Errorf("unknown transport mode: %s (use: udp, faketcp, or rawtcp)", t.config.Transport)
+	log.Println("Using UDP with fake TCP headers for firewall bypass")
+	listener, err := faketcp.Listen(t.config.LocalAddr)
+	if err != nil {
+		return err
 	}
 
 	// Store listener for later cleanup
@@ -616,7 +509,7 @@ func (t *Tunnel) startServer() error {
 }
 
 // acceptClients accepts multiple client connections
-func (t *Tunnel) acceptClients(listener PacketListener) {
+func (t *Tunnel) acceptClients(listener *faketcp.Listener) {
 	defer t.wg.Done()
 
 	for {
@@ -660,7 +553,7 @@ func (t *Tunnel) acceptClients(listener PacketListener) {
 }
 
 // handleClient handles a single client connection
-func (t *Tunnel) handleClient(conn PacketConn) {
+func (t *Tunnel) handleClient(conn *faketcp.Conn) {
 	log.Printf("Client connected: %s", conn.RemoteAddr())
 
 	client := &ClientConnection{
