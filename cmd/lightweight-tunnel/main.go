@@ -36,6 +36,7 @@ func main() {
 	enableMeshRouting := flag.Bool("mesh-routing", true, "Enable mesh routing through other clients")
 	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
+	enableNATDetection := flag.Bool("nat-detection", true, "Enable automatic NAT type detection")
 	showVersion := flag.Bool("v", false, "Show version")
 	generateConfig := flag.String("g", "", "Generate example config file")
 	// TLS flags removed: TLS over the UDP fake-TCP transport is not supported.
@@ -91,6 +92,7 @@ func main() {
 			EnableMeshRouting:   *enableMeshRouting,
 			MaxHops:             *maxHops,
 			RouteUpdateInterval: *routeUpdateInterval,
+			EnableNATDetection:  *enableNATDetection,
 			P2PTimeout:          5,
 		}
 	}

@@ -4,6 +4,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 )
 
 // PeerInfo contains information about a peer
@@ -11,6 +13,7 @@ type PeerInfo struct {
 	TunnelIP     net.IP    // Tunnel IP address (e.g., 10.0.0.2)
 	PublicAddr   string    // Public address for P2P (IP:Port)
 	LocalAddr    string    // Local address behind NAT
+	NATType      nat.NATType // NAT type of this peer
 	LastSeen     time.Time // Last time we received data from this peer
 	Latency      time.Duration // Measured latency to this peer
 	PacketLoss   float64   // Packet loss rate (0.0 - 1.0)
@@ -25,6 +28,7 @@ type PeerInfo struct {
 func NewPeerInfo(tunnelIP net.IP) *PeerInfo {
 	return &PeerInfo{
 		TunnelIP:   tunnelIP,
+		NATType:    nat.NATUnknown,
 		LastSeen:   time.Now(),
 		RelayPeers: make([]net.IP, 0),
 	}
@@ -43,6 +47,20 @@ func (p *PeerInfo) UpdatePacketLoss(loss float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.PacketLoss = loss
+}
+
+// SetNATType sets the NAT type for this peer
+func (p *PeerInfo) SetNATType(natType nat.NATType) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.NATType = natType
+}
+
+// GetNATType returns the NAT type for this peer
+func (p *PeerInfo) GetNATType() nat.NATType {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.NATType
 }
 
 // SetConnected marks the peer as connected via P2P
@@ -154,6 +172,7 @@ func (p *PeerInfo) Clone() *PeerInfo {
 		TunnelIP:          p.TunnelIP,
 		PublicAddr:        p.PublicAddr,
 		LocalAddr:         p.LocalAddr,
+		NATType:           p.NATType,
 		LastSeen:          p.LastSeen,
 		Latency:           p.Latency,
 		PacketLoss:        p.PacketLoss,

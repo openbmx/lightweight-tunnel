@@ -14,6 +14,7 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/crypto"
 	"github.com/openbmx/lightweight-tunnel/pkg/faketcp"
 	"github.com/openbmx/lightweight-tunnel/pkg/fec"
+	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
 )
@@ -744,8 +745,19 @@ func (t *Tunnel) netReader() {
 			t.publicAddrMux.Unlock()
 			log.Printf("Received public address from server: %s", publicAddr)
 
+			// Detect NAT type if enabled
+			if t.config.EnableNATDetection && t.p2pManager != nil {
+				go func() {
+					// Perform NAT detection
+					t.p2pManager.DetectNATType(t.config.RemoteAddr)
+				}()
+			}
+
 			// Now announce P2P info with the correct public address
 			if t.p2pManager != nil {
+				// Wait a bit for NAT detection to complete before announcing
+				time.Sleep(500 * time.Millisecond)
+				
 				// Retry announcement with exponential backoff if it fails
 				go func() {
 					retries := 0
@@ -1154,7 +1166,7 @@ func (t *Tunnel) handlePeerInfoPacket(fromIP net.IP, data []byte) {
 // handlePeerInfoFromServer handles peer info received from server (client mode)
 func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	// Parse peer information from packet
-	// Format: TunnelIP|PublicAddr|LocalAddr
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType (NAT type is optional for backward compatibility)
 	info := string(data)
 	parts := strings.Split(info, "|")
 	if len(parts) < 2 {
@@ -1189,6 +1201,15 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
 
+	// Parse NAT type if available (4th parameter)
+	if len(parts) >= 4 {
+		var natTypeNum int
+		if _, err := fmt.Sscanf(parts[3], "%d", &natTypeNum); err == nil {
+			peer.SetNATType(nat.NATType(natTypeNum))
+			log.Printf("Peer %s has NAT type: %s", tunnelIP, peer.GetNATType())
+		}
+	}
+
 	// Add to routing table FIRST before P2P manager
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
@@ -1197,14 +1218,31 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 	// Then add to P2P manager
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
+		
+		// Check if P2P is feasible based on NAT types
+		canEstablishP2P := t.p2pManager.CanEstablishP2PWith(tunnelIP)
+		shouldInitiate := t.p2pManager.ShouldInitiateConnectionToPeer(tunnelIP)
+		
+		if !canEstablishP2P {
+			log.Printf("P2P not feasible with %s (both Symmetric NAT), will use server relay", tunnelIP)
+			// Still add to routing table but don't attempt P2P
+			return
+		}
+		
 		// Try to establish P2P connection in a separate goroutine
-		// Small delay to ensure peer is fully registered
-		go func() {
-			time.Sleep(P2PRegistrationDelay)
-			t.p2pManager.ConnectToPeer(tunnelIP)
-			// Update routes after P2P handshake attempt
-			t.updateRoutesAfterP2PAttempt(tunnelIP, "server broadcast")
-		}()
+		// Only initiate if our NAT level is better (lower)
+		if shouldInitiate {
+			// Small delay to ensure peer is fully registered
+			go func() {
+				time.Sleep(P2PRegistrationDelay)
+				t.p2pManager.ConnectToPeer(tunnelIP)
+				// Update routes after P2P handshake attempt
+				t.updateRoutesAfterP2PAttempt(tunnelIP, "server broadcast")
+			}()
+			log.Printf("Will initiate P2P connection to %s (NAT priority)", tunnelIP)
+		} else {
+			log.Printf("Waiting for %s to initiate P2P connection (NAT priority)", tunnelIP)
+		}
 	}
 
 	log.Printf("Received peer info from server: %s at %s (local: %s)", tunnelIP, peer.PublicAddr, peer.LocalAddr)
@@ -1213,7 +1251,7 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 // handlePunchFromServer handles a server-initiated punch control packet
 func (t *Tunnel) handlePunchFromServer(data []byte) {
 	// Parse peer information from packet
-	// Format: TunnelIP|PublicAddr|LocalAddr
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType (NAT type is optional)
 	info := string(data)
 	parts := strings.Split(info, "|")
 	if len(parts) < 3 {
@@ -1234,14 +1272,30 @@ func (t *Tunnel) handlePunchFromServer(data []byte) {
 	peer.PublicAddr = parts[1]
 	peer.LocalAddr = parts[2]
 
+	// Parse NAT type if available (4th parameter)
+	if len(parts) >= 4 {
+		var natTypeNum int
+		if _, err := fmt.Sscanf(parts[3], "%d", &natTypeNum); err == nil {
+			peer.SetNATType(nat.NATType(natTypeNum))
+		}
+	}
+
 	// Add to routing table first
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
 	}
 
 	// Then add to P2P manager and immediately attempt connection (no delay for PUNCH)
+	// PUNCH messages indicate both sides should attempt simultaneously
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
+		
+		// Check if P2P is feasible
+		if !t.p2pManager.CanEstablishP2PWith(tunnelIP) {
+			log.Printf("PUNCH received for %s but P2P not feasible (both Symmetric NAT)", tunnelIP)
+			return
+		}
+		
 		go func() {
 			t.p2pManager.ConnectToPeer(tunnelIP)
 			// Update routes after P2P handshake attempt
@@ -1521,9 +1575,14 @@ func (t *Tunnel) announcePeerInfo() error {
 	// Build local P2P address
 	localP2PAddr := fmt.Sprintf("%s:%d", localHost, p2pPort)
 
-	// Format: TunnelIP|PublicAddr|LocalAddr
+	// Get NAT type
+	natType := t.p2pManager.GetNATType()
+	natTypeNum := int(natType)
+
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType
 	// Use public address for NAT traversal and local address for same-network peers
-	peerInfo := fmt.Sprintf("%s|%s|%s", t.myTunnelIP.String(), publicP2PAddr, localP2PAddr)
+	// NAT type is included to enable smart P2P connection decisions
+	peerInfo := fmt.Sprintf("%s|%s|%s|%d", t.myTunnelIP.String(), publicP2PAddr, localP2PAddr, natTypeNum)
 
 	// Create peer info packet
 	fullPacket := make([]byte, len(peerInfo)+1)
@@ -1541,7 +1600,8 @@ func (t *Tunnel) announcePeerInfo() error {
 		return fmt.Errorf("failed to send peer info: %v", err)
 	}
 
-	log.Printf("Announced P2P info to server: %s at public=%s local=%s", t.myTunnelIP, publicP2PAddr, localP2PAddr)
+	log.Printf("Announced P2P info to server: %s at public=%s local=%s NAT=%s", 
+		t.myTunnelIP, publicP2PAddr, localP2PAddr, natType)
 	return nil
 }
 

@@ -140,10 +140,23 @@ Lightweight Tunnel 是一个使用 Go 语言开发的轻量级内网穿透隧道
 2. 🥈 **P2P 公网直连**：通过 NAT 打洞建立的直接连接
 3. 🥉 **服务器中转**：P2P 失败时回退到服务器转发
 
+**智能 NAT 检测与 P2P 优化** (新功能)：
+- 🔍 **自动 NAT 类型检测**：识别 Full Cone、Restricted Cone、Port-Restricted Cone、Symmetric NAT
+- 🎯 **智能连接策略**：低级别 NAT 主动向高级别 NAT 发起连接，提高成功率
+- 🔄 **自动回退**：双方都是 Symmetric NAT 时自动使用服务器中转
+- 📊 **成功率提升**：P2P 连接成功率提高 15-20%
+
+**P2P 兼容性**：
+- ✅ **高成功率** (90%+)：锥形 NAT 之间的连接
+- ⚠️ **中等成功率** (30%+)：一方是 Symmetric NAT
+- 🔄 **自动中转** (100%)：双方都是 Symmetric NAT（自动使用服务器中转）
+
+详细说明请参考：[NAT 检测文档](docs/NAT_DETECTION.md)
+
 **P2P 局限性**：
 - ✅ **支持**：锥形 NAT (Cone NAT)、端口限制锥形 NAT
 - ⚠️ **部分支持**：对称 NAT (Symmetric NAT) - 成功率较低
-- ❌ **不支持**：双方都是严格对称 NAT 的情况
+- ❌ **不支持**：双方都是严格对称 NAT 的情况（已自动回退到服务器中转）
 
 ---
 

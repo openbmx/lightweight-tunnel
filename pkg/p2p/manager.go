@@ -6,6 +6,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 )
 
 const (
@@ -41,6 +43,9 @@ type Manager struct {
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 	onPacket    func(peerIP net.IP, data []byte) // Callback for received packets
+	natDetector *nat.Detector // NAT type detector
+	myNATType   nat.NATType   // My NAT type
+	natTypeMux  sync.RWMutex  // Protects myNATType
 }
 
 // NewManager creates a new P2P connection manager
@@ -50,6 +55,8 @@ func NewManager(port int) *Manager {
 		connections: make(map[string]*Connection),
 		peers:       make(map[string]*PeerInfo),
 		stopCh:      make(chan struct{}),
+		natDetector: nat.NewDetector(port, 5*time.Second),
+		myNATType:   nat.NATUnknown,
 	}
 }
 
@@ -134,6 +141,7 @@ func (m *Manager) AddPeer(peer *PeerInfo) {
 
 // ConnectToPeer establishes a P2P connection to a peer
 // Priority order: 1) Local network address, 2) Public address, 3) Server fallback
+// Smart strategy: Lower-level NAT connects to higher-level NAT for better stability
 func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -154,6 +162,25 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	peer, exists := m.peers[ipStr]
 	if !exists {
 		return fmt.Errorf("peer %s not found", ipStr)
+	}
+	
+	// Check if P2P is feasible based on NAT types
+	myNATType := m.GetNATType()
+	peerNATType := peer.GetNATType()
+	
+	// If both are symmetric NAT, skip P2P attempt and use server relay
+	if myNATType == nat.NATSymmetric && peerNATType == nat.NATSymmetric {
+		log.Printf("Both peers have Symmetric NAT (%s and %s) - skipping P2P, will use server relay",
+			ipStr, peerTunnelIP)
+		return fmt.Errorf("symmetric NAT detected on both sides, P2P not feasible")
+	}
+	
+	// Check if we should initiate based on NAT levels
+	// This is for logging/debugging; actual initiation is controlled by server coordination
+	shouldInitiate := myNATType.ShouldInitiateConnection(peerNATType)
+	if shouldInitiate {
+		log.Printf("NAT level indicates we should initiate to %s (Our NAT: %s level %d, Peer NAT: %s level %d)",
+			ipStr, myNATType, myNATType.GetLevel(), peerNATType, peerNATType.GetLevel())
 	}
 	
 	// Priority: Try local address first (internal network direct connection)
@@ -493,4 +520,103 @@ func (m *Manager) RemovePeer(peerIP net.IP) {
 		delete(m.peers, ipStr)
 		log.Printf("P2P peer %s removed", ipStr)
 	}
+}
+
+// DetectNATType detects the local NAT type
+func (m *Manager) DetectNATType(serverAddr string) {
+	log.Println("Detecting NAT type...")
+	
+	var detectedType nat.NATType
+	
+	// Try detection with server address if available
+	if serverAddr != "" {
+		natType, err := m.natDetector.DetectNATType(serverAddr)
+		if err != nil {
+			log.Printf("NAT detection with server failed: %v, using simple detection", err)
+			detectedType = m.natDetector.DetectNATTypeSimple()
+		} else {
+			detectedType = natType
+		}
+	} else {
+		detectedType = m.natDetector.DetectNATTypeSimple()
+	}
+	
+	m.natTypeMux.Lock()
+	m.myNATType = detectedType
+	m.natTypeMux.Unlock()
+	
+	log.Printf("NAT Type detected: %s (Level: %d)", detectedType, detectedType.GetLevel())
+}
+
+// GetNATType returns the detected NAT type
+func (m *Manager) GetNATType() nat.NATType {
+	m.natTypeMux.RLock()
+	defer m.natTypeMux.RUnlock()
+	return m.myNATType
+}
+
+// SetNATType sets the NAT type (useful when server provides this info)
+func (m *Manager) SetNATType(natType nat.NATType) {
+	m.natTypeMux.Lock()
+	defer m.natTypeMux.Unlock()
+	m.myNATType = natType
+	log.Printf("NAT Type set to: %s (Level: %d)", natType, natType.GetLevel())
+}
+
+// ShouldInitiateConnectionToPeer determines if we should initiate connection to peer
+// based on NAT types (lower-level NAT connects to higher-level NAT)
+func (m *Manager) ShouldInitiateConnectionToPeer(peerIP net.IP) bool {
+	m.mu.RLock()
+	peer, exists := m.peers[peerIP.String()]
+	m.mu.RUnlock()
+	
+	if !exists {
+		// Default to true if peer not found
+		return true
+	}
+	
+	myNATType := m.GetNATType()
+	peerNATType := peer.GetNATType()
+	
+	// If either NAT type is unknown, default to initiating
+	if myNATType == nat.NATUnknown || peerNATType == nat.NATUnknown {
+		return true
+	}
+	
+	// Lower-level (better) NAT should initiate
+	shouldInitiate := myNATType.ShouldInitiateConnection(peerNATType)
+	
+	log.Printf("P2P connection decision for %s: My NAT=%s (level %d), Peer NAT=%s (level %d), Should initiate=%v",
+		peerIP, myNATType, myNATType.GetLevel(), peerNATType, peerNATType.GetLevel(), shouldInitiate)
+	
+	return shouldInitiate
+}
+
+// CanEstablishP2PWith checks if P2P connection is likely to succeed with peer
+func (m *Manager) CanEstablishP2PWith(peerIP net.IP) bool {
+	m.mu.RLock()
+	peer, exists := m.peers[peerIP.String()]
+	m.mu.RUnlock()
+	
+	if !exists {
+		// Assume possible if peer not found
+		return true
+	}
+	
+	myNATType := m.GetNATType()
+	peerNATType := peer.GetNATType()
+	
+	// If either NAT type is unknown, attempt P2P
+	if myNATType == nat.NATUnknown || peerNATType == nat.NATUnknown {
+		return true
+	}
+	
+	canTraverse := myNATType.CanTraverseWith(peerNATType)
+	
+	if !canTraverse {
+		log.Printf("P2P traversal unlikely between %s (NAT: %s) and peer %s (NAT: %s) - will use server relay",
+			myNATType, myNATType, peerIP, peerNATType)
+	}
+	
+	return canTraverse
 }
