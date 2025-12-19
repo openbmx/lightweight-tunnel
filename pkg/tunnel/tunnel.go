@@ -52,6 +52,8 @@ const (
 	tlsContentTypeApp    = 0x17
 	tlsVersionMajor      = 0x03
 	tlsVersionMinorTLS12 = 0x03
+
+	rotatedKeyLength = 30
 )
 
 // packetConn defines the subset of methods shared by fake TCP and TLS transports.
@@ -1745,7 +1747,7 @@ func (t *Tunnel) rotateKeyOnce() {
 		return
 	}
 
-	newKey, err := generateRandomKey(30)
+	newKey, err := generateRandomKey(rotatedKeyLength)
 	if err != nil {
 		log.Printf("Failed to generate rotated key: %v", err)
 		return
@@ -1770,7 +1772,10 @@ func (t *Tunnel) rotateKeyOnce() {
 
 func (t *Tunnel) scheduleKeyActivation(version int, newKey string) {
 	grace := time.Duration(t.config.KeyRotateGrace) * time.Second
+	t.wg.Add(1)
 	go func() {
+		defer t.wg.Done()
+
 		timer := time.NewTimer(grace)
 		defer timer.Stop()
 
