@@ -464,7 +464,7 @@ sudo ./lightweight-tunnel \
 | `local_addr` | 监听地址（服务端） | `0.0.0.0:9000` |
 | `tunnel_addr` | 虚拟网络地址 | `10.0.0.1/24` |
 | `key` | 加密密钥 | 16+ 字符的强密码 |
-| `mtu` | 最大传输单元 | 1400 (标准网络)<br>1200 (弱网)<br>8000 (内网) |
+| `mtu` | 最大传输单元 | 1400 (标准网络)<br>1200 (弱网)<br>8000 (内网)<br>**注意**: rawtcp+加密时自动调整为1371 |
 | `fec_data` | FEC 数据分片数 | 10 (标准)<br>20 (低丢包) |
 | `fec_parity` | FEC 校验分片数 | 3 (标准)<br>5 (高丢包) |
 | `timeout` | 连接超时秒数 | 30 |
@@ -484,6 +484,7 @@ sudo ./lightweight-tunnel \
 - ✅ 可抵御深度包检测（DPI）
 - ⚠️ **需要root权限**
 - ⚠️ **自动管理iptables规则**（防止内核RST）
+- ⚠️ **启用加密时MTU自动调整为1371**（防止TCP分段导致解密失败）
 - ⚡ 类似udp2raw的真实TCP伪装
 
 **udp模式（兼容）**：
@@ -780,15 +781,17 @@ telnet <服务器IP> 9000
 如果服务器在 NAT 后面，确保路由器配置了端口转发：
 - 外部端口 9000 → 内部 IP:9000 (TCP + UDP)
 
-### Q4: 密钥不匹配导致连接失败
+### Q4: 密钥不匹配或解密错误
 
-**错误信息（服务端日志）**：
+**错误信息（服务端/客户端日志）**：
 ```
-Decryption error (wrong key?)
+Decryption error (wrong key?): cipher: message authentication failed
 Client authentication failed
 ```
 
-**原因**：服务端和客户端使用了不同的加密密钥。
+**可能原因1：密钥不匹配**
+
+服务端和客户端使用了不同的加密密钥。
 
 **解决方案**：
 确保服务端和所有客户端使用完全相同的 `-k` 参数：
@@ -805,6 +808,27 @@ sudo ./lightweight-tunnel -m client -k "exactly-same-password" ...
 - 密钥区分大小写
 - 注意空格、特殊字符
 - 建议使用引号包裹密钥
+
+**可能原因2：MTU配置过大（已自动修复）**
+
+在rawtcp模式下，如果MTU设置过大（>1371），加密后的数据包可能被TCP层分段，导致接收端无法正确解密部分数据。
+
+**自动修复**：
+从v1.0.0版本开始，程序会自动检测并调整MTU：
+- 当使用rawtcp模式+加密时，MTU自动限制为1371字节
+- 您会看到日志：`⚠️  Adjusting MTU from 1400 to 1371 to prevent TCP segmentation of encrypted packets`
+
+**手动配置（如果需要）**：
+```bash
+# 如果仍遇到问题，可以手动降低MTU
+sudo ./lightweight-tunnel -m client -k "key" -mtu 1371 ...
+```
+
+**技术说明**：
+- Raw TCP最大分段大小：1400字节
+- 加密开销：28字节（12字节nonce + 16字节认证标签）
+- 数据包类型：1字节
+- 安全MTU = 1400 - 28 - 1 = 1371字节
 
 ### Q5: 第二个客户端连接被拒绝
 
