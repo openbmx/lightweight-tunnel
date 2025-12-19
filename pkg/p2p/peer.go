@@ -21,6 +21,10 @@ type PeerInfo struct {
 	ThroughServer bool     // Whether currently routing through server
 	IsLocalConnection bool // Whether connection is via local network (not NAT)
 	RelayPeers   []net.IP  // List of peers that can relay to this peer
+	// Quality monitoring fields
+	packetsSent     uint64 // Total packets sent
+	packetsReceived uint64 // Total packets received (for loss calculation)
+	lastQualityCheck time.Time // Last time quality was checked
 	mu           sync.RWMutex
 }
 
@@ -47,6 +51,58 @@ func (p *PeerInfo) UpdatePacketLoss(loss float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.PacketLoss = loss
+}
+
+// RecordPacketSent increments the sent packet counter
+func (p *PeerInfo) RecordPacketSent() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.packetsSent++
+}
+
+// RecordPacketReceived increments the received packet counter
+func (p *PeerInfo) RecordPacketReceived() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.packetsReceived++
+	p.LastSeen = time.Now()
+}
+
+// CalculatePacketLoss calculates packet loss based on sent/received counters
+// This is a simplified approach - in reality would need sequence numbers
+func (p *PeerInfo) CalculatePacketLoss() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	if p.packetsSent == 0 {
+		return 0.0
+	}
+	
+	// Expected to receive roughly same amount as sent (bidirectional)
+	// This is simplified - real implementation would use acknowledgments
+	expectedReceived := p.packetsSent
+	actualReceived := p.packetsReceived
+	
+	if actualReceived >= expectedReceived {
+		return 0.0 // No loss
+	}
+	
+	loss := float64(expectedReceived-actualReceived) / float64(expectedReceived)
+	if loss > 1.0 {
+		loss = 1.0
+	}
+	
+	p.PacketLoss = loss
+	return loss
+}
+
+// ResetPacketCounters resets packet statistics (called periodically)
+func (p *PeerInfo) ResetPacketCounters() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.packetsSent = 0
+	p.packetsReceived = 0
+	p.lastQualityCheck = time.Now()
 }
 
 // SetNATType sets the NAT type for this peer
@@ -180,6 +236,9 @@ func (p *PeerInfo) Clone() *PeerInfo {
 		ThroughServer:     p.ThroughServer,
 		IsLocalConnection: p.IsLocalConnection,
 		RelayPeers:        make([]net.IP, len(p.RelayPeers)),
+		packetsSent:       p.packetsSent,
+		packetsReceived:   p.packetsReceived,
+		lastQualityCheck:  p.lastQualityCheck,
 	}
 	copy(clone.RelayPeers, p.RelayPeers)
 	

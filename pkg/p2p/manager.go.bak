@@ -872,99 +872,99 @@ func (m *Manager) sendKeepalives() {
 	}
 }
 
+
 // qualityMonitorLoop periodically checks connection quality and updates metrics
 func (m *Manager) qualityMonitorLoop() {
-	defer m.wg.Done()
-	
-	// Check quality every 30 seconds
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-m.stopCh:
-			return
-		case <-ticker.C:
-			m.checkConnectionQuality()
-		}
-	}
+defer m.wg.Done()
+
+// Check quality every 30 seconds
+ticker := time.NewTicker(30 * time.Second)
+defer ticker.Stop()
+
+for {
+select {
+case <-m.stopCh:
+return
+case <-ticker.C:
+m.checkConnectionQuality()
+}
+}
 }
 
 // checkConnectionQuality checks and updates quality metrics for all connections
 func (m *Manager) checkConnectionQuality() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	
-	now := time.Now()
-	
-	for ipStr, conn := range m.connections {
-		peer, exists := m.peers[ipStr]
-		if !exists {
-			continue
-		}
-		
-		peer.mu.RLock()
-		connected := peer.Connected
-		lastSeen := peer.LastSeen
-		peer.mu.RUnlock()
-		
-		if !connected {
-			continue
-		}
-		
-		// Check connection responsiveness
-		timeSinceLastSeen := now.Sub(lastSeen)
-		
-		// Update latency from connection's RTT measurement
-		conn.mu.RLock()
-		rtt := conn.estimatedRTT
-		conn.mu.RUnlock()
-		
-		if rtt > 0 {
-			peer.UpdateLatency(rtt)
-		}
-		
-		// Calculate packet loss
-		loss := peer.CalculatePacketLoss()
-		
-		// Determine connection quality
-		quality := peer.GetQualityScore()
-		
-		// Log poor quality connections
-		if quality < 50 {
-			log.Printf("⚠️  Poor P2P connection quality to %s: score=%d, latency=%v, loss=%.2f%%, last_seen=%v ago",
-				ipStr, quality, rtt, loss*100, timeSinceLastSeen)
-			
-			// If quality is very poor and connection is stale, consider switching to server relay
-			if quality < 30 && timeSinceLastSeen > ConnectionStaleTimeout/2 {
-				log.Printf("Connection to %s is poor quality - may need to fallback to server relay", ipStr)
-				// Mark as going through server temporarily
-				peer.SetThroughServer(true)
-				peer.SetConnected(false)
-			}
-		}
-		
-		// Reset packet counters for next measurement period
-		peer.ResetPacketCounters()
-	}
+m.mu.RLock()
+defer m.mu.RUnlock()
+
+now := time.Now()
+
+for ipStr, conn := range m.connections {
+peer, exists := m.peers[ipStr]
+continue
+}
+
+peer.mu.RLock()
+connected := peer.Connected
+lastSeen := peer.LastSeen
+peer.mu.RUnlock()
+
+continue
+}
+
+// Check connection responsiveness
+timeSinceLastSeen := now.Sub(lastSeen)
+
+// Update latency from connection's RTT measurement
+conn.mu.RLock()
+rtt := conn.estimatedRTT
+conn.mu.RUnlock()
+
+if rtt > 0 {
+peer.UpdateLatency(rtt)
+}
+
+// Calculate packet loss
+loss := peer.CalculatePacketLoss()
+
+// Determine connection quality
+quality := peer.GetQualityScore()
+
+// Log poor quality connections
+if quality < 50 {
+log.Printf("⚠️  Poor P2P connection quality to %s: score=%d, latency=%v, loss=%.2f%%, last_seen=%v ago",
+ipStr, quality, rtt, loss*100, timeSinceLastSeen)
+
+// If quality is very poor and connection is stale, consider switching to server relay
+if quality < 30 && timeSinceLastSeen > ConnectionStaleTimeout/2 {
+log.Printf("Connection to %s is poor quality - may need to fallback to server relay", ipStr)
+// Mark as going through server temporarily
+peer.SetThroughServer(true)
+peer.SetConnected(false)
+}
+}
+
+// Reset packet counters for next measurement period
+peer.ResetPacketCounters()
+}
 }
 
 // RecordPacketSent records that a packet was sent to a peer (for quality monitoring)
 func (m *Manager) RecordPacketSent(peerIP net.IP) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	
-	if peer, exists := m.peers[peerIP.String()]; exists {
-		peer.RecordPacketSent()
-	}
+m.mu.RLock()
+defer m.mu.RUnlock()
+
+if peer, exists := m.peers[peerIP.String()]; exists {
+peer.RecordPacketSent()
+}
 }
 
 // RecordPacketReceived records that a packet was received from a peer (for quality monitoring)
 func (m *Manager) RecordPacketReceived(peerIP net.IP) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	
-	if peer, exists := m.peers[peerIP.String()]; exists {
-		peer.RecordPacketReceived()
-	}
+m.mu.RLock()
+defer m.mu.RUnlock()
+
+if peer, exists := m.peers[peerIP.String()]; exists {
+peer.RecordPacketReceived()
 }
+}
+
