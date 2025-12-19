@@ -39,6 +39,9 @@ const (
 	P2PHandshakeWaitTime   = 2 * time.Second        // Time to wait for P2P handshake to complete before updating routes
 	P2PMaxRetries          = 5
 	P2PMaxBackoffSeconds   = 32 // Maximum backoff delay in seconds
+	
+	// Queue management constants
+	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 )
 
 // ClientConnection represents a single client connection
@@ -83,27 +86,48 @@ type Tunnel struct {
 
 // NewTunnel creates a new tunnel instance
 func NewTunnel(cfg *config.Config) (*Tunnel, error) {
-	// Set faketcp mode based on transport configuration
-	if cfg.Transport == "rawtcp" || cfg.Transport == "raw" {
-		faketcp.SetMode(faketcp.ModeRaw)
-		// Check if raw socket is supported
-		if err := faketcp.CheckRawSocketSupport(); err != nil {
-			log.Printf("⚠️  WARNING: Raw socket mode requested but not supported: %v", err)
-			log.Printf("⚠️  Raw Socket模式需要root权限！请使用 sudo 运行程序")
-			log.Printf("⚠️  例如: sudo ./lightweight-tunnel -m %s ...", cfg.Mode)
-			log.Printf("⚠️  Falling back to UDP mode (fake TCP headers in payload)")
-			log.Printf("⚠️  注意: UDP模式性能较低，延迟约为Raw Socket模式的2-3倍")
-			faketcp.SetMode(faketcp.ModeUDP)
-		} else {
-			log.Printf("✅ Using Raw Socket mode (真正的TCP伪装，类似udp2raw)")
-			log.Printf("✅ 性能优化：低延迟，高吞吐量")
+	// Force rawtcp mode - this is the only supported transport now
+	cfg.Transport = "rawtcp"
+	faketcp.SetMode(faketcp.ModeRaw)
+	
+	// Check if raw socket is supported (requires root)
+	if err := faketcp.CheckRawSocketSupport(); err != nil {
+		return nil, fmt.Errorf("Raw Socket模式需要root权限运行\n"+
+			"请使用以下命令运行: sudo ./lightweight-tunnel -m %s ...\n"+
+			"错误详情: %v", cfg.Mode, err)
+	}
+	
+	log.Printf("✅ 使用 Raw Socket 模式 (真正的TCP伪装，类似udp2raw)")
+	log.Printf("✅ 性能优化：低延迟，高吞吐量")
+
+	// Auto-detect MTU if not specified or set to 0
+	if cfg.MTU == 0 {
+		log.Println("🔍 MTU未指定，启动自动检测...")
+		
+		// Detect network type
+		networkType := AutoDetectNetworkType()
+		log.Printf("   检测到网络类型: %s", networkType)
+		
+		// Get recommended MTU for network type
+		recommendedMTU := GetRecommendedMTU(networkType)
+		cfg.MTU = recommendedMTU
+		
+		log.Printf("✅ 自动设置MTU为: %d", cfg.MTU)
+		
+		// If in client mode and remote address is available, do path MTU discovery
+		if cfg.Mode == "client" && cfg.RemoteAddr != "" {
+			discovery := NewMTUDiscovery(cfg.RemoteAddr, cfg.MTU)
+			if optimalMTU, err := discovery.DiscoverOptimalMTU(); err == nil {
+				cfg.MTU = optimalMTU
+				log.Printf("✅ 通过路径MTU探测优化为: %d", cfg.MTU)
+			} else {
+				log.Printf("⚠️  路径MTU探测失败: %v，使用推荐值 %d", err, cfg.MTU)
+			}
 		}
 	} else {
-		faketcp.SetMode(faketcp.ModeUDP)
-		log.Printf("ℹ️  Using UDP mode (fake TCP headers in payload)")
-		log.Printf("ℹ️  建议: 使用 'transport: rawtcp' 配置并以root权限运行以获得更好性能")
+		log.Printf("使用配置的MTU: %d", cfg.MTU)
 	}
-
+	
 	// Create FEC encoder/decoder
 	fecCodec, err := fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, cfg.MTU/cfg.FECDataShards)
 	if err != nil {
@@ -744,8 +768,15 @@ func (t *Tunnel) tunReaderServer() {
 			case client.sendQueue <- packet:
 			case <-t.stopCh:
 				return
-			default:
-				log.Printf("Client send queue full for %s, dropping packet", dstIP)
+			case <-time.After(QueueSendTimeout):
+				// Wait for queue space before logging and dropping
+				select {
+				case client.sendQueue <- packet:
+				case <-t.stopCh:
+					return
+				default:
+					log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
+				}
 			}
 		}
 		// If no client found, packet is dropped
@@ -1116,8 +1147,17 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 							return
 						case <-client.stopCh:
 							return
-						default:
-							log.Printf("Target client send queue full for %s, dropping packet", dstIP)
+						case <-time.After(QueueSendTimeout):
+							// Wait for queue space
+							select {
+							case targetClient.sendQueue <- payload:
+							case <-t.stopCh:
+								return
+							case <-client.stopCh:
+								return
+							default:
+								log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
+							}
 						}
 					} else {
 						// Send to TUN device (for server or unknown destination)
@@ -1661,14 +1701,24 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 }
 
 // sendViaServer sends packet through the server connection
+// Uses timeout-based approach to handle queue congestion
 func (t *Tunnel) sendViaServer(packet []byte) error {
 	select {
 	case t.sendQueue <- packet:
 		return nil
 	case <-t.stopCh:
 		return errors.New("tunnel stopped")
-	default:
-		return errors.New("send queue full")
+	case <-time.After(QueueSendTimeout):
+		// Wait for queue space before giving up
+		// This handles temporary bursts without immediately dropping packets
+		select {
+		case t.sendQueue <- packet:
+			return nil
+		case <-t.stopCh:
+			return errors.New("tunnel stopped")
+		default:
+			return errors.New("send queue full after timeout")
+		}
 	}
 }
 

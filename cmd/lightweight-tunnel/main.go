@@ -20,15 +20,16 @@ func main() {
 	// Command line flags
 	configFile := flag.String("c", "", "Configuration file path")
 	mode := flag.String("m", "server", "Mode: server or client")
-	transport := flag.String("transport", "rawtcp", "Transport: udp, faketcp, or rawtcp (requires root, default)")
+	// Transport mode is now fixed to rawtcp only
+	// transport flag removed - always use rawtcp mode for true TCP disguise
 	localAddr := flag.String("l", "0.0.0.0:9000", "Local address to listen on")
 	remoteAddr := flag.String("r", "", "Remote address to connect to (client mode)")
 	tunnelAddr := flag.String("t", "10.0.0.1/24", "Tunnel IP address and netmask")
 	mtu := flag.Int("mtu", 1400, "MTU size")
 	fecData := flag.Int("fec-data", 10, "FEC data shards")
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards")
-	sendQueueSize := flag.Int("send-queue", 1000, "Send queue buffer size")
-	recvQueueSize := flag.Int("recv-queue", 1000, "Receive queue buffer size")
+	sendQueueSize := flag.Int("send-queue", 5000, "Send queue buffer size (increased default for better performance)")
+	recvQueueSize := flag.Int("recv-queue", 5000, "Receive queue buffer size (increased default for better performance)")
 	multiClient := flag.Bool("multi-client", true, "Enable multi-client support (server mode)")
 	maxClients := flag.Int("max-clients", 100, "Maximum number of concurrent clients (server mode)")
 	clientIsolation := flag.Bool("client-isolation", false, "Enable client isolation mode (clients cannot communicate with each other)")
@@ -73,7 +74,7 @@ func main() {
 		// Use command line arguments
 		cfg = &config.Config{
 			Mode:              *mode,
-			Transport:         *transport,
+			Transport:         "rawtcp", // Fixed to rawtcp mode only
 			LocalAddr:         *localAddr,
 			RemoteAddr:        *remoteAddr,
 			TunnelAddr:        *tunnelAddr,
@@ -113,7 +114,7 @@ func main() {
 	log.Println("=== Lightweight Tunnel ===")
 	log.Printf("Version: %s", version)
 	log.Printf("Mode: %s", cfg.Mode)
-	log.Printf("Transport: %s", cfg.Transport)
+	log.Printf("Transport: rawtcp (true TCP disguise)")
 	log.Printf("Local Address: %s", cfg.LocalAddr)
 	if cfg.Mode == "client" {
 		log.Printf("Remote Address: %s", cfg.RemoteAddr)
@@ -184,30 +185,43 @@ func validateConfig(cfg *config.Config) error {
 }
 
 func generateConfigFile(filename string) error {
-	// Generate server config with all features
-	serverCfg := config.DefaultConfig()
-	serverCfg.Mode = "server"
-	serverCfg.LocalAddr = "0.0.0.0:9000"
-	serverCfg.TunnelAddr = "10.0.0.1/24"
-	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Example key
+	// Generate minimalist server config with only essential parameters
+	serverCfg := &config.Config{
+		Mode:       "server",
+		LocalAddr:  "0.0.0.0:9000",
+		TunnelAddr: "10.0.0.1/24",
+		Key:        "请修改为您的强密钥",
+		MTU:        0, // 0 = auto-detect
+	}
 
 	if err := config.SaveConfig(filename, serverCfg); err != nil {
 		return err
 	}
 
-	// Generate client config example with all features
+	// Generate minimalist client config example with only essential parameters
 	clientFilename := filename + ".client"
-	clientCfg := config.DefaultConfig()
-	clientCfg.Mode = "client"
-	clientCfg.RemoteAddr = "SERVER_IP:9000"
-	clientCfg.TunnelAddr = "10.0.0.2/24"
-	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Must match server key
+	clientCfg := &config.Config{
+		Mode:       "client",
+		RemoteAddr: "服务器IP:9000",
+		TunnelAddr: "10.0.0.2/24",
+		Key:        "请修改为您的强密钥",
+		MTU:        0, // 0 = auto-detect
+	}
 
 	if err := config.SaveConfig(clientFilename, clientCfg); err != nil {
 		return err
 	}
 
-	fmt.Printf("Also generated client config example: %s\n", clientFilename)
+	fmt.Printf("✅ 已生成服务端配置: %s\n", filename)
+	fmt.Printf("✅ 已生成客户端配置: %s\n", clientFilename)
+	fmt.Printf("\n📝 配置说明:\n")
+	fmt.Printf("   - mode: 运行模式 (server/client)\n")
+	fmt.Printf("   - local_addr: 服务端监听地址\n")
+	fmt.Printf("   - remote_addr: 客户端连接的服务器地址\n")
+	fmt.Printf("   - tunnel_addr: 虚拟网络IP地址\n")
+	fmt.Printf("   - key: 加密密钥（必须设置且双方一致）\n")
+	fmt.Printf("   - mtu: 最大传输单元 (0=自动检测)\n")
+	fmt.Printf("\n⚠️  重要: 请修改配置文件中的密钥为强密码！\n")
 	return nil
 }
 

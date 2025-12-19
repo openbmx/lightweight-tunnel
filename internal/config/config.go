@@ -8,11 +8,11 @@ import (
 // Config holds the tunnel configuration
 type Config struct {
 	Mode          string `json:"mode"`           // "client" or "server"
-	Transport     string `json:"transport"`      // "udp", "faketcp", or "rawtcp" (default: "rawtcp")
+	Transport     string `json:"transport"`      // "rawtcp" only (true TCP disguise, requires root)
 	LocalAddr     string `json:"local_addr"`     // Local address to listen on
 	RemoteAddr    string `json:"remote_addr"`    // Remote address to connect to (client mode)
 	TunnelAddr    string `json:"tunnel_addr"`    // Tunnel network address (e.g., "10.0.0.1/24")
-	MTU           int    `json:"mtu"`            // MTU size
+	MTU           int    `json:"mtu"`            // MTU size (0 = auto-detect)
 	FECDataShards int    `json:"fec_data"`       // Number of FEC data shards
 	FECParityShards int  `json:"fec_parity"`     // Number of FEC parity shards
 	Timeout       int    `json:"timeout"`        // Connection timeout in seconds
@@ -38,7 +38,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Mode:              "server",
-		Transport:         "rawtcp",  // Default to rawtcp for true TCP disguise
+		Transport:         "rawtcp",  // Fixed to rawtcp for true TCP disguise
 		LocalAddr:         "0.0.0.0:9000",
 		RemoteAddr:        "",
 		TunnelAddr:        "10.0.0.1/24",
@@ -47,8 +47,8 @@ func DefaultConfig() *Config {
 		FECParityShards:   3,
 		Timeout:           30,
 		KeepaliveInterval: 10,
-		SendQueueSize:     1000,
-		RecvQueueSize:     1000,
+		SendQueueSize:     5000,  // Increased from 1000 to prevent queue full errors
+		RecvQueueSize:     5000,  // Increased from 1000 to handle burst traffic
 		MultiClient:         true,
 		MaxClients:          100,
 		ClientIsolation:     false,
@@ -97,10 +97,10 @@ func LoadConfig(filename string) (*Config, error) {
 		config.KeepaliveInterval = 10
 	}
 	if config.SendQueueSize == 0 {
-		config.SendQueueSize = 1000
+		config.SendQueueSize = 5000  // Increased default from 1000
 	}
 	if config.RecvQueueSize == 0 {
-		config.RecvQueueSize = 1000
+		config.RecvQueueSize = 5000  // Increased default from 1000
 	}
 	if config.MaxClients == 0 {
 		config.MaxClients = 100
@@ -138,8 +138,33 @@ func LoadConfig(filename string) (*Config, error) {
 }
 
 // SaveConfig saves configuration to a file
+// Only saves essential fields for cleaner config files.
+// Note: This function saves a minimal subset of configuration fields.
+// Additional fields in config files are preserved on load but will be lost on save.
+// To preserve all fields, modify the config file manually and avoid regenerating it.
 func SaveConfig(filename string, config *Config) error {
-	data, err := json.MarshalIndent(config, "", "  ")
+	// Create a minimal config map with only essential fields
+	minimalConfig := make(map[string]interface{})
+	
+	// Always include mode
+	minimalConfig["mode"] = config.Mode
+	
+	// Server-specific fields
+	if config.Mode == "server" {
+		minimalConfig["local_addr"] = config.LocalAddr
+	}
+	
+	// Client-specific fields
+	if config.Mode == "client" {
+		minimalConfig["remote_addr"] = config.RemoteAddr
+	}
+	
+	// Common essential fields
+	minimalConfig["tunnel_addr"] = config.TunnelAddr
+	minimalConfig["key"] = config.Key
+	minimalConfig["mtu"] = config.MTU
+	
+	data, err := json.MarshalIndent(minimalConfig, "", "  ")
 	if err != nil {
 		return err
 	}
