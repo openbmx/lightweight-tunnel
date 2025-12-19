@@ -64,6 +64,7 @@ func main() {
 	enableMeshRouting := flag.Bool("mesh-routing", true, "Enable mesh routing through other clients")
 	maxHops := flag.Int("max-hops", 3, "Maximum hops for mesh routing")
 	routeUpdateInterval := flag.Int("route-update", 30, "Route quality check interval in seconds")
+	p2pTimeout := flag.Int("p2p-timeout", 5, "P2P connection timeout in seconds before falling back to server routing")
 	tunName := flag.String("tun", "", "TUN device name (empty = auto assign)")
 	advertisedRoutes := flag.String("routes", "", "Comma-separated CIDR ranges reachable through this node (advertised to the server for routing)")
 	showVersion := flag.Bool("v", false, "Show version")
@@ -149,7 +150,7 @@ func main() {
 			EnableMeshRouting:   *enableMeshRouting,
 			MaxHops:             *maxHops,
 			RouteUpdateInterval: *routeUpdateInterval,
-			P2PTimeout:          5,
+			P2PTimeout:          *p2pTimeout,
 		}
 	}
 
@@ -230,6 +231,13 @@ func validateConfig(cfg *config.Config) error {
 
 	if cfg.FECDataShards < 1 || cfg.FECParityShards < 1 {
 		return fmt.Errorf("FEC shards must be positive")
+	}
+
+	if cfg.P2PTimeout < 0 {
+		return fmt.Errorf("P2P timeout must be zero or positive")
+	}
+	if cfg.P2PTimeout > 86400 {
+		return fmt.Errorf("P2P timeout too large (max 86400 seconds)")
 	}
 
 	// TLS validation

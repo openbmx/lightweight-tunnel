@@ -6,10 +6,31 @@
 
 Lightweight Tunnel 通过 **UDP + TCP 头部伪装** 来规避常见的 UDP 封锁，并内置 **AES-256-GCM 加密** 与 **FEC 前向纠错**，在保证安全的同时兼顾低延迟和稳定性。
 
+## 网络拓扑速览
+
+```mermaid
+flowchart LR
+    subgraph Cloud[Internet / NAT]
+    S[Server\n0.0.0.0:9000]
+    end
+
+    C1[Client A\n10.0.0.2]
+    C2[Client B\n10.0.0.3]
+    C3[Client C\n10.0.0.4]
+
+    S ---|UDP + TCP 伪装 / TLS| C1
+    S ---|UDP + TCP 伪装| C2
+    S ---|UDP + TCP 伪装| C3
+
+    C1 <--> |P2P / Mesh 路由| C2
+    C2 <--> |转发| C3
+```
+
 ## 主要特性
 
 - 🚀 **轻量高效** - 资源占用少，适合低配置服务器
 - 🔐 **AES-256-GCM 加密** - 使用 `-k` 参数启用加密，防止未授权连接
+- 🛡️ **TLS 传输模式** - 可选的 TLS 证书传输通道，适合需要纯 TCP/TLS 的环境
 - 🎭 **TCP 伪装** - UDP 数据包伪装成 TCP 连接，可穿透防火墙
 - ⚡ **UDP 传输** - 实际使用 UDP 传输，避免 TCP-over-TCP 问题
 - 🛡️ **FEC 纠错** - 自动纠正丢包，提升弱网环境下的稳定性
@@ -20,6 +41,11 @@ Lightweight Tunnel 通过 **UDP + TCP 头部伪装** 来规避常见的 UDP 封�
 - 🌐 **网状网络** - 支持通过其他客户端中继流量，实现多跳转发
 - ⚡ **高性能** - 基于 Go 协程实现高并发处理
 - 🎯 **简单易用** - 支持命令行和配置文件两种方式
+
+## 已补齐的功能清单
+
+- ✅ **TLS 传输模式**：现已支持 `-tls` 与证书/密钥，满足需要纯 TCP/TLS 的场景，可配合 `-tls-skip-verify` 在测试环境跳过校验。
+- ✅ **P2P 连接超时可配置**：新增 `-p2p-timeout`（默认 5s），直连超过超时会自动回退到服务器转发，避免长时间等待。
 
 ## 适用场景
 
@@ -34,6 +60,8 @@ Lightweight Tunnel 通过 **UDP + TCP 头部伪装** 来规避常见的 UDP 封�
 ### 推荐：使用 `-k` 参数加密
 
 使用 `-k` 参数可以启用 **AES-256-GCM 加密**，这是推荐的安全配置：
+
+- 若环境需要严格的传输层合规，可叠加 `-tls` 与证书文件；`-k` 仍用于隧道负载端到端加密。
 
 ```bash
 # 服务端（启用加密）
@@ -217,6 +245,24 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
 
 路由选择会结合 NAT 类型识别：较“开放”的 NAT 会优先主动打洞；双方都是对称 NAT 时自动回退服务器中转。
 
+#### 场景五：TLS 传输模式（需证书，适合纯 TCP/TLS 环境）
+
+**服务端：**
+```bash
+sudo ./lightweight-tunnel -m server -l 0.0.0.0:9000 -t 10.0.0.1/24 \
+    -tls -tls-cert /path/server.crt -tls-key /path/server.key
+```
+
+**客户端：**
+```bash
+sudo ./lightweight-tunnel -m client -r <服务器IP>:9000 -t 10.0.0.2/24 \
+    -tls -tls-skip-verify=false
+# 如使用自签证书，可额外提供 CA/客户端证书：
+# -tls-cert /path/ca_or_client.crt [-tls-key /path/client.key]
+```
+
+> 说明：TLS 模式走 TCP 传输并使用长度帧封装，仍可结合 `-k` 对隧道负载进行 AES-256-GCM 加密。
+
 ### 使用配置文件
 
 #### 生成示例配置
@@ -315,13 +361,14 @@ sudo ./lightweight-tunnel -c config.json
 | `-client-isolation` | 客户端隔离模式 | false |
 | `-p2p` | 启用 P2P 直连 | true |
 | `-p2p-port` | P2P UDP 端口（0=自动） | 0 |
+| `-p2p-timeout` | P2P 连接超时（秒），超时后回退服务器转发 | 5 |
 | `-mesh-routing` | 启用网状路由 | true |
 | `-max-hops` | 最大跳数 | 3 |
 | `-route-update` | 路由更新间隔（秒） | 30 |
-| `-tls` | 启用 TLS 加密（当前不支持，会报错；请使用 `-k` 进行加密） | false |
-| `-tls-cert` | TLS 证书文件（服务端） | - |
-| `-tls-key` | TLS 私钥文件（服务端） | - |
-| `-tls-skip-verify` | 跳过证书验证（客户端，不安全） | false |
+| `-tls` | 启用 TLS 传输加密（使用 TCP + 长度帧，可与 `-k` 叠加） | false |
+| `-tls-cert` | TLS 证书文件（服务端必填，客户端可用于自签 CA/客户端证书） | - |
+| `-tls-key` | TLS 私钥文件（服务端必填；与 `-tls-cert` 搭配可用于客户端双向认证） | - |
+| `-tls-skip-verify` | 跳过证书验证（客户端，不安全，仅测试时使用） | false |
 | `-tun` | 指定 TUN 设备名（为空则自动分配 tun0、tun1...） | - |
 | `-routes` | 逗号分隔的 CIDR 列表，表示可经由本节点访问的其他网段（例如本地网卡或其他 TUN） | - |
 | `-service` | systemd 服务操作：install/uninstall/start/stop/restart/status | - |
@@ -331,7 +378,7 @@ sudo ./lightweight-tunnel -c config.json
 | `-g` | 生成示例配置文件 | - |
 
 配置文件额外字段：
-- `p2p_timeout`：P2P 连接超时时间（秒），默认 5，命令行暂未提供独立参数。
+- `p2p_timeout`：P2P 连接超时时间（秒），默认 5（同 `-p2p-timeout`）。
 
 ### 广播额外网段（访问其他 TUN/网卡）
 
