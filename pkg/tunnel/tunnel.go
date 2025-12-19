@@ -129,10 +129,10 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		// In raw TCP mode, WritePacket segments data into 1400-byte chunks.
 		// To avoid segmenting encrypted packets (which breaks decryption), we must ensure:
 		// encrypted_size = plaintext_size + overhead <= 1400
-		// plaintext_size = packet_data + 1 (packet type byte)
+		// plaintext_size = tunnel_packet_payload + 1 (packet type byte)
 		// Therefore: MTU + 1 + overhead <= 1400
 		// MTU <= 1400 - 1 - overhead
-		if cfg.Transport == "rawtcp" || cfg.Transport == "raw" {
+		if cfg.Transport == "rawtcp" {
 			const maxRawTCPSegment = 1400
 			const packetTypeOverhead = 1
 			encryptionOverhead := cipher.Overhead()
