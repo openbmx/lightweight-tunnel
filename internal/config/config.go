@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -189,6 +190,8 @@ func UpdateConfigKey(filename string, newKey string) error {
 	if err != nil {
 		return err
 	}
+
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF}) // Handle UTF-8 BOM
 
 	var cfgMap map[string]interface{}
 	if err := json.Unmarshal(data, &cfgMap); err != nil {
