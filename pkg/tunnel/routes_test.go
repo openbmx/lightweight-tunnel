@@ -54,3 +54,17 @@ func TestChooseRouteClient(t *testing.T) {
 		t.Fatalf("expected no match, got %s", client)
 	}
 }
+
+func TestDiffIPNets(t *testing.T) {
+	_, a, _ := net.ParseCIDR("10.0.0.0/24")
+	_, b, _ := net.ParseCIDR("10.0.1.0/24")
+	_, c, _ := net.ParseCIDR("10.0.2.0/24")
+
+	toAdd, toDel := diffIPNets([]*net.IPNet{a, b}, []*net.IPNet{b, c})
+	if len(toAdd) != 1 || toAdd[0].String() != "10.0.2.0/24" {
+		t.Fatalf("unexpected toAdd: %v", toAdd)
+	}
+	if len(toDel) != 1 || toDel[0].String() != "10.0.0.0/24" {
+		t.Fatalf("unexpected toDel: %v", toDel)
+	}
+}
