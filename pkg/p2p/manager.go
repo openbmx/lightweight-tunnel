@@ -85,11 +85,11 @@ func (m *Manager) Start() error {
 // Stop stops the P2P manager
 func (m *Manager) Stop() {
 	close(m.stopCh)
-	
+
 	if m.listener != nil {
 		m.listener.Close()
 	}
-	
+
 	m.mu.Lock()
 	for _, conn := range m.connections {
 		close(conn.stopCh)
@@ -98,8 +98,20 @@ func (m *Manager) Stop() {
 		}
 	}
 	m.mu.Unlock()
-	
-	m.wg.Wait()
+
+	// Wait for receivePackets goroutine to finish, but don't block forever
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return
+	case <-time.After(5 * time.Second):
+		log.Println("Timeout waiting for P2P manager goroutines to stop; continuing shutdown")
+		return
+	}
 }
 
 // SetPacketHandler sets the callback for received packets

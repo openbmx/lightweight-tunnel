@@ -273,8 +273,20 @@ func (t *Tunnel) Stop() {
 		}
 		
 		// Now wait for all goroutines to finish
-		t.wg.Wait()
-		log.Println("Tunnel stopped")
+		// Now wait for all goroutines to finish, but avoid indefinite hang by
+		// using a timeout. This prevents Stop() from blocking forever if some
+		// goroutines do not exit due to unforeseen blocking operations.
+		done := make(chan struct{})
+		go func() {
+			t.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			log.Println("Tunnel stopped")
+		case <-time.After(5 * time.Second):
+			log.Println("Timeout waiting for tunnel goroutines to stop; continuing shutdown")
+		}
 	})
 }
 
