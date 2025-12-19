@@ -706,7 +706,15 @@ func (l *ListenerRaw) acceptLoop() {
 func (l *ListenerRaw) Accept() (*ConnRaw, error) {
 	select {
 	case conn := <-l.acceptQueue:
-		return conn, nil
+		// 清空握手期间积压的控制包
+		for {
+			select {
+			case <-conn.recvQueue:
+				// 丢弃
+			default:
+				return conn, nil
+			}
+		}
 	case <-l.stopCh:
 		return nil, fmt.Errorf("listener closed")
 	}
