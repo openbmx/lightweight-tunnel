@@ -22,7 +22,8 @@ var (
 	serviceDir               = "/etc/systemd/system"
 )
 
-const systemdUnitTemplate = `[Unit]
+const (
+	systemdUnitTemplate = `[Unit]
 Description=Lightweight Tunnel Service (%q)
 After=network-online.target
 Wants=network-online.target
@@ -41,6 +42,8 @@ ProtectSystem=full
 [Install]
 WantedBy=multi-user.target
 `
+	maxObfsPaddingBytes = 4096
+)
 
 type commandRunner func(name string, args ...string) ([]byte, error)
 
@@ -77,6 +80,8 @@ func main() {
 	tlsKeyFile := flag.String("tls-key", "", "TLS private key file (server mode)")
 	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "Skip TLS certificate verification (client mode, insecure)")
 	key := flag.String("k", "", "Encryption key for tunnel traffic (required for secure communication)")
+	obfsTLSRecord := flag.Bool("obfs", false, "Wrap packets in TLS-like records with random padding to evade DPI/GFW (enable on both ends)")
+	obfsPaddingBytes := flag.Int("obfs-padding", 16, "Maximum random padding bytes when obfuscation is enabled")
 
 	flag.Parse()
 
@@ -138,6 +143,8 @@ func main() {
 			TunName:             *tunName,
 			AdvertisedRoutes:    splitAndCleanList(*advertisedRoutes),
 			Key:                 *key,
+			ObfsTLSRecord:       *obfsTLSRecord,
+			ObfsPaddingBytes:    *obfsPaddingBytes,
 			TLSEnabled:          *tlsEnabled,
 			TLSCertFile:         *tlsCertFile,
 			TLSKeyFile:          *tlsKeyFile,
@@ -182,6 +189,9 @@ func main() {
 		log.Println("⚠️  WARNING: No encryption key set (-k) - traffic is NOT encrypted")
 		log.Println("⚠️  Anyone can connect to this tunnel without authentication")
 		log.Println("⚠️  Use -k <key> to enable encryption and prevent unauthorized access")
+	}
+	if cfg.ObfsTLSRecord {
+		log.Printf("🎭  Obfuscation: TLS-like framing with up to %d padding bytes", cfg.ObfsPaddingBytes)
 	}
 
 	// Create tunnel
@@ -245,6 +255,9 @@ func validateConfig(cfg *config.Config) error {
 		if cfg.TLSCertFile == "" || cfg.TLSKeyFile == "" {
 			return fmt.Errorf("TLS enabled in server mode but certificate or key file not specified")
 		}
+	}
+	if cfg.ObfsPaddingBytes < 0 || cfg.ObfsPaddingBytes > maxObfsPaddingBytes {
+		return fmt.Errorf("obfs padding must be between 0 and %d bytes", maxObfsPaddingBytes)
 	}
 
 	return nil

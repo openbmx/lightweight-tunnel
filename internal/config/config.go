@@ -9,27 +9,29 @@ const DefaultLocalAddr = "0.0.0.0:9000"
 
 // Config holds the tunnel configuration
 type Config struct {
-	Mode              string   `json:"mode"`              // "client" or "server"
-	LocalAddr         string   `json:"local_addr"`        // Local address to listen on
-	RemoteAddr        string   `json:"remote_addr"`       // Remote address to connect to (client mode)
-	TunnelAddr        string   `json:"tunnel_addr"`       // Tunnel network address (e.g., "10.0.0.1/24")
-	TunName           string   `json:"tun_name"`          // Optional TUN device name (empty = auto assign)
-	AdvertisedRoutes  []string `json:"advertised_routes"` // Optional CIDR ranges reachable behind this node
-	MTU               int      `json:"mtu"`               // MTU size
-	FECDataShards     int      `json:"fec_data"`          // Number of FEC data shards
-	FECParityShards   int      `json:"fec_parity"`        // Number of FEC parity shards
-	Timeout           int      `json:"timeout"`           // Connection timeout in seconds
-	KeepaliveInterval int      `json:"keepalive"`         // Keepalive interval in seconds
-	SendQueueSize     int      `json:"send_queue_size"`   // Size of send queue buffer (default 1000)
-	RecvQueueSize     int      `json:"recv_queue_size"`   // Size of receive queue buffer (default 1000)
-	Key               string   `json:"key"`               // Encryption key for tunnel traffic (required for secure communication)
-	TLSEnabled        bool     `json:"tls_enabled"`       // Enable TLS encryption
-	TLSCertFile       string   `json:"tls_cert_file"`     // Path to TLS certificate file (server mode)
-	TLSKeyFile        string   `json:"tls_key_file"`      // Path to TLS private key file (server mode)
-	TLSSkipVerify     bool     `json:"tls_skip_verify"`   // Skip TLS certificate verification (client mode, insecure)
-	MultiClient       bool     `json:"multi_client"`      // Enable multi-client support (server mode, default true)
-	MaxClients        int      `json:"max_clients"`       // Maximum number of concurrent clients (default 100)
-	ClientIsolation   bool     `json:"client_isolation"`  // Enable client isolation (clients cannot communicate with each other)
+	Mode              string   `json:"mode"`               // "client" or "server"
+	LocalAddr         string   `json:"local_addr"`         // Local address to listen on
+	RemoteAddr        string   `json:"remote_addr"`        // Remote address to connect to (client mode)
+	TunnelAddr        string   `json:"tunnel_addr"`        // Tunnel network address (e.g., "10.0.0.1/24")
+	TunName           string   `json:"tun_name"`           // Optional TUN device name (empty = auto assign)
+	AdvertisedRoutes  []string `json:"advertised_routes"`  // Optional CIDR ranges reachable behind this node
+	MTU               int      `json:"mtu"`                // MTU size
+	FECDataShards     int      `json:"fec_data"`           // Number of FEC data shards
+	FECParityShards   int      `json:"fec_parity"`         // Number of FEC parity shards
+	Timeout           int      `json:"timeout"`            // Connection timeout in seconds
+	KeepaliveInterval int      `json:"keepalive"`          // Keepalive interval in seconds
+	SendQueueSize     int      `json:"send_queue_size"`    // Size of send queue buffer (default 1000)
+	RecvQueueSize     int      `json:"recv_queue_size"`    // Size of receive queue buffer (default 1000)
+	Key               string   `json:"key"`                // Encryption key for tunnel traffic (required for secure communication)
+	ObfsTLSRecord     bool     `json:"obfs_tls_record"`    // Wrap packets in TLS-like records to evade DPI/GFW (must be enabled on both ends)
+	ObfsPaddingBytes  int      `json:"obfs_padding_bytes"` // Maximum random padding bytes added when obfuscation is enabled
+	TLSEnabled        bool     `json:"tls_enabled"`        // Enable TLS encryption
+	TLSCertFile       string   `json:"tls_cert_file"`      // Path to TLS certificate file (server mode)
+	TLSKeyFile        string   `json:"tls_key_file"`       // Path to TLS private key file (server mode)
+	TLSSkipVerify     bool     `json:"tls_skip_verify"`    // Skip TLS certificate verification (client mode, insecure)
+	MultiClient       bool     `json:"multi_client"`       // Enable multi-client support (server mode, default true)
+	MaxClients        int      `json:"max_clients"`        // Maximum number of concurrent clients (default 100)
+	ClientIsolation   bool     `json:"client_isolation"`   // Enable client isolation (clients cannot communicate with each other)
 
 	// P2P and routing configuration
 	P2PEnabled          bool `json:"p2p_enabled"`           // Enable P2P direct connections (default true)
@@ -56,6 +58,7 @@ func DefaultConfig() *Config {
 		KeepaliveInterval:   10,
 		SendQueueSize:       1000,
 		RecvQueueSize:       1000,
+		ObfsPaddingBytes:    16,
 		MultiClient:         true,
 		MaxClients:          100,
 		ClientIsolation:     false,
@@ -119,6 +122,9 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if config.P2PTimeout == 0 {
 		config.P2PTimeout = 5
+	}
+	if config.ObfsPaddingBytes == 0 {
+		config.ObfsPaddingBytes = 16
 	}
 
 	// Default multi_client to true for server mode if not explicitly set

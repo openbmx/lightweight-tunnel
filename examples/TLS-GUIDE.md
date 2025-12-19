@@ -84,6 +84,7 @@ sudo ./bin/lightweight-tunnel \
    ```
 
 3. **额外安全建议**
+   - 结合 `-obfs` 与 `-obfs-padding`（默认 16）开启 TLS 记录混淆，流量特征更接近常规 HTTPS
    - 使用非标准端口（避免 443、1194 等常见端口）
    - 考虑使用 CDN 或域前置技术
    - 结合其他混淆工具使用
