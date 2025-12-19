@@ -75,6 +75,10 @@ type Tunnel struct {
 	publicAddrMux sync.RWMutex          // Protects publicAddr
 }
 
+func isDefaultClientLocalAddr(addr string) bool {
+	return addr == "" || addr == config.DefaultLocalAddr
+}
+
 // NewTunnel creates a new tunnel instance
 func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	// Create FEC encoder/decoder
@@ -469,6 +473,7 @@ func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
 
 	timeout := time.Duration(t.config.Timeout) * time.Second
+	useLocalAddr := !isDefaultClientLocalAddr(t.config.LocalAddr)
 
 	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
@@ -476,7 +481,17 @@ func (t *Tunnel) connectClient() error {
 	}
 
 	log.Println("Using UDP with fake TCP headers for firewall bypass")
-	conn, err := faketcp.Dial(t.config.RemoteAddr, timeout)
+	var (
+		conn *faketcp.Conn
+		err  error
+	)
+
+	if useLocalAddr {
+		log.Println("Binding client to configured local address")
+		conn, err = faketcp.DialWithLocalAddr(t.config.RemoteAddr, t.config.LocalAddr, timeout)
+	} else {
+		conn, err = faketcp.Dial(t.config.RemoteAddr, timeout)
+	}
 	if err != nil {
 		return err
 	}

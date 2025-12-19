@@ -5,6 +5,8 @@ import (
 	"os"
 )
 
+const DefaultLocalAddr = "0.0.0.0:9000"
+
 // Config holds the tunnel configuration
 type Config struct {
 	Mode              string   `json:"mode"`              // "client" or "server"
@@ -42,7 +44,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Mode:                "server",
-		LocalAddr:           "0.0.0.0:9000",
+		LocalAddr:           DefaultLocalAddr,
 		RemoteAddr:          "",
 		TunnelAddr:          "10.0.0.1/24",
 		TunName:             "",

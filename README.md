@@ -557,6 +557,9 @@ sudo kill -9 PID
   - `sudo ./lightweight-tunnel -service install -service-name tunnel-c -c /etc/lightweight-tunnel/c.json`
   - `sudo ./lightweight-tunnel -service install -service-name tunnel-d -c /etc/lightweight-tunnel/d.json`
   每个配置中可设置不同的远端 IP/端口（如 19000/29000/39000）和网段（10.0.0.1/24、10.0.1.1/24、10.0.2.1/24），对应的 TUN 设备会分别创建。
+- 如需让不同隧道/网段之间在同一台机器上互通（例如一机双客户端作为网关中转其他网段），请开启内核转发：
+  - 临时：`sudo sysctl -w net.ipv4.ip_forward=1`
+  - 永久：`echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-lightweight-tunnel.conf && sudo sysctl -p /etc/sysctl.d/99-lightweight-tunnel.conf`
 
 ## 为什么不用真正的 TCP？
 
