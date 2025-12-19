@@ -406,12 +406,19 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 		}
 		// Mark peer as connected and track connection type
 		if peer, exists := m.peers[ipStr]; exists {
-			peer.SetConnected(true)
+			// Only log on transition from not-connected -> connected to avoid log spam
+			peer.mu.RLock()
+			alreadyConnected := peer.Connected
+			peer.mu.RUnlock()
+			// Update connection flags regardless
 			peer.SetLocalConnection(isLocalConnection)
-			if isLocalConnection {
-				log.Printf("P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
-			} else {
-				log.Printf("P2P PUBLIC connection established with %s via %s", peerIP, remoteAddr)
+			if !alreadyConnected {
+				peer.SetConnected(true)
+				if isLocalConnection {
+					log.Printf("P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
+				} else {
+					log.Printf("P2P PUBLIC connection established with %s via %s", peerIP, remoteAddr)
+				}
 			}
 		}
 		m.mu.Unlock()
