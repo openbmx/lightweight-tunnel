@@ -35,6 +35,7 @@ type ConnRaw struct {
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 	isListener  bool // true表示这是listener接受的连接，不需要启动recvLoop
+	ownsResources bool // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
 }
 
 // NewConnRaw creates a new raw socket connection
@@ -59,20 +60,21 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 	}
 
 	conn := &ConnRaw{
-		rawSocket:   rawSock,
-		localIP:     localIP,
-		localPort:   localPort,
-		remoteIP:    remoteIP,
-		remotePort:  remotePort,
-		srcPort:     localPort,
-		dstPort:     remotePort,
-		seqNum:      isn,
-		ackNum:      0,
-		isConnected: isClient,
-		recvQueue:   make(chan []byte, 100),
-		iptablesMgr: iptablesMgr,
-		stopCh:      make(chan struct{}),
-		isListener:  false,
+		rawSocket:     rawSock,
+		localIP:       localIP,
+		localPort:     localPort,
+		remoteIP:      remoteIP,
+		remotePort:    remotePort,
+		srcPort:       localPort,
+		dstPort:       remotePort,
+		seqNum:        isn,
+		ackNum:        0,
+		isConnected:   isClient,
+		recvQueue:     make(chan []byte, 100),
+		iptablesMgr:   iptablesMgr,
+		stopCh:        make(chan struct{}),
+		isListener:    false,
+		ownsResources: true, // 客户端连接拥有资源所有权
 	}
 
 	// 只有客户端连接才启动recvLoop，服务端连接由acceptLoop统一分发
@@ -417,14 +419,17 @@ func (c *ConnRaw) Close() error {
 	close(c.stopCh)
 	c.wg.Wait()
 
-	// Close raw socket
-	if err := c.rawSocket.Close(); err != nil {
-		log.Printf("Error closing raw socket: %v", err)
-	}
+	// 只有拥有资源的连接才关闭socket和删除iptables规则
+	if c.ownsResources {
+		// Close raw socket
+		if err := c.rawSocket.Close(); err != nil {
+			log.Printf("Error closing raw socket: %v", err)
+		}
 
-	// Remove iptables rules
-	if err := c.iptablesMgr.RemoveAllRules(); err != nil {
-		log.Printf("Error removing iptables rules: %v", err)
+		// Remove iptables rules
+		if err := c.iptablesMgr.RemoveAllRules(); err != nil {
+			log.Printf("Error removing iptables rules: %v", err)
+		}
 	}
 
 	// Close receive queue
@@ -570,20 +575,21 @@ func (l *ListenerRaw) acceptLoop() {
 			isn, _ := randomUint32()
 			
 			newConn := &ConnRaw{
-				rawSocket:   l.rawSocket,
-				localIP:     dstIP,
-				localPort:   dstPort,
-				remoteIP:    srcIP,
-				remotePort:  srcPort,
-				srcPort:     dstPort,
-				dstPort:     srcPort,
-				seqNum:      isn,
-				ackNum:      seq + 1,
-				isConnected: false,
-				recvQueue:   make(chan []byte, 100),
-				iptablesMgr: l.iptablesMgr,
-				stopCh:      make(chan struct{}),
-				isListener:  true,
+				rawSocket:     l.rawSocket,
+				localIP:       dstIP,
+				localPort:     dstPort,
+				remoteIP:      srcIP,
+				remotePort:    srcPort,
+				srcPort:       dstPort,
+				dstPort:       srcPort,
+				seqNum:        isn,
+				ackNum:        seq + 1,
+				isConnected:   false,
+				recvQueue:     make(chan []byte, 100),
+				iptablesMgr:   l.iptablesMgr,
+				stopCh:        make(chan struct{}),
+				isListener:    true,
+				ownsResources: false, // 服务端连接不拥有资源（共享）
 			}
 
 			// Send SYN-ACK
