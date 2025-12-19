@@ -75,25 +75,8 @@ type Tunnel struct {
 	publicAddrMux sync.RWMutex          // Protects publicAddr
 }
 
-// Keep in sync with config.DefaultConfig().LocalAddr; used to detect explicit client overrides.
-var defaultLocalAddr = config.DefaultConfig().LocalAddr
-
 func isDefaultClientLocalAddr(addr string) bool {
-	if addr == "" {
-		return false
-	}
-
-	def, err := net.ResolveUDPAddr("udp", defaultLocalAddr)
-	if err != nil {
-		return false
-	}
-
-	val, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return false
-	}
-
-	return def.IP.Equal(val.IP) && def.Port == val.Port
+	return addr == "" || addr == config.DefaultLocalAddr
 }
 
 // NewTunnel creates a new tunnel instance
@@ -490,7 +473,7 @@ func (t *Tunnel) connectClient() error {
 	log.Printf("Connecting to server at %s...", t.config.RemoteAddr)
 
 	timeout := time.Duration(t.config.Timeout) * time.Second
-	useLocalAddr := t.config.LocalAddr != "" && !isDefaultClientLocalAddr(t.config.LocalAddr)
+	useLocalAddr := !isDefaultClientLocalAddr(t.config.LocalAddr)
 
 	// TLS is not supported with UDP-based fake TCP
 	if t.config.TLSEnabled {
