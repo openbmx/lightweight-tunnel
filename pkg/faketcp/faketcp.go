@@ -79,6 +79,7 @@ type Conn struct {
 	dstPort     uint16
 	seqNum      uint32
 	ackNum      uint32
+	tsVal       uint32 // timestamp value for TCP TS option (monotonic per-connection)
 	mu          sync.Mutex
 	isConnected bool // true if UDP socket is connected, false if shared listener socket
 	recvQueue   chan []byte // for listener connections
@@ -104,6 +105,7 @@ func NewConn(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, isConnected bool) (*
 		dstPort:     uint16(remoteAddr.Port),
 		seqNum:      isn, // Initial sequence number (random)
 		ackNum:      0,
+		tsVal:       uint32(time.Now().UnixNano() / 1e6),
 		isConnected: isConnected,
 	}
 
@@ -367,7 +369,20 @@ func (l *Listener) Accept() (*Conn, error) {
 						// Queue full, drop packet and log
 						log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
 					}
-				}()
+
+					// Update ack number based on received sequence and payload length
+					conn.mu.Lock()
+					conn.ackNum = tcpHeader.SeqNum + uint32(len(payload))
+					conn.mu.Unlock()
+
+					// Send an ACK back to the sender to mimic TCP behavior
+					ackHdr := conn.buildTCPHeader(0)
+					ackHdr.Flags = ACK
+					ackHdr.AckNum = conn.ackNum
+					ackBytes := conn.serializeTCPHeader(ackHdr)
+					// Use listener UDP socket to send ACK to remoteAddr
+					_, _ = l.udpConn.WriteToUDP(ackBytes, conn.remoteAddr)
+				}
 			}
 		}
 	}
@@ -516,10 +531,10 @@ func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
 	tsOpt := make([]byte, 10)
 	tsOpt[0] = 8
 	tsOpt[1] = 10
-	// ts value pseudo-random
-	if v, err := randomUint32(); err == nil {
-		binary.BigEndian.PutUint32(tsOpt[2:], v)
-	}
+	// Use per-connection monotonic timestamp (ms) and increment slightly per packet
+	ts := atomic.AddUint32(&c.tsVal, 1)
+	binary.BigEndian.PutUint32(tsOpt[2:], ts)
+	// Echo field: 0 (we don't implement full TS echo)
 	binary.BigEndian.PutUint32(tsOpt[6:], 0)
 	opts = append(opts, 1) // NOP before TS
 	opts = append(opts, tsOpt...)
@@ -566,8 +581,23 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 	binary.BigEndian.PutUint16(base[14:16], h.Window)
 	binary.BigEndian.PutUint16(base[18:20], h.UrgentPtr)
 
-	// Simplified checksum: use a non-zero pseudo-random value to avoid trivial fingerprint
-	cs, _ := randomUint16()
+	// Deterministic pseudo-checksum to appear plausible (sum of header bytes)
+	// Compute simple additive checksum over base (excluding checksum field) and options
+	// This produces consistent values per-packet instead of random every time.
+	// Note: This is not a real TCP checksum over pseudo-header; it is only
+	// intended to make the header look less obviously random.
+	sum := uint32(0)
+	for i := 0; i < len(base); i++ {
+		// skip checksum bytes
+		if i == 16 || i == 17 {
+			continue
+		}
+		sum += uint32(base[i])
+	}
+	for i := 0; i < optLen; i++ {
+		sum += uint32(h.Options[i])
+	}
+	cs := uint16((sum & 0xffff))
 	if cs == 0 {
 		cs = 1
 	}
@@ -661,7 +691,18 @@ func serializeTCPHeaderStatic(h *TCPHeader) []byte {
 	binary.BigEndian.PutUint16(base[14:16], h.Window)
 	binary.BigEndian.PutUint16(base[18:20], h.UrgentPtr)
 
-	cs, _ := randomUint16()
+	// Deterministic pseudo-checksum similar to serializeTCPHeader
+	sum := uint32(0)
+	for i := 0; i < len(base); i++ {
+		if i == 16 || i == 17 {
+			continue
+		}
+		sum += uint32(base[i])
+	}
+	for i := 0; i < optLen; i++ {
+		sum += uint32(h.Options[i])
+	}
+	cs := uint16((sum & 0xffff))
 	if cs == 0 {
 		cs = 1
 	}
