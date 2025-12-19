@@ -421,7 +421,10 @@ func (t *Tunnel) updateClientRoutes(clientIP net.IP, routes []string) {
 	ipStr := clientIP.String()
 
 	t.routeMux.Lock()
-	oldRoutes := append([]*net.IPNet(nil), t.clientRoutes[ipStr]...)
+	oldRoutes := t.clientRoutes[ipStr]
+	if len(oldRoutes) > 0 {
+		oldRoutes = append([]*net.IPNet(nil), oldRoutes...)
+	}
 	if routeCount == 0 {
 		delete(t.clientRoutes, ipStr)
 		t.routeMux.Unlock()
@@ -442,7 +445,10 @@ func (t *Tunnel) removeClientRoutes(clientIP net.IP) {
 		return
 	}
 	t.routeMux.Lock()
-	oldRoutes := append([]*net.IPNet(nil), t.clientRoutes[clientIP.String()]...)
+	oldRoutes := t.clientRoutes[clientIP.String()]
+	if len(oldRoutes) > 0 {
+		oldRoutes = append([]*net.IPNet(nil), oldRoutes...)
+	}
 	delete(t.clientRoutes, clientIP.String())
 	t.routeMux.Unlock()
 	t.applyHostRouteChanges(nil, oldRoutes)
@@ -470,6 +476,9 @@ func (t *Tunnel) applyHostRoute(action string, route *net.IPNet) error {
 	if route == nil {
 		return nil
 	}
+	if action != "del" && action != "replace" {
+		return fmt.Errorf("unsupported route action: %s", action)
+	}
 	cmd := exec.Command("ip", "route", action, route.String(), "dev", t.tunName)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to %s route %s via %s: %w (output: %s)", action, route, t.tunName, err, strings.TrimSpace(string(output)))
@@ -485,18 +494,16 @@ func (t *Tunnel) cleanupHostRoutes() {
 
 	if t.config.Mode == "server" {
 		t.routeMux.Lock()
-		allRoutes := make([][]*net.IPNet, 0, len(t.clientRoutes))
+		routesToRemove := make([]*net.IPNet, 0)
 		for _, routes := range t.clientRoutes {
-			allRoutes = append(allRoutes, append([]*net.IPNet(nil), routes...))
+			routesToRemove = append(routesToRemove, routes...)
 		}
 		for k := range t.clientRoutes {
 			delete(t.clientRoutes, k)
 		}
 		t.routeMux.Unlock()
 
-		for _, routes := range allRoutes {
-			t.applyHostRouteChanges(nil, routes)
-		}
+		t.applyHostRouteChanges(nil, routesToRemove)
 	} else {
 		t.routeMux.Lock()
 		routes := t.serverRoutes
@@ -1368,8 +1375,14 @@ func (t *Tunnel) handleServerRouteInfo(data []byte) {
 	}
 
 	t.routeMux.Lock()
-	oldRoutes := append([]*net.IPNet(nil), t.serverRoutes...)
-	newRoutes := append([]*net.IPNet(nil), valid...)
+	oldRoutes := t.serverRoutes
+	if len(oldRoutes) > 0 {
+		oldRoutes = append([]*net.IPNet(nil), oldRoutes...)
+	}
+	newRoutes := valid
+	if len(newRoutes) > 0 {
+		newRoutes = append([]*net.IPNet(nil), newRoutes...)
+	}
 	t.serverRoutes = newRoutes
 	t.routeMux.Unlock()
 
