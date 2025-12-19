@@ -190,7 +190,17 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					c.mu.Lock()
 					c.isConnected = true
 					c.mu.Unlock()
-					return nil
+					
+					// 清空recvQueue中的握手包（可能有重传的SYN-ACK等）
+					for {
+						select {
+						case <-c.recvQueue:
+							// 丢弃握手期间积压的包
+						default:
+							// 队列已空，返回
+							return nil
+						}
+					}
 				}
 			case <-time.After(200 * time.Millisecond):
 				// Continue waiting
