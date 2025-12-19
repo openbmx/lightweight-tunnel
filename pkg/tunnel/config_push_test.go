@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"encoding/json"
 	"net"
 	"testing"
 	"time"
@@ -87,12 +88,16 @@ func TestPushConfigUpdateUsesAllClients(t *testing.T) {
 
 	select {
 	case <-client.stopCh:
+		t.Fatalf("expected client to remain connected during key rotation")
 	default:
-		t.Fatalf("expected client stop channel to be closed")
 	}
 
-	if !mock.closed {
-		t.Fatalf("expected client connection to be closed")
+	if mock.closed {
+		t.Fatalf("expected client connection to stay open during rotation")
+	}
+
+	if tun.prevCipher != originalCipher {
+		t.Fatalf("expected previous cipher to be retained for seamless rotation")
 	}
 }
 
@@ -171,5 +176,53 @@ func TestKeyRotationGraceAndInvalidation(t *testing.T) {
 
 	if _, _, _, err := tun.decryptPacketForServer(encryptedOld); err == nil {
 		t.Fatalf("expected old cipher to be invalid after new key confirmed")
+	}
+}
+
+func TestHandleConfigUpdateKeepsConnectionAlive(t *testing.T) {
+	cfg := &config.Config{
+		Mode: "client",
+		Key:  "old-key",
+	}
+
+	oldCipher, err := crypto.NewCipher(cfg.Key)
+	if err != nil {
+		t.Fatalf("failed to create cipher: %v", err)
+	}
+
+	mock := &mockConn{}
+
+	tun := &Tunnel{
+		config:       cfg,
+		cipher:       oldCipher,
+		stopCh:       make(chan struct{}),
+		clients:      make(map[string]*ClientConnection),
+		clientRoutes: make(map[*ClientConnection][]string),
+		allClients:   make(map[*ClientConnection]struct{}),
+		conn:         mock,
+	}
+
+	msg := ConfigUpdateMessage{Key: "new-rotated-key-1234"}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("failed to marshal config update: %v", err)
+	}
+
+	tun.handleConfigUpdate(payload)
+
+	if cfg.Key != msg.Key {
+		t.Fatalf("expected config key to update, got %s", cfg.Key)
+	}
+
+	if tun.cipher == oldCipher {
+		t.Fatalf("expected cipher to rotate on config update")
+	}
+
+	if tun.prevCipher != oldCipher {
+		t.Fatalf("expected previous cipher to be retained for grace period")
+	}
+
+	if mock.closed {
+		t.Fatalf("expected connection to remain open during key rotation")
 	}
 }

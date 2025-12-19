@@ -2632,28 +2632,14 @@ func (t *Tunnel) pushConfigUpdate() error {
 		}
 	}
 
-	// Disconnect clients to force reconnect with new key
-	for _, client := range clients {
-		client.stopOnce.Do(func() {
-			select {
-			case <-client.stopCh:
-				return
-			default:
-			}
-			if err := client.conn.Close(); err != nil {
-				log.Printf("Error closing client during rotation: %v", err)
-			}
-			close(client.stopCh)
-		})
-	}
-
-	// Allow in-flight disconnects to settle before rotating cipher
-	time.Sleep(KeyRotationSettleTime)
-
-	// Rotate server cipher after clients are disconnected to avoid decrypt mismatches
+	// Rotate server cipher while keeping existing connections. The previous cipher
+	// remains active for the grace period, allowing in-flight packets from
+	// clients that have not yet switched keys to be decrypted seamlessly.
 	if err := t.rotateCipher(newKey); err != nil {
 		return fmt.Errorf("failed to rotate cipher: %w", err)
 	}
+
+	time.Sleep(KeyRotationSettleTime)
 	log.Printf("Rotated tunnel key and pushed new config to %d client(s)", len(clients))
 
 	return nil
@@ -2672,7 +2658,7 @@ func (t *Tunnel) handleConfigUpdate(payload []byte) {
 		return
 	}
 
-	log.Printf("Received config update with new key; rotating cipher and reconnecting...")
+	log.Printf("Received config update with new key; rotating cipher without reconnect...")
 
 	if len(msg.Routes) > 0 {
 		t.configMux.Lock()
@@ -2686,15 +2672,6 @@ func (t *Tunnel) handleConfigUpdate(payload []byte) {
 		return
 	}
 
-	// Force reconnection with new key
-	t.connMux.Lock()
-	if t.conn != nil {
-		if err := t.conn.Close(); err != nil {
-			log.Printf("Error closing connection during key rotation: %v", err)
-		}
-		t.conn = nil
-	}
-	t.connMux.Unlock()
 }
 
 func generateRandomKey() (string, error) {
