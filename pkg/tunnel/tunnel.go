@@ -51,7 +51,6 @@ const (
 	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 
 	// Rotation and advertisement timing
-	KeyRotationSettleTime      = 100 * time.Millisecond
 	KeyRotationGracePeriod     = 15 * time.Second
 	DefaultRouteAdvertInterval = 60 * time.Second
 )
@@ -2639,7 +2638,6 @@ func (t *Tunnel) pushConfigUpdate() error {
 		return fmt.Errorf("failed to rotate cipher: %w", err)
 	}
 
-	time.Sleep(KeyRotationSettleTime)
 	log.Printf("Rotated tunnel key and pushed new config to %d client(s)", len(clients))
 
 	return nil
