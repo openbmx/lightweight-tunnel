@@ -442,7 +442,7 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 			if atomic.LoadInt32(&c.closed) != 0 {
 				return nil, fmt.Errorf("connection closed")
 			}
-			return nil, fmt.Errorf("read timeout")
+			return nil, &net.OpError{Op: "read", Net: "udp", Err: fmt.Errorf("timeout")}
 		}
 	}
 	

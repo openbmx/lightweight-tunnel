@@ -339,7 +339,7 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			if atomic.LoadInt32(&c.closed) != 0 {
 				return nil, fmt.Errorf("connection closed")
 			}
-			return nil, fmt.Errorf("read timeout")
+			return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 		}
 	}
 
@@ -365,7 +365,7 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			return []byte{}, nil
 		}
 		return data[headerLen:], nil
-	case <-time.After(500 * time.Millisecond):  // 500ms适合高延迟网络
+	case <-time.After(30 * time.Second):  // 30秒超时，适合隧道长连接
 		return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 	}
 }
