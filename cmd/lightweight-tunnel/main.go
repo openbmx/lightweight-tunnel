@@ -70,18 +70,18 @@ func main() {
 	} else {
 		// Use command line arguments
 		cfg = &config.Config{
-			Mode:                *mode,
-			LocalAddr:           *localAddr,
-			RemoteAddr:          *remoteAddr,
-			TunnelAddr:          *tunnelAddr,
-			MTU:                 *mtu,
-			FECDataShards:       *fecData,
-			FECParityShards:     *fecParity,
-			Timeout:             30,
-			KeepaliveInterval:   10,
-			SendQueueSize:       *sendQueueSize,
-			RecvQueueSize:       *recvQueueSize,
-			Key:                 *key,
+			Mode:              *mode,
+			LocalAddr:         *localAddr,
+			RemoteAddr:        *remoteAddr,
+			TunnelAddr:        *tunnelAddr,
+			MTU:               *mtu,
+			FECDataShards:     *fecData,
+			FECParityShards:   *fecParity,
+			Timeout:           30,
+			KeepaliveInterval: 10,
+			SendQueueSize:     *sendQueueSize,
+			RecvQueueSize:     *recvQueueSize,
+			Key:               *key,
 			// TLS configuration is available via config file only; CLI flags were removed
 			MultiClient:         *multiClient,
 			MaxClients:          *maxClients,
@@ -93,6 +93,11 @@ func main() {
 			RouteUpdateInterval: *routeUpdateInterval,
 			P2PTimeout:          5,
 		}
+	}
+
+	// Normalize client tunnel address when running without explicit config file
+	if err := normalizeTunnelAddr(cfg, *configFile != ""); err != nil {
+		log.Fatalf("Failed to normalize tunnel address: %v", err)
 	}
 
 	// Validate configuration
@@ -139,7 +144,7 @@ func main() {
 	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	
+
 	log.Println("Tunnel running. Press Ctrl+C to stop.")
 	<-sigCh
 
@@ -179,7 +184,7 @@ func generateConfigFile(filename string) error {
 	serverCfg.Mode = "server"
 	serverCfg.LocalAddr = "0.0.0.0:9000"
 	serverCfg.TunnelAddr = "10.0.0.1/24"
-	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY"  // Example key
+	serverCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Example key
 
 	if err := config.SaveConfig(filename, serverCfg); err != nil {
 		return err
@@ -191,12 +196,35 @@ func generateConfigFile(filename string) error {
 	clientCfg.Mode = "client"
 	clientCfg.RemoteAddr = "SERVER_IP:9000"
 	clientCfg.TunnelAddr = "10.0.0.2/24"
-	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY"  // Must match server key
+	clientCfg.Key = "CHANGE-THIS-TO-YOUR-SECRET-KEY" // Must match server key
 
 	if err := config.SaveConfig(clientFilename, clientCfg); err != nil {
 		return err
 	}
 
 	fmt.Printf("Also generated client config example: %s\n", clientFilename)
+	return nil
+}
+
+// normalizeTunnelAddr ensures the client does not reuse the default server tunnel IP
+// when no explicit configuration file is provided. This prevents IP conflicts like
+// both ends using 10.0.0.1/24, which makes the server tunnel unreachable.
+func normalizeTunnelAddr(cfg *config.Config, configFromFile bool) error {
+	if configFromFile || cfg == nil || cfg.Mode != "client" {
+		return nil
+	}
+
+	const defaultServerTunnel = "10.0.0.1/24"
+	if cfg.TunnelAddr == "" {
+		return fmt.Errorf("tunnel address is required in client mode")
+	}
+	if cfg.TunnelAddr == defaultServerTunnel {
+		peerAddr, err := tunnel.GetPeerIP(cfg.TunnelAddr)
+		if err != nil {
+			return fmt.Errorf("failed to derive peer tunnel IP: %w", err)
+		}
+		log.Printf("Client tunnel address %s conflicts with server default; auto-switching to %s", cfg.TunnelAddr, peerAddr)
+		cfg.TunnelAddr = peerAddr
+	}
 	return nil
 }
