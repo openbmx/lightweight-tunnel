@@ -463,6 +463,10 @@ func (t *Tunnel) applyHostRouteChanges(toAdd, toDel []*net.IPNet) {
 	if t.tunName == "" {
 		return
 	}
+	if trimmed := strings.TrimSpace(t.tunName); trimmed == "" || !ifaceNamePattern.MatchString(trimmed) {
+		log.Printf("Skipping route change due to invalid tunnel interface name: %q", t.tunName)
+		return
+	}
 	for _, r := range toDel {
 		if err := t.applyHostRoute("del", r); err != nil {
 			log.Print(err)
@@ -509,17 +513,11 @@ func (t *Tunnel) cleanupHostRoutes() {
 
 	if t.config.Mode == "server" {
 		t.routeMux.Lock()
-		totalRoutes := 0
-		for _, routes := range t.clientRoutes {
-			totalRoutes += len(routes)
-		}
-		routesToRemove := make([]*net.IPNet, 0, totalRoutes)
+		routesToRemove := make([]*net.IPNet, 0)
 		for _, routes := range t.clientRoutes {
 			routesToRemove = append(routesToRemove, routes...)
 		}
-		for k := range t.clientRoutes {
-			delete(t.clientRoutes, k)
-		}
+		t.clientRoutes = make(map[string][]*net.IPNet)
 		t.routeMux.Unlock()
 
 		t.applyHostRouteChanges(nil, routesToRemove)
