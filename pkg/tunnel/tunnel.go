@@ -670,8 +670,8 @@ func (t *Tunnel) buildClientTLSConfig() (*tls.Config, error) {
 		cfg.ServerName = host
 	}
 
-	// Optional custom CA / client cert support (reuse cert/key when provided)
-	if t.config.TLSCertFile != "" {
+	// Optional custom CA support (when only CA is provided)
+	if t.config.TLSCertFile != "" && t.config.TLSKeyFile == "" {
 		caData, err := os.ReadFile(t.config.TLSCertFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read TLS cert file: %w", err)

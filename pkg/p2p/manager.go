@@ -119,6 +119,8 @@ func (m *Manager) SetHandshakeTimeout(timeout time.Duration) {
 	defer m.mu.Unlock()
 	if timeout > 0 {
 		m.handshakeTimeout = timeout
+	} else {
+		m.handshakeTimeout = LocalConnectionTimeout
 	}
 }
 
@@ -144,10 +146,7 @@ func (m *Manager) getHandshakeTimeout() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.handshakeTimeout > 0 {
-		return m.handshakeTimeout
-	}
-	return LocalConnectionTimeout
+	return m.handshakeTimeout
 }
 
 // ConnectToPeer establishes a P2P connection to a peer

@@ -236,6 +236,9 @@ func validateConfig(cfg *config.Config) error {
 	if cfg.P2PTimeout < 0 {
 		return fmt.Errorf("P2P timeout must be zero or positive")
 	}
+	if cfg.P2PTimeout > 86400 {
+		return fmt.Errorf("P2P timeout too large (max 86400 seconds)")
+	}
 
 	// TLS validation
 	if cfg.TLSEnabled && cfg.Mode == "server" {
