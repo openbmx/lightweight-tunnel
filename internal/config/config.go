@@ -8,6 +8,7 @@ import (
 // Config holds the tunnel configuration
 type Config struct {
 	Mode          string `json:"mode"`           // "client" or "server"
+	Transport     string `json:"transport"`      // "udp", "faketcp", or "rawtcp" (default: "rawtcp")
 	LocalAddr     string `json:"local_addr"`     // Local address to listen on
 	RemoteAddr    string `json:"remote_addr"`    // Remote address to connect to (client mode)
 	TunnelAddr    string `json:"tunnel_addr"`    // Tunnel network address (e.g., "10.0.0.1/24")
@@ -37,6 +38,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Mode:              "server",
+		Transport:         "rawtcp",  // Default to rawtcp for true TCP disguise
 		LocalAddr:         "0.0.0.0:9000",
 		RemoteAddr:        "",
 		TunnelAddr:        "10.0.0.1/24",

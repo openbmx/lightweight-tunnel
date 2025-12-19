@@ -20,6 +20,7 @@ func main() {
 	// Command line flags
 	configFile := flag.String("c", "", "Configuration file path")
 	mode := flag.String("m", "server", "Mode: server or client")
+	transport := flag.String("transport", "rawtcp", "Transport: udp, faketcp, or rawtcp (requires root, default)")
 	localAddr := flag.String("l", "0.0.0.0:9000", "Local address to listen on")
 	remoteAddr := flag.String("r", "", "Remote address to connect to (client mode)")
 	tunnelAddr := flag.String("t", "10.0.0.1/24", "Tunnel IP address and netmask")
@@ -72,6 +73,7 @@ func main() {
 		// Use command line arguments
 		cfg = &config.Config{
 			Mode:              *mode,
+			Transport:         *transport,
 			LocalAddr:         *localAddr,
 			RemoteAddr:        *remoteAddr,
 			TunnelAddr:        *tunnelAddr,
@@ -111,6 +113,7 @@ func main() {
 	log.Println("=== Lightweight Tunnel ===")
 	log.Printf("Version: %s", version)
 	log.Printf("Mode: %s", cfg.Mode)
+	log.Printf("Transport: %s", cfg.Transport)
 	log.Printf("Local Address: %s", cfg.LocalAddr)
 	if cfg.Mode == "client" {
 		log.Printf("Remote Address: %s", cfg.RemoteAddr)
