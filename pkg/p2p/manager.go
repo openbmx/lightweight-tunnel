@@ -401,12 +401,17 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 		// Mark peer as connected and track connection type. If the responding
 		// port differs from the advertised one, treat the peer as symmetric
 		// and update the reachable public address to the observed endpoint.
-		// Mark peer as connected and track connection type
 		if peer, exists := m.peers[ipStr]; exists {
-			if !isLocalConnection && peer.PublicAddr != "" && peer.PublicAddr != remoteAddr.String() {
+			updatedToSymmetric := false
+			if !isLocalConnection {
 				peer.mu.Lock()
-				peer.PublicAddr = remoteAddr.String()
+				if peer.PublicAddr != "" && peer.PublicAddr != remoteAddr.String() {
+					peer.PublicAddr = remoteAddr.String()
+					updatedToSymmetric = true
+				}
 				peer.mu.Unlock()
+			}
+			if updatedToSymmetric {
 				peer.SetNATType(NATSymmetric)
 			}
 			peer.SetConnected(true)
