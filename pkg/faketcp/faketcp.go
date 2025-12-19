@@ -31,9 +31,9 @@ const (
 	MaxPayloadSize = MaxPacketSize - IPHeaderSize - TCPHeaderSize
 	
 	// Read timeout duration for making blocking reads interruptible
-	ReadTimeoutDuration = 1 * time.Second
+	ReadTimeoutDuration = 50 * time.Millisecond  // 降低到50ms以减少延迟
 	// Listener read timeout for queue operations (longer timeout for actual data)
-	ListenerReadTimeout = 30 * time.Second
+	ListenerReadTimeout = 5 * time.Second  // 降低到5秒
 	// Handshake timeout for SYN/SYN-ACK/ACK
 	HandshakeTimeout = 3 * time.Second
 	// Channel close delay to allow pending writes to complete

@@ -88,15 +88,20 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 		faketcp.SetMode(faketcp.ModeRaw)
 		// Check if raw socket is supported
 		if err := faketcp.CheckRawSocketSupport(); err != nil {
-			log.Printf("WARNING: Raw socket mode requested but not supported: %v", err)
-			log.Printf("Falling back to UDP mode (fake TCP headers in payload)")
+			log.Printf("⚠️  WARNING: Raw socket mode requested but not supported: %v", err)
+			log.Printf("⚠️  Raw Socket模式需要root权限！请使用 sudo 运行程序")
+			log.Printf("⚠️  例如: sudo ./lightweight-tunnel -m %s ...", cfg.Mode)
+			log.Printf("⚠️  Falling back to UDP mode (fake TCP headers in payload)")
+			log.Printf("⚠️  注意: UDP模式性能较低，延迟约为Raw Socket模式的2-3倍")
 			faketcp.SetMode(faketcp.ModeUDP)
 		} else {
-			log.Printf("Using Raw Socket mode (真正的TCP伪装，类似udp2raw)")
+			log.Printf("✅ Using Raw Socket mode (真正的TCP伪装，类似udp2raw)")
+			log.Printf("✅ 性能优化：低延迟，高吞吐量")
 		}
 	} else {
 		faketcp.SetMode(faketcp.ModeUDP)
-		log.Printf("Using UDP mode (fake TCP headers in payload)")
+		log.Printf("ℹ️  Using UDP mode (fake TCP headers in payload)")
+		log.Printf("ℹ️  建议: 使用 'transport: rawtcp' 配置并以root权限运行以获得更好性能")
 	}
 
 	// Create FEC encoder/decoder

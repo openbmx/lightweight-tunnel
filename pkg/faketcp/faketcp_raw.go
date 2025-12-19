@@ -192,8 +192,8 @@ func (c *ConnRaw) recvLoop() {
 		default:
 		}
 
-		// Set read timeout to allow checking stopCh
-		c.rawSocket.SetReadTimeout(1, 0)
+		// Set read timeout to allow checking stopCh (10ms for low latency)
+		c.rawSocket.SetReadTimeout(0, 10000)  // 10ms = 10000 microseconds
 
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := c.rawSocket.RecvPacket(buf)
 		if err != nil {
@@ -343,7 +343,7 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			return []byte{}, nil
 		}
 		return data[headerLen:], nil
-	case <-time.After(ReadTimeoutDuration):
+	case <-time.After(100 * time.Millisecond):  // 降低超时到100ms
 		return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 	}
 }
@@ -529,7 +529,7 @@ func (l *ListenerRaw) acceptLoop() {
 		default:
 		}
 
-		l.rawSocket.SetReadTimeout(1, 0)
+		l.rawSocket.SetReadTimeout(0, 10000)  // 10ms for low latency
 		srcIP, srcPort, dstIP, dstPort, seq, ack, flags, payload, err := l.rawSocket.RecvPacket(buf)
 		if err != nil {
 			continue
