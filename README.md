@@ -247,7 +247,7 @@ sudo systemctl status lightweight-tunnel-server
 
 # （可选）一键更新：在仓库根目录执行，自动 git pull + make build，并替换 /usr/local/bin/lightweight-tunnel
 ./mupdate
-# 如果服务正在运行，更新后请重启对应的 systemd 服务：sudo systemctl restart <SERVICE_NAME>
+# 如果服务正在运行，更新后请重启对应的 systemd 服务，例如：sudo systemctl restart lightweight-tunnel-server
 ```
 
 ---
