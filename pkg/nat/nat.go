@@ -90,6 +90,7 @@ func (n NATType) CanTraverseWith(other NATType) bool {
 
 // ShouldInitiateConnection determines if this NAT should initiate connection to the other
 // Prefer better (lower level) NAT to initiate, improving success rate and reducing latency
+// Nodes with permissive NATs can usually reach restrictive peers more reliably during hole punching.
 func (n NATType) ShouldInitiateConnection(other NATType) bool {
 	// Prefer the side with better NAT characteristics to initiate to reduce latency and failures
 	return n.GetLevel() < other.GetLevel()

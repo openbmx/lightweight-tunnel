@@ -38,6 +38,8 @@ const (
 	HandshakeTimeout = 5 * time.Second // 增加到5秒以适应网络抖动
 	// Channel close delay to allow pending writes to complete
 	ChannelCloseDelay = 100 * time.Millisecond
+	// Pending accepted connections buffer
+	ListenerQueueSize = 8
 )
 
 // TCPHeader represents a minimal TCP header
@@ -92,6 +94,7 @@ type Listener struct {
 	connMap   map[string]*Conn
 	mu        sync.RWMutex
 	newConnCh chan *Conn
+	closeOnce sync.Once
 }
 
 // NewConn creates a new fake TCP connection
@@ -129,7 +132,9 @@ func (l *Listener) dispatch() {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
-			close(l.newConnCh)
+			l.closeOnce.Do(func() {
+				close(l.newConnCh)
+			})
 			return
 		}
 
@@ -163,6 +168,11 @@ func (l *Listener) dispatch() {
 			select {
 			case l.newConnCh <- conn:
 			default:
+				log.Printf("accept queue full (%d), dropping connection from %s", ListenerQueueSize, connKey)
+				l.mu.Lock()
+				delete(l.connMap, connKey)
+				l.mu.Unlock()
+				conn.Close()
 			}
 			continue
 		}
@@ -172,7 +182,10 @@ func (l *Listener) dispatch() {
 }
 
 func (l *Listener) createConnection(remoteAddr *net.UDPAddr, tcpHeader *TCPHeader) *Conn {
-	serverIsn, _ := randomUint32()
+	serverIsn, err := randomUint32()
+	if err != nil {
+		serverIsn = uint32(time.Now().UnixNano())
+	}
 	conn := &Conn{
 		udpConn:     l.udpConn,
 		localAddr:   l.udpConn.LocalAddr().(*net.UDPAddr),
@@ -218,19 +231,11 @@ func (l *Listener) enqueuePayload(connKey string, conn *Conn, tcpHeader *TCPHead
 		return
 	}
 
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("WARNING: Connection closed for %s, dropping packet (%d bytes)", connKey, len(payload))
-			}
-		}()
-
-		select {
-		case conn.recvQueue <- payload:
-		default:
-			log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
-		}
-	}()
+	select {
+	case conn.recvQueue <- payload:
+	default:
+		log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
+	}
 }
 
 // Dial creates a fake TCP connection to the remote address
@@ -273,10 +278,13 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 		conn.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 		n, err := conn.udpConn.Read(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+			if netErr, ok := err.(net.Error); ok {
+				if netErr.Timeout() {
+					continue
+				}
 			}
 			// Non-timeout errors are treated as best-effort; proceed without failing
+			log.Printf("handshake read error (best-effort): %v", err)
 			break
 		}
 		hdr := parseTCPHeader(buf[:n])
@@ -316,7 +324,7 @@ func Listen(addr string) (*Listener, error) {
 	l := &Listener{
 		udpConn:   udpConn,
 		connMap:   make(map[string]*Conn),
-		newConnCh: make(chan *Conn, 8),
+		newConnCh: make(chan *Conn, ListenerQueueSize),
 	}
 
 	go l.dispatch()
@@ -346,7 +354,7 @@ func (l *Listener) Addr() net.Addr {
 // WritePacket sends data with fake TCP header
 func (c *Conn) WritePacket(data []byte) error {
 	if len(data) > MaxPayloadSize {
-		return fmt.Errorf("packet too large")
+		return fmt.Errorf("payload size %d exceeds maximum %d bytes", len(data), MaxPayloadSize)
 	}
 
 	// Segment data by typical MSS to look like TCP segments
@@ -456,6 +464,9 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 
 // buildTCPHeader constructs a fake TCP header
 func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
+	// Options are intentionally omitted for minimal overhead and lower latency.
+	// This keeps packets small for disguise/performance at the cost of skipping
+	// features like MSS/window scaling negotiation.
 	return &TCPHeader{
 		SrcPort:    c.srcPort,
 		DstPort:    c.dstPort,
@@ -482,13 +493,16 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 
 	// Options length in 32-bit words
 	optLen := 0
-	if len(h.Options) > 0 {
+	opts := h.Options
+	if len(opts) > 0 {
 		// pad options to 4-byte boundary
-		pad := (4 - (len(h.Options) % 4)) % 4
+		pad := (4 - (len(opts) % 4)) % 4
 		if pad > 0 {
-			h.Options = append(h.Options, make([]byte, pad)...)
+			padded := make([]byte, len(opts)+pad) // padding bytes zero-initialized
+			copy(padded, opts)
+			opts = padded
 		}
-		optLen = len(h.Options)
+		optLen = len(opts)
 	}
 
 	dataOffsetWords := uint8(5 + (optLen / 4))
@@ -511,7 +525,7 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 
 	header := make([]byte, TCPHeaderSize+optLen)
 	copy(header[:TCPHeaderSize], base)
-	copy(header[TCPHeaderSize:], h.Options[:optLen])
+	copy(header[TCPHeaderSize:], opts[:optLen])
 	return header
 }
 
@@ -579,12 +593,15 @@ func serializeTCPHeaderStatic(h *TCPHeader) []byte {
 	binary.BigEndian.PutUint32(base[8:12], h.AckNum)
 
 	optLen := 0
-	if len(h.Options) > 0 {
-		pad := (4 - (len(h.Options) % 4)) % 4
+	opts := h.Options
+	if len(opts) > 0 {
+		pad := (4 - (len(opts) % 4)) % 4
 		if pad > 0 {
-			h.Options = append(h.Options, make([]byte, pad)...)
+			padded := make([]byte, len(opts)+pad) // padding bytes zero-initialized
+			copy(padded, opts)
+			opts = padded
 		}
-		optLen = len(h.Options)
+		optLen = len(opts)
 	}
 	dataOffsetWords := uint8(5 + (optLen / 4))
 	base[12] = (dataOffsetWords << 4)
@@ -604,7 +621,7 @@ func serializeTCPHeaderStatic(h *TCPHeader) []byte {
 	}
 	header := make([]byte, TCPHeaderSize+optLen)
 	copy(header[:TCPHeaderSize], base)
-	copy(header[TCPHeaderSize:], h.Options[:optLen])
+	copy(header[TCPHeaderSize:], opts[:optLen])
 	return header
 }
 
