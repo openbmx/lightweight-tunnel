@@ -1399,7 +1399,7 @@ func (t *Tunnel) sendViaServer(packet []byte) error {
 
 // markPeerFallbackToServer updates routing state to force server relay for a peer.
 func (t *Tunnel) markPeerFallbackToServer(dstIP net.IP) {
-	if t.routingTable == nil {
+	if t.routingTable == nil || dstIP == nil {
 		return
 	}
 	if peer := t.routingTable.GetPeer(dstIP); peer != nil {

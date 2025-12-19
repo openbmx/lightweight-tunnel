@@ -215,6 +215,9 @@ func normalizeTunnelAddr(cfg *config.Config, configFromFile bool) error {
 	}
 
 	const defaultServerTunnel = "10.0.0.1/24"
+	if cfg.TunnelAddr == "" {
+		return fmt.Errorf("tunnel address is required in client mode")
+	}
 	if cfg.TunnelAddr == defaultServerTunnel {
 		peerAddr, err := tunnel.GetPeerIP(cfg.TunnelAddr)
 		if err != nil {
