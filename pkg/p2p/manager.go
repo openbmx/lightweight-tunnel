@@ -166,6 +166,10 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		m.localNAT.priority() > peer.NATType.priority() {
 		shouldInitiate = false
 	}
+	delay := time.Duration(0)
+	if !shouldInitiate {
+		delay = HandshakeInterval * 3
+	}
 
 	// Priority: Try local address first (internal network direct connection)
 	// Only fall back to public address if local fails
@@ -188,12 +192,12 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 				ipStr, peer.LocalAddr, peer.PublicAddr)
 
 			// Start local handshake first with optional delay
-			go func() {
-				if !shouldInitiate {
-					time.Sleep(HandshakeInterval * 3)
+			go func(d time.Duration) {
+				if d > 0 {
+					time.Sleep(d)
 				}
 				m.performHandshakeWithFallback(conn, peer)
-			}()
+			}(delay)
 			return nil
 		}
 	}
@@ -217,12 +221,12 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	log.Printf("Attempting P2P connection to %s at public address: %s", ipStr, peer.PublicAddr)
 
 	// Perform handshake to public address
-	go func() {
-		if !shouldInitiate {
-			time.Sleep(HandshakeInterval * 3)
+	go func(d time.Duration) {
+		if d > 0 {
+			time.Sleep(d)
 		}
 		m.performHandshake(conn, false)
-	}()
+	}(delay)
 
 	return nil
 }
@@ -402,17 +406,13 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 		// port differs from the advertised one, treat the peer as symmetric
 		// and update the reachable public address to the observed endpoint.
 		if peer, exists := m.peers[ipStr]; exists {
-			updatedToSymmetric := false
 			if !isLocalConnection {
 				peer.mu.Lock()
 				if peer.PublicAddr != "" && peer.PublicAddr != remoteAddr.String() {
 					peer.PublicAddr = remoteAddr.String()
-					updatedToSymmetric = true
+					peer.NATType = NATSymmetric
 				}
 				peer.mu.Unlock()
-			}
-			if updatedToSymmetric {
-				peer.SetNATType(NATSymmetric)
 			}
 			peer.SetConnected(true)
 			peer.SetLocalConnection(isLocalConnection)
