@@ -2,6 +2,10 @@
 
 一个使用 Go 语言开发的轻量级内网隧道工具，使用 **UDP 传输并添加伪装 TCP 头部**来绕过防火墙，同时支持 **AES-256-GCM 加密**和 FEC 纠错功能，适用于在多个服务器之间建立安全的虚拟内网连接。
 
+## 项目简介
+
+Lightweight Tunnel 通过 **UDP + TCP 头部伪装** 来规避常见的 UDP 封锁，并内置 **AES-256-GCM 加密** 与 **FEC 前向纠错**，在保证安全的同时兼顾低延迟和稳定性。
+
 ## 主要特性
 
 - 🚀 **轻量高效** - 资源占用少，适合低配置服务器
@@ -16,6 +20,14 @@
 - 🌐 **网状网络** - 支持通过其他客户端中继流量，实现多跳转发
 - ⚡ **高性能** - 基于 Go 协程实现高并发处理
 - 🎯 **简单易用** - 支持命令行和配置文件两种方式
+
+## 适用场景
+
+- 🏢 企业或分支机构之间的安全互联
+- 🏠 家庭服务器 / NAS 远程访问
+- 🎮 低延迟游戏联机
+- 🔧 异地开发测试快速组网
+- 🌐 多客户端 Hub 互访或网状路由场景
 
 ## 🔐 安全说明
 
@@ -203,7 +215,7 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
 # 表示：2个对等节点，1个P2P直连，0个中继，1个服务器路由
 ```
 
-详细文档请参阅：[P2P_ROUTING.md](P2P_ROUTING.md)
+路由选择会结合 NAT 类型识别：较“开放”的 NAT 会优先主动打洞；双方都是对称 NAT 时自动回退服务器中转。
 
 ### 使用配置文件
 
@@ -260,7 +272,8 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
   "p2p_port": 0,
   "enable_mesh_routing": true,
   "max_hops": 3,
-  "route_update_interval": 30
+  "route_update_interval": 30,
+  "p2p_timeout": 5
 }
 ```
 
@@ -273,6 +286,7 @@ Routing stats: 2 peers, 1 direct, 0 relay, 1 server
 - `enable_mesh_routing`：启用网状路由（默认：true）
 - `max_hops`：最大跳数（默认：3）
 - `route_update_interval`：路由更新间隔秒数（默认：30）
+- `p2p_timeout`：P2P 连接超时（秒），默认 5
 
 #### 使用配置文件运行
 
@@ -305,7 +319,7 @@ sudo ./lightweight-tunnel -c config.json
 | `-mesh-routing` | 启用网状路由 | true |
 | `-max-hops` | 最大跳数 | 3 |
 | `-route-update` | 路由更新间隔（秒） | 30 |
-| `-tls` | 启用 TLS 加密（不推荐，因为使用 UDP） | false |
+| `-tls` | 启用 TLS 加密（当前不支持，会报错；请使用 `-k` 进行加密） | false |
 | `-tls-cert` | TLS 证书文件（服务端） | - |
 | `-tls-key` | TLS 私钥文件（服务端） | - |
 | `-tls-skip-verify` | 跳过证书验证（客户端，不安全） | false |
@@ -316,6 +330,9 @@ sudo ./lightweight-tunnel -c config.json
 | `-service-config` | 安装/控制服务使用的配置文件路径 | /etc/lightweight-tunnel/config.json |
 | `-v` | 显示版本 | - |
 | `-g` | 生成示例配置文件 | - |
+
+配置文件额外字段：
+- `p2p_timeout`：P2P 连接超时时间（秒），默认 5，命令行暂未提供独立参数。
 
 ### 广播额外网段（访问其他 TUN/网卡）
 
