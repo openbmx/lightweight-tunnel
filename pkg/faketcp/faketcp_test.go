@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -186,8 +187,6 @@ func TestDialWithLocalAddrBindsPort(t *testing.T) {
 	defer listener.Close()
 
 	listenerAddr := listener.Addr().String()
-	localPort := getFreeUDPPort(t)
-	localAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
 
 	serverDone := make(chan error, 1)
 	go func() {
@@ -212,9 +211,28 @@ func TestDialWithLocalAddrBindsPort(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	client, err := DialWithLocalAddr(listenerAddr, localAddr, 5*time.Second)
+	var (
+		client    *Conn
+		localAddr string
+		localPort int
+	)
+
+	for attempt := 0; attempt < 5; attempt++ {
+		localPort = getFreeUDPPort(t)
+		localAddr = fmt.Sprintf("127.0.0.1:%d", localPort)
+
+		client, err = DialWithLocalAddr(listenerAddr, localAddr, 5*time.Second)
+		if err == nil {
+			break
+		}
+
+		if !strings.Contains(err.Error(), "address already in use") {
+			t.Fatalf("Failed to dial with local addr: %v", err)
+		}
+	}
+
 	if err != nil {
-		t.Fatalf("Failed to dial with local addr: %v", err)
+		t.Fatalf("Failed to dial with local addr after retries: %v", err)
 	}
 	defer client.Close()
 

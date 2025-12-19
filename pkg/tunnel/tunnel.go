@@ -37,7 +37,7 @@ const (
 	P2PMaxBackoffSeconds = 32 // Maximum backoff delay in seconds
 )
 
-var defaultLocalAddr = config.DefaultConfig().LocalAddr
+const defaultLocalAddr = "0.0.0.0:9000"
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
