@@ -50,6 +50,7 @@ func TestPushConfigUpdateUsesAllClients(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create cipher: %v", err)
 	}
+	originalCipher := ciph
 
 	tun := &Tunnel{
 		config:       cfg,
@@ -76,8 +77,12 @@ func TestPushConfigUpdateUsesAllClients(t *testing.T) {
 		t.Fatalf("expected config update to be sent, got %d writes", len(mock.writes))
 	}
 
-	if cfg.Key == "initial-key" {
+	if tun.config.Key == "initial-key" {
 		t.Fatalf("expected key to rotate from initial value")
+	}
+
+	if tun.cipher == originalCipher {
+		t.Fatalf("expected cipher to be replaced after rotation")
 	}
 
 	select {
