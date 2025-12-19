@@ -1747,21 +1747,25 @@ func parseTLSLikeFrame(frame []byte) ([]byte, error) {
 	}
 
 	bodyLen := int(binary.BigEndian.Uint16(frame[3:]))
+	if bodyLen > maxObfsFrameSize-tlsRecordHeaderLen {
+		return nil, fmt.Errorf("obfuscation frame exceeds allowed size")
+	}
 	if len(frame) < tlsRecordHeaderLen+bodyLen {
 		return nil, fmt.Errorf("obfuscation frame length mismatch")
 	}
 
-	if bodyLen > maxObfsFrameSize {
-		return nil, fmt.Errorf("obfuscation frame exceeds allowed size")
+	body := frame[tlsRecordHeaderLen : tlsRecordHeaderLen+bodyLen]
+	if len(body) < tlsObfsLengthField {
+		return nil, fmt.Errorf("obfuscation frame missing length field")
 	}
 
-	body := frame[tlsRecordHeaderLen : tlsRecordHeaderLen+bodyLen]
 	actualLen := int(binary.BigEndian.Uint16(body[:tlsObfsLengthField]))
-	if actualLen > len(body)-tlsObfsLengthField {
+	end := tlsObfsLengthField + actualLen
+	if end > len(body) {
 		return nil, fmt.Errorf("invalid obfuscation payload length")
 	}
 
-	return body[tlsObfsLengthField : tlsObfsLengthField+actualLen], nil
+	return body[tlsObfsLengthField:end], nil
 }
 
 // encryptPacket encrypts a packet if cipher is available
