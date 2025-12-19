@@ -5,7 +5,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
-  echo "This script must be run from the lightweight-tunnel git repository root."
+  echo "This script must be run from the repository root (directory containing .git)."
   exit 1
 fi
 
@@ -16,7 +16,7 @@ fi
 
 echo "Pulling latest changes..."
 if ! git pull --ff-only; then
-  echo "git pull failed. Please ensure the repository is clean, resolve any merge conflicts, and verify network connectivity before rerunning this script."
+  echo "git pull failed. Ensure the repository is clean, branches are not diverged (fast-forward only), resolve any issues, and verify network connectivity before rerunning this script."
   exit 1
 fi
 
@@ -38,7 +38,10 @@ echo "Installing binary to $TARGET..."
 if ! install -m 755 "$BIN_PATH" "$TARGET"; then
   if command -v sudo >/dev/null 2>&1; then
     echo "Retrying with sudo..."
-    sudo install -m 755 "$BIN_PATH" "$TARGET"
+    if ! sudo install -m 755 "$BIN_PATH" "$TARGET"; then
+      echo "Installation failed even with sudo. Please check permissions for $TARGET."
+      exit 1
+    fi
   else
     echo "Installation failed and sudo is not available. Please check permissions for $TARGET."
     exit 1
