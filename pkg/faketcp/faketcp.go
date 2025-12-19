@@ -171,7 +171,6 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 			ackBytes := conn.serializeTCPHeader(ackHdr)
 			conn.udpConn.Write(ackBytes)
 			return conn, nil
-				}()
 	}
 
 	// Handshake timed out; still return connection (best-effort disguise)
