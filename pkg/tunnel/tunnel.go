@@ -454,22 +454,27 @@ func (t *Tunnel) applyHostRouteChanges(toAdd, toDel []*net.IPNet) {
 		return
 	}
 	for _, r := range toDel {
-		t.applyHostRoute("del", r)
+		if err := t.applyHostRoute("del", r); err != nil {
+			log.Print(err)
+		}
 	}
 	for _, r := range toAdd {
-		t.applyHostRoute("replace", r)
+		if err := t.applyHostRoute("replace", r); err != nil {
+			log.Print(err)
+		}
 	}
 }
 
 // applyHostRoute executes a host route change command and logs errors.
-func (t *Tunnel) applyHostRoute(action string, route *net.IPNet) {
+func (t *Tunnel) applyHostRoute(action string, route *net.IPNet) error {
 	if route == nil {
-		return
+		return nil
 	}
 	cmd := exec.Command("ip", "route", action, route.String(), "dev", t.tunName)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("Failed to %s route %s via %s: %v (output: %s)", action, route, t.tunName, err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("failed to %s route %s via %s: %w (output: %s)", action, route, t.tunName, err, strings.TrimSpace(string(output)))
 	}
+	return nil
 }
 
 // cleanupHostRoutes removes any remaining routes associated with the tunnel.
@@ -480,14 +485,13 @@ func (t *Tunnel) cleanupHostRoutes() {
 
 	if t.config.Mode == "server" {
 		t.routeMux.Lock()
-		if t.clientRoutes == nil {
-			t.clientRoutes = make(map[string][]*net.IPNet)
-		}
 		allRoutes := make([][]*net.IPNet, 0, len(t.clientRoutes))
 		for _, routes := range t.clientRoutes {
 			allRoutes = append(allRoutes, routes)
 		}
-		t.clientRoutes = make(map[string][]*net.IPNet)
+		for k := range t.clientRoutes {
+			delete(t.clientRoutes, k)
+		}
 		t.routeMux.Unlock()
 
 		for _, routes := range allRoutes {
