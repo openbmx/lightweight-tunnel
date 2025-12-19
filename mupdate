@@ -50,10 +50,12 @@ restart_msg="Restart the lightweight-tunnel systemd service to load the new bina
 restart_example_template="For example: sudo systemctl restart %s (or your custom service name, such as lightweight-tunnel-server)."
 default_service="lightweight-tunnel"
 running_service=""
+systemctl_output=""
 if command -v systemctl >/dev/null 2>&1; then
-  running_service=$(systemctl list-units --type=service --state=active 'lightweight-tunnel*' --no-legend --no-pager --plain 2>/dev/null | awk '{print $1}' | head -n1 | sed 's/\.service$//' || true)
+  systemctl_output=$(systemctl list-units --type=service --state=active 'lightweight-tunnel*' --no-legend --no-pager --plain 2>/dev/null || true)
+  running_service=$(printf "%s" "$systemctl_output" | awk '{print $1}' | head -n1)
+  running_service=${running_service%.service}
 fi
-restart_example=$(printf "$restart_example_template" "${running_service:-$default_service}")
 if [ -n "$running_service" ]; then
   echo "Detected running lightweight-tunnel systemd service: $running_service"
   echo "$restart_msg"
@@ -61,5 +63,5 @@ if [ -n "$running_service" ]; then
 else
   echo "If a lightweight-tunnel systemd service is running:"
   echo "$restart_msg"
-  echo "$restart_example"
+  printf "$restart_example_template\n" "${running_service:-$default_service}"
 fi
