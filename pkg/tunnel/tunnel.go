@@ -2442,9 +2442,22 @@ func applyKernelTunings(enabled bool) {
 		log.Println("TCP Fast Open enabled (net.ipv4.tcp_fastopen=3)")
 	}
 
+	// fq qdisc is recommended for BBR/BBR2 to pace traffic correctly.
+	if err := runSysctl("net.core.default_qdisc=fq"); err != nil {
+		log.Printf("⚠️  Failed to set default qdisc to fq: %v", err)
+	} else {
+		log.Println("fq qdisc enabled (net.core.default_qdisc=fq)")
+	}
+
 	// Prefer BBR2 congestion control if available; fallback silently if kernel lacks it.
 	if err := runSysctl("net.ipv4.tcp_congestion_control=bbr2"); err != nil {
 		log.Printf("⚠️  Failed to set BBR2 congestion control (kernel may not support bbr2): %v", err)
+		// Fallback to BBR if BBR2 is unavailable.
+		if err := runSysctl("net.ipv4.tcp_congestion_control=bbr"); err != nil {
+			log.Printf("⚠️  Failed to fallback to BBR congestion control: %v", err)
+		} else {
+			log.Println("BBR congestion control enabled (fallback from bbr2)")
+		}
 	} else {
 		log.Println("BBR2 congestion control enabled")
 	}

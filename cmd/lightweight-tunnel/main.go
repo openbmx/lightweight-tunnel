@@ -198,11 +198,13 @@ func validateConfig(cfg *config.Config) error {
 func generateConfigFile(filename string) error {
 	// Generate minimalist server config with only essential parameters
 	serverCfg := &config.Config{
-		Mode:       "server",
-		LocalAddr:  "0.0.0.0:9000",
-		TunnelAddr: "10.0.0.1/24",
-		Key:        "请修改为您的强密钥",
-		MTU:        0, // 0 = auto-detect
+		Mode:             "server",
+		LocalAddr:        "0.0.0.0:9000",
+		TunnelAddr:       "10.0.0.1/24",
+		Key:              "请修改为您的强密钥",
+		MTU:              0, // 0 = auto-detect
+		EnableXDP:        true,
+		EnableKernelTune: true,
 	}
 
 	if err := config.SaveConfig(filename, serverCfg); err != nil {
@@ -212,11 +214,13 @@ func generateConfigFile(filename string) error {
 	// Generate minimalist client config example with only essential parameters
 	clientFilename := filename + ".client"
 	clientCfg := &config.Config{
-		Mode:       "client",
-		RemoteAddr: "服务器IP:9000",
-		TunnelAddr: "10.0.0.2/24",
-		Key:        "请修改为您的强密钥",
-		MTU:        0, // 0 = auto-detect
+		Mode:             "client",
+		RemoteAddr:       "服务器IP:9000",
+		TunnelAddr:       "10.0.0.2/24",
+		Key:              "请修改为您的强密钥",
+		MTU:              0, // 0 = auto-detect
+		EnableXDP:        true,
+		EnableKernelTune: true,
 	}
 
 	if err := config.SaveConfig(clientFilename, clientCfg); err != nil {

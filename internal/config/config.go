@@ -181,6 +181,8 @@ func SaveConfig(filename string, config *Config) error {
 	minimalConfig["tunnel_addr"] = config.TunnelAddr
 	minimalConfig["key"] = config.Key
 	minimalConfig["mtu"] = config.MTU
+	minimalConfig["enable_xdp"] = config.EnableXDP
+	minimalConfig["enable_kernel_tune"] = config.EnableKernelTune
 
 	data, err := json.MarshalIndent(minimalConfig, "", "  ")
 	if err != nil {
