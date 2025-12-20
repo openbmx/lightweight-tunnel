@@ -15,6 +15,10 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/rawsocket"
 )
 
+const (
+	rawRecvQueueSize = 4096 // large buffer to avoid drops under high throughput
+)
+
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)
 type ConnRaw struct {
 	rawSocket     *rawsocket.RawSocket
@@ -70,7 +74,7 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 		seqNum:        isn,
 		ackNum:        0,
 		isConnected:   false, // 握手未完成，初始为false
-		recvQueue:     make(chan []byte, 100),
+		recvQueue:     make(chan []byte, rawRecvQueueSize),
 		iptablesMgr:   iptablesMgr,
 		stopCh:        make(chan struct{}),
 		isListener:    false,
@@ -620,7 +624,7 @@ func (l *ListenerRaw) acceptLoop() {
 				seqNum:        isn,
 				ackNum:        seq + 1,
 				isConnected:   false,
-				recvQueue:     make(chan []byte, 100),
+				recvQueue:     make(chan []byte, rawRecvQueueSize),
 				iptablesMgr:   l.iptablesMgr,
 				stopCh:        make(chan struct{}),
 				isListener:    true,

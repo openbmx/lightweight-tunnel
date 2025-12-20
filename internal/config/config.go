@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 )
 
@@ -175,5 +177,33 @@ func SaveConfig(filename string, config *Config) error {
 		return err
 	}
 
-	return os.WriteFile(filename, data, 0644)
+	return os.WriteFile(filename, data, 0600)
+}
+
+// UpdateConfigKey updates only the key field in an existing config file while preserving other fields.
+func UpdateConfigKey(filename string, newKey string) error {
+	if newKey == "" {
+		return fmt.Errorf("new key is empty")
+	}
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF}) // Handle UTF-8 BOM
+
+	var cfgMap map[string]interface{}
+	if err := json.Unmarshal(data, &cfgMap); err != nil {
+		return err
+	}
+
+	cfgMap["key"] = newKey
+
+	updated, err := json.MarshalIndent(cfgMap, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, updated, 0600)
 }

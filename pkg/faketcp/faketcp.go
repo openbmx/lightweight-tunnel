@@ -29,16 +29,42 @@ const (
 	MaxPacketSize = 1500
 	// Maximum payload size (MTU - IP - TCP headers)
 	MaxPayloadSize = MaxPacketSize - IPHeaderSize - TCPHeaderSize
-	
+
 	// Read timeout duration for making blocking reads interruptible
-	ReadTimeoutDuration = 300 * time.Millisecond  // 300ms适合中等延迟网络
+	ReadTimeoutDuration = 300 * time.Millisecond // 300ms适合中等延迟网络
 	// Listener read timeout for queue operations (longer timeout for actual data)
 	ListenerReadTimeout = 10 * time.Second
 	// Handshake timeout for SYN/SYN-ACK/ACK
-	HandshakeTimeout = 5 * time.Second  // 增加到5秒以适应网络抖动
+	HandshakeTimeout = 5 * time.Second // 增加到5秒以适应网络抖动
 	// Channel close delay to allow pending writes to complete
 	ChannelCloseDelay = 100 * time.Millisecond
 )
+
+// Tuning controls runtime knobs for faketcp behavior.
+type Tuning struct {
+	ListenerQueueSize   int           // pending accept queue length
+	HandshakeMaxErrors  int           // max non-timeout handshake read errors before giving up
+	WritePacingMinDelay time.Duration // optional pacing delay between segments to reduce burst loss
+}
+
+var tunables = Tuning{
+	ListenerQueueSize:   8,
+	HandshakeMaxErrors:  2,
+	WritePacingMinDelay: 0,
+}
+
+// SetTuning applies runtime tuning (zero or negative values keep defaults).
+func SetTuning(t Tuning) {
+	if t.ListenerQueueSize > 0 {
+		tunables.ListenerQueueSize = t.ListenerQueueSize
+	}
+	if t.HandshakeMaxErrors > 0 {
+		tunables.HandshakeMaxErrors = t.HandshakeMaxErrors
+	}
+	if t.WritePacingMinDelay > 0 {
+		tunables.WritePacingMinDelay = t.WritePacingMinDelay
+	}
+}
 
 // TCPHeader represents a minimal TCP header
 type TCPHeader struct {
@@ -46,7 +72,7 @@ type TCPHeader struct {
 	DstPort    uint16
 	SeqNum     uint32
 	AckNum     uint32
-	DataOffset uint8  // 4 bits
+	DataOffset uint8 // 4 bits
 	Flags      uint8
 	Window     uint16
 	Checksum   uint16
@@ -56,9 +82,9 @@ type TCPHeader struct {
 
 // IPHeader represents a minimal IPv4 header
 type IPHeader struct {
-	Version    uint8  // 4 bits
-	IHL        uint8  // 4 bits (Internet Header Length)
-	TOS        uint8  // Type of Service
+	Version    uint8 // 4 bits
+	IHL        uint8 // 4 bits (Internet Header Length)
+	TOS        uint8 // Type of Service
 	TotalLen   uint16
 	ID         uint16
 	Flags      uint8  // 3 bits
@@ -80,16 +106,25 @@ type Conn struct {
 	seqNum      uint32
 	ackNum      uint32
 	mu          sync.Mutex
-	isConnected bool // true if UDP socket is connected, false if shared listener socket
+	isConnected bool        // true if UDP socket is connected, false if shared listener socket
 	recvQueue   chan []byte // for listener connections
 	closed      int32       // atomic flag: 1 if connection is closed, 0 otherwise
 	closeOnce   sync.Once   // ensures channel is closed only once
 }
 
+// Listener accepts and dispatches fake TCP connections
+type Listener struct {
+	udpConn   *net.UDPConn
+	connMap   map[string]*Conn
+	mu        sync.RWMutex
+	newConnCh chan *Conn
+	closeOnce sync.Once
+}
+
 // NewConn creates a new fake TCP connection
 func NewConn(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, isConnected bool) (*Conn, error) {
 	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-    
+
 	// Generate a random initial sequence number (ISN)
 	isn, err := randomUint32()
 	if err != nil {
@@ -110,6 +145,123 @@ func NewConn(udpConn *net.UDPConn, remoteAddr *net.UDPAddr, isConnected bool) (*
 	return conn, nil
 }
 
+// dispatch continuously reads UDP packets and routes them to connections
+func (l *Listener) dispatch() {
+	buf := make([]byte, MaxPacketSize)
+
+	for {
+		l.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
+		n, remoteAddr, err := l.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			l.closeOnce.Do(func() {
+				close(l.newConnCh)
+			})
+			return
+		}
+
+		if n < TCPHeaderSize {
+			continue
+		}
+
+		tcpHeader := parseTCPHeader(buf[:n])
+		if tcpHeader == nil {
+			continue
+		}
+
+		connKey := remoteAddr.String()
+
+		l.mu.RLock()
+		conn, exists := l.connMap[connKey]
+		l.mu.RUnlock()
+
+		if !exists {
+			conn = l.createConnection(remoteAddr, tcpHeader)
+			if conn == nil {
+				continue
+			}
+
+			l.mu.Lock()
+			l.connMap[connKey] = conn
+			l.mu.Unlock()
+
+			l.enqueuePayload(connKey, conn, tcpHeader, buf[:n], n)
+
+			select {
+			case l.newConnCh <- conn:
+			default:
+				log.Printf("accept queue full (%d), dropping connection from %s", tunables.ListenerQueueSize, connKey)
+				l.mu.Lock()
+				delete(l.connMap, connKey)
+				l.mu.Unlock()
+				conn.Close()
+			}
+			continue
+		}
+
+		l.enqueuePayload(connKey, conn, tcpHeader, buf[:n], n)
+	}
+}
+
+func (l *Listener) createConnection(remoteAddr *net.UDPAddr, tcpHeader *TCPHeader) *Conn {
+	serverIsn, err := randomUint32()
+	if err != nil {
+		serverIsn = uint32(time.Now().UnixNano())
+	}
+	conn := &Conn{
+		udpConn:     l.udpConn,
+		localAddr:   l.udpConn.LocalAddr().(*net.UDPAddr),
+		remoteAddr:  remoteAddr,
+		srcPort:     uint16(l.udpConn.LocalAddr().(*net.UDPAddr).Port),
+		dstPort:     tcpHeader.SrcPort,
+		seqNum:      serverIsn,
+		ackNum:      tcpHeader.SeqNum + 1,
+		isConnected: false,
+		recvQueue:   make(chan []byte, 100),
+	}
+
+	// Respond with SYN-ACK when possible to improve handshake success
+	if tcpHeader.Flags&SYN != 0 {
+		synAck := &TCPHeader{
+			SrcPort: conn.srcPort,
+			DstPort: conn.dstPort,
+			SeqNum:  conn.seqNum,
+			AckNum:  conn.ackNum,
+			Flags:   SYN | ACK,
+			Window:  65535,
+		}
+		synAckBytes := serializeTCPHeaderStatic(synAck)
+		l.udpConn.WriteToUDP(synAckBytes, remoteAddr)
+	}
+
+	return conn
+}
+
+func (l *Listener) enqueuePayload(connKey string, conn *Conn, tcpHeader *TCPHeader, buf []byte, n int) {
+	headerLen := int(tcpHeader.DataOffset) * 4
+	if headerLen < TCPHeaderSize {
+		headerLen = TCPHeaderSize
+	}
+	if n <= headerLen {
+		return
+	}
+
+	payload := make([]byte, n-headerLen)
+	copy(payload, buf[headerLen:n])
+
+	if atomic.LoadInt32(&conn.closed) != 0 {
+		return
+	}
+
+	select {
+	case conn.recvQueue <- payload:
+	default:
+		log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
+	}
+}
+
 // Dial creates a fake TCP connection to the remote address
 func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 	// Parse remote address
@@ -117,13 +269,13 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address: %v", err)
 	}
-	
+
 	// Create UDP connection (connected socket)
 	udpConn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial UDP: %v", err)
 	}
-	
+
 	conn, err := NewConn(udpConn, raddr, true)
 	if err != nil {
 		udpConn.Close()
@@ -145,16 +297,24 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 
 	// Wait for SYN-ACK
 	buf := make([]byte, MaxPacketSize)
+	errorCount := 0
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 		n, err := conn.udpConn.Read(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
+			if netErr, ok := err.(net.Error); ok {
+				if netErr.Timeout() {
+					continue
+				}
 			}
-			conn.udpConn.Close()
-			return nil, fmt.Errorf("handshake read error: %v", err)
+			// Non-timeout errors are treated as best-effort; proceed without failing
+			log.Printf("handshake read error (best-effort): %v", err)
+			errorCount++
+			if tunables.HandshakeMaxErrors > 0 && errorCount >= tunables.HandshakeMaxErrors {
+				break
+			}
+			break
 		}
 		hdr := parseTCPHeader(buf[:n])
 		if hdr == nil {
@@ -183,194 +343,31 @@ func Listen(addr string) (*Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve address: %v", err)
 	}
-	
+
 	// Create UDP listener
 	udpConn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen UDP: %v", err)
 	}
-	
-	return &Listener{
-		udpConn: udpConn,
-		connMap: make(map[string]*Conn),
-	}, nil
-}
 
-// Listener listens for fake TCP connections
-type Listener struct {
-	udpConn *net.UDPConn
-	connMap map[string]*Conn
-	mu      sync.RWMutex
+	l := &Listener{
+		udpConn:   udpConn,
+		connMap:   make(map[string]*Conn),
+		newConnCh: make(chan *Conn, tunables.ListenerQueueSize),
+	}
+
+	go l.dispatch()
+
+	return l, nil
 }
 
 // Accept accepts a new connection (blocks until packet arrives)
 func (l *Listener) Accept() (*Conn, error) {
-	buf := make([]byte, MaxPacketSize)
-	
-	for {
-		// Set read deadline to allow for interruption
-		l.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
-		
-		n, remoteAddr, err := l.udpConn.ReadFromUDP(buf)
-		if err != nil {
-			// Check if it's a timeout, if so continue to allow for shutdown check
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return nil, err
-		}
-		
-		if n < TCPHeaderSize {
-			continue // Invalid packet
-		}
-
-		// Parse full TCP header (may contain options)
-		tcpHeader := parseTCPHeader(buf[:n])
-		if tcpHeader == nil {
-			continue
-		}
-
-		// Create connection key (remote IP:port)
-		connKey := remoteAddr.String()
-
-		l.mu.Lock()
-		conn, exists := l.connMap[connKey]
-		if !exists {
-			// New connection - handle SYN handshake if present
-			if tcpHeader.Flags&SYN != 0 {
-				// Create connection object but don't publish until handshake completes
-				serverIsn, _ := randomUint32()
-				newConn := &Conn{
-					udpConn:     l.udpConn,
-					localAddr:   l.udpConn.LocalAddr().(*net.UDPAddr),
-					remoteAddr:  remoteAddr,
-					srcPort:     uint16(l.udpConn.LocalAddr().(*net.UDPAddr).Port),
-					dstPort:     tcpHeader.SrcPort,
-					seqNum:      serverIsn,
-					ackNum:      tcpHeader.SeqNum + 1,
-					isConnected: false,
-					recvQueue:   make(chan []byte, 100),
-				}
-
-				// Send SYN-ACK
-				synAck := &TCPHeader{
-					SrcPort: newConn.srcPort,
-					DstPort: newConn.dstPort,
-					SeqNum:  newConn.seqNum,
-					AckNum:  newConn.ackNum,
-					Flags:   SYN | ACK,
-					Window:  65535,
-					Options: newConn.buildTCPHeader(0).Options,
-				}
-				synAckBytes := serializeTCPHeaderStatic(synAck)
-				l.udpConn.WriteToUDP(synAckBytes, remoteAddr)
-
-				// Wait for ACK from client (handshake)
-				deadline := time.Now().Add(HandshakeTimeout)
-				handshakeDone := false
-				for !handshakeDone && time.Now().Before(deadline) {
-					l.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
-					n2, r2, err := l.udpConn.ReadFromUDP(buf)
-					if err != nil {
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							continue
-						}
-						break
-					}
-					if r2.String() != remoteAddr.String() {
-						// Not the same peer; ignore (will be handled in outer loop)
-						continue
-					}
-					hdr := parseTCPHeader(buf[:n2])
-					if hdr == nil {
-						continue
-					}
-					if hdr.Flags&ACK != 0 && hdr.AckNum == newConn.seqNum+1 {
-						// Handshake complete
-						newConn.seqNum += 1
-						// If there's payload after header, queue it
-						headerLen := int(hdr.DataOffset) * 4
-						if headerLen < TCPHeaderSize {
-							headerLen = TCPHeaderSize
-						}
-						if n2 > headerLen {
-							payload := make([]byte, n2-headerLen)
-							copy(payload, buf[headerLen:n2])
-							newConn.recvQueue <- payload
-						}
-						// Publish connection and return
-						l.connMap[connKey] = newConn
-						l.mu.Unlock()
-						return newConn, nil
-					}
-				}
-
-				// Handshake timed out or failed: still publish connection to allow further packets
-				l.connMap[connKey] = newConn
-				l.mu.Unlock()
-				return newConn, nil
-			}
-
-			// Not a SYN or policy: create a connection and queue payload
-			conn = &Conn{
-				udpConn:     l.udpConn,
-				localAddr:   l.udpConn.LocalAddr().(*net.UDPAddr),
-				remoteAddr:  remoteAddr,
-				srcPort:     uint16(l.udpConn.LocalAddr().(*net.UDPAddr).Port),
-				dstPort:     tcpHeader.SrcPort,
-				seqNum:      uint32(time.Now().Unix()),
-				ackNum:      tcpHeader.SeqNum + uint32(n-TCPHeaderSize),
-				isConnected: false, // Shared listener socket
-				recvQueue:   make(chan []byte, 100),
-			}
-			l.connMap[connKey] = conn
-
-			// Extract and queue first payload (respect header length)
-			headerLen := int(tcpHeader.DataOffset) * 4
-			if headerLen < TCPHeaderSize {
-				headerLen = TCPHeaderSize
-			}
-			if n > headerLen {
-				payload := make([]byte, n-headerLen)
-				copy(payload, buf[headerLen:n])
-				conn.recvQueue <- payload
-			}
-
-			l.mu.Unlock()
-			return conn, nil
-		}
-		l.mu.Unlock()
-
-		// Existing connection - queue payload based on header length
-		if n > int(tcpHeader.DataOffset)*4 {
-			headerLen := int(tcpHeader.DataOffset) * 4
-			if headerLen < TCPHeaderSize {
-				headerLen = TCPHeaderSize
-			}
-			payload := make([]byte, n-headerLen)
-			copy(payload, buf[headerLen:n])
-
-			// Check if connection is closed before attempting to send (using atomic read)
-			if atomic.LoadInt32(&conn.closed) == 0 {
-				// Use recover to handle the rare case where channel is closed between check and send
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							// Channel was closed, silently drop packet
-							log.Printf("WARNING: Connection closed for %s, dropping packet (%d bytes)", connKey, len(payload))
-						}
-					}()
-					select {
-					case conn.recvQueue <- payload:
-						// Successfully queued
-					default:
-						// Queue full, drop packet and log
-						log.Printf("WARNING: Receive queue full for %s, dropping packet (%d bytes)", connKey, len(payload))
-					}
-				}()
-			}
-		}
+	conn, ok := <-l.newConnCh
+	if !ok {
+		return nil, fmt.Errorf("listener closed")
 	}
+	return conn, nil
 }
 
 // Close closes the listener
@@ -385,6 +382,10 @@ func (l *Listener) Addr() net.Addr {
 
 // WritePacket sends data with fake TCP header
 func (c *Conn) WritePacket(data []byte) error {
+	if len(data) > MaxPayloadSize {
+		return fmt.Errorf("payload size %d exceeds maximum %d bytes", len(data), MaxPayloadSize)
+	}
+
 	// Segment data by typical MSS to look like TCP segments
 	const defaultMSS = 1460
 
@@ -422,6 +423,10 @@ func (c *Conn) WritePacket(data []byte) error {
 		// Update sequence number and counters
 		c.seqNum += uint32(len(seg))
 		sent += segLen
+
+		if tunables.WritePacingMinDelay > 0 {
+			time.Sleep(tunables.WritePacingMinDelay)
+		}
 	}
 
 	return nil
@@ -445,7 +450,7 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 			return nil, &net.OpError{Op: "read", Net: "udp", Err: fmt.Errorf("timeout")}
 		}
 	}
-	
+
 	// Connected socket - read directly with deadline to allow interruption
 	c.udpConn.SetReadDeadline(time.Now().Add(ReadTimeoutDuration))
 
@@ -492,38 +497,9 @@ func (c *Conn) ReadPacket() ([]byte, error) {
 
 // buildTCPHeader constructs a fake TCP header
 func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
-	// Build common TCP options to resemble real TCP stacks
-	opts := make([]byte, 0)
-
-	// MSS (kind=2, len=4)
-	mss := uint16(1460)
-	mssOpt := make([]byte, 4)
-	mssOpt[0] = 2
-	mssOpt[1] = 4
-	binary.BigEndian.PutUint16(mssOpt[2:], mss)
-	opts = append(opts, mssOpt...)
-
-	// NOP for padding
-	opts = append(opts, 1)
-
-	// Window scale (kind=3, len=3)
-	opts = append(opts, 3, 3, 7)
-
-	// SACK permitted (kind=4, len=2)
-	opts = append(opts, 4, 2)
-
-	// NOP then Timestamp (kind=8, len=10)
-	tsOpt := make([]byte, 10)
-	tsOpt[0] = 8
-	tsOpt[1] = 10
-	// ts value pseudo-random
-	if v, err := randomUint32(); err == nil {
-		binary.BigEndian.PutUint32(tsOpt[2:], v)
-	}
-	binary.BigEndian.PutUint32(tsOpt[6:], 0)
-	opts = append(opts, 1) // NOP before TS
-	opts = append(opts, tsOpt...)
-
+	// Options are intentionally omitted for minimal overhead and lower latency.
+	// This keeps packets small for disguise/performance at the cost of skipping
+	// features like MSS/window scaling negotiation.
 	return &TCPHeader{
 		SrcPort:    c.srcPort,
 		DstPort:    c.dstPort,
@@ -534,7 +510,7 @@ func (c *Conn) buildTCPHeader(dataLen int) *TCPHeader {
 		Window:     65535,
 		Checksum:   0,
 		UrgentPtr:  0,
-		Options:    opts,
+		Options:    nil,
 	}
 }
 
@@ -550,13 +526,16 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 
 	// Options length in 32-bit words
 	optLen := 0
-	if len(h.Options) > 0 {
+	opts := h.Options
+	if len(opts) > 0 {
 		// pad options to 4-byte boundary
-		pad := (4 - (len(h.Options) % 4)) % 4
+		pad := (4 - (len(opts) % 4)) % 4
 		if pad > 0 {
-			h.Options = append(h.Options, make([]byte, pad)...)
+			padded := make([]byte, len(opts)+pad) // padding bytes zero-initialized
+			copy(padded, opts)
+			opts = padded
 		}
-		optLen = len(h.Options)
+		optLen = len(opts)
 	}
 
 	dataOffsetWords := uint8(5 + (optLen / 4))
@@ -579,7 +558,7 @@ func (c *Conn) serializeTCPHeader(h *TCPHeader) []byte {
 
 	header := make([]byte, TCPHeaderSize+optLen)
 	copy(header[:TCPHeaderSize], base)
-	copy(header[TCPHeaderSize:], h.Options[:optLen])
+	copy(header[TCPHeaderSize:], opts[:optLen])
 	return header
 }
 
@@ -647,12 +626,15 @@ func serializeTCPHeaderStatic(h *TCPHeader) []byte {
 	binary.BigEndian.PutUint32(base[8:12], h.AckNum)
 
 	optLen := 0
-	if len(h.Options) > 0 {
-		pad := (4 - (len(h.Options) % 4)) % 4
+	opts := h.Options
+	if len(opts) > 0 {
+		pad := (4 - (len(opts) % 4)) % 4
 		if pad > 0 {
-			h.Options = append(h.Options, make([]byte, pad)...)
+			padded := make([]byte, len(opts)+pad) // padding bytes zero-initialized
+			copy(padded, opts)
+			opts = padded
 		}
-		optLen = len(h.Options)
+		optLen = len(opts)
 	}
 	dataOffsetWords := uint8(5 + (optLen / 4))
 	base[12] = (dataOffsetWords << 4)
@@ -672,7 +654,7 @@ func serializeTCPHeaderStatic(h *TCPHeader) []byte {
 	}
 	header := make([]byte, TCPHeaderSize+optLen)
 	copy(header[:TCPHeaderSize], base)
-	copy(header[TCPHeaderSize:], h.Options[:optLen])
+	copy(header[TCPHeaderSize:], opts[:optLen])
 	return header
 }
 
@@ -684,12 +666,12 @@ func (c *Conn) Close() error {
 		// Already closed - return immediately without creating a goroutine
 		return nil
 	}
-	
+
 	// For connected sockets created with Dial(), close the UDP connection
 	if c.isConnected {
 		return c.udpConn.Close()
 	}
-	
+
 	// For shared listener sockets, don't close the shared UDP connection
 	// but close the receive queue channel after a brief delay to allow pending writes to complete
 	if c.recvQueue != nil {

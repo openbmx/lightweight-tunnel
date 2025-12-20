@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,7 +51,7 @@ const (
 	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 
 	// Rotation and advertisement timing
-	KeyRotationSettleTime      = 100 * time.Millisecond
+	KeyRotationGracePeriod     = 15 * time.Second
 	DefaultRouteAdvertInterval = 60 * time.Second
 )
 
@@ -65,6 +66,8 @@ type ClientConnection struct {
 	wg        sync.WaitGroup
 	// lastPeerInfo stores the last peer info string sent by this client
 	lastPeerInfo string
+	cipher       *crypto.Cipher
+	cipherGen    uint64
 	mu           sync.RWMutex
 }
 
@@ -79,24 +82,44 @@ type clientRoute struct {
 	client  *ClientConnection
 }
 
+func (c *ClientConnection) setCipherWithGen(cipher *crypto.Cipher, gen uint64) {
+	c.mu.Lock()
+	c.cipher = cipher
+	c.cipherGen = gen
+	c.mu.Unlock()
+}
+
+func (c *ClientConnection) getCipher() (*crypto.Cipher, uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cipher, c.cipherGen
+}
+
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
-	config     *config.Config
-	fec        *fec.FEC
-	cipher     *crypto.Cipher // Encryption cipher (nil if no key)
-	cipherMux  sync.RWMutex
-	configMux  sync.RWMutex
-	conn       faketcp.ConnAdapter          // Used in client mode (interface for both modes)
-	listener   faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
-	clients    map[string]*ClientConnection // Used in server mode (key: IP address)
-	clientsMux sync.RWMutex
-	tunName    string
-	tunFile    *TunDevice
-	stopCh     chan struct{}
-	stopOnce   sync.Once // Ensures Stop() is only executed once
-	wg         sync.WaitGroup
-	sendQueue  chan []byte // Used in client mode
-	recvQueue  chan []byte // Used in client mode
+	config         *config.Config
+	configFilePath string
+	fec            *fec.FEC
+	cipher         *crypto.Cipher // Encryption cipher (nil if no key)
+	cipherGen      uint64
+	prevCipher     *crypto.Cipher
+	prevCipherGen  uint64
+	prevCipherExp  time.Time
+	cipherMux      sync.RWMutex
+	configMux      sync.RWMutex
+	conn           faketcp.ConnAdapter          // Used in client mode (interface for both modes)
+	listener       faketcp.ListenerAdapter      // Used in server mode (interface for both modes)
+	clients        map[string]*ClientConnection // Used in server mode (key: IP address)
+	clientsMux     sync.RWMutex
+	allClients     map[*ClientConnection]struct{} // Tracks all active clients (including those without registered tunnel IP)
+	allClientsMux  sync.RWMutex
+	tunName        string
+	tunFile        *TunDevice
+	stopCh         chan struct{}
+	stopOnce       sync.Once // Ensures Stop() is only executed once
+	wg             sync.WaitGroup
+	sendQueue      chan []byte // Used in client mode
+	recvQueue      chan []byte // Used in client mode
 
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
@@ -112,7 +135,7 @@ type Tunnel struct {
 }
 
 // NewTunnel creates a new tunnel instance
-func NewTunnel(cfg *config.Config) (*Tunnel, error) {
+func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	// Force rawtcp mode - this is the only supported transport now
 	cfg.Transport = "rawtcp"
 	faketcp.SetMode(faketcp.ModeRaw)
@@ -197,12 +220,18 @@ func NewTunnel(cfg *config.Config) (*Tunnel, error) {
 	}
 
 	t := &Tunnel{
-		config:       cfg,
-		fec:          fecCodec,
-		cipher:       cipher,
-		stopCh:       make(chan struct{}),
-		myTunnelIP:   myIP,
-		clientRoutes: make(map[*ClientConnection][]string),
+		config:         cfg,
+		configFilePath: configFilePath,
+		fec:            fecCodec,
+		cipher:         cipher,
+		stopCh:         make(chan struct{}),
+		myTunnelIP:     myIP,
+		clientRoutes:   make(map[*ClientConnection][]string),
+		allClients:     make(map[*ClientConnection]struct{}),
+	}
+
+	if cipher != nil {
+		t.cipherGen = 1
 	}
 
 	// Initialize P2P manager if enabled
@@ -377,6 +406,18 @@ func (t *Tunnel) Stop() {
 		}
 		t.clientsMux.Unlock()
 
+		// Also close any clients that haven't been registered with a tunnel IP yet
+		t.allClientsMux.RLock()
+		for client := range t.allClients {
+			client.stopOnce.Do(func() {
+				if err := client.conn.Close(); err != nil {
+					log.Printf("Error closing client connection: %v", err)
+				}
+				close(client.stopCh)
+			})
+		}
+		t.allClientsMux.RUnlock()
+
 		// Stop P2P manager
 		if t.p2pManager != nil {
 			t.p2pManager.Stop()
@@ -398,6 +439,18 @@ func (t *Tunnel) Stop() {
 			log.Println("Timeout waiting for tunnel goroutines to stop; continuing shutdown")
 		}
 	})
+}
+
+func (t *Tunnel) trackClientConnection(client *ClientConnection) {
+	t.allClientsMux.Lock()
+	t.allClients[client] = struct{}{}
+	t.allClientsMux.Unlock()
+}
+
+func (t *Tunnel) untrackClientConnection(client *ClientConnection) {
+	t.allClientsMux.Lock()
+	delete(t.allClients, client)
+	t.allClientsMux.Unlock()
 }
 
 // addClient adds a client to the routing table
@@ -463,19 +516,17 @@ func (t *Tunnel) broadcastPeerDisconnect(disconnectedIP net.IP) {
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(disconnectInfo))
 
-	// Encrypt
-	encryptedPacket, err := t.encryptPacket(fullPacket)
-	if err != nil {
-		log.Printf("Failed to encrypt disconnect notification: %v", err)
-		return
-	}
-
 	// Broadcast to all clients with its own lock
 	t.clientsMux.RLock()
 	defer t.clientsMux.RUnlock()
 
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(disconnectedIP) {
+			encryptedPacket, err := t.encryptForClient(client, fullPacket)
+			if err != nil {
+				log.Printf("Failed to encrypt disconnect notification: %v", err)
+				continue
+			}
 			if err := client.conn.WritePacket(encryptedPacket); err != nil {
 				log.Printf("Failed to send disconnect notification to %s: %v", client.clientIP, err)
 			}
@@ -712,6 +763,8 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 		stopCh:    make(chan struct{}),
 	}
 
+	t.trackClientConnection(client)
+
 	// Send client's public address for NAT traversal (if P2P enabled)
 	if t.config.P2PEnabled {
 		go t.sendPublicAddrToClient(client)
@@ -729,6 +782,7 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 	// Wait for client to disconnect
 	client.wg.Wait()
 
+	t.untrackClientConnection(client)
 	// Clean up client
 	t.removeClient(client)
 	log.Printf("Client disconnected: %s", conn.RemoteAddr())
@@ -1224,11 +1278,15 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			continue
 		}
 
-		// Decrypt if cipher is available
-		decryptedPacket, err := t.decryptPacket(packet)
+		// Decrypt if cipher is available (supports previous key during grace)
+		decryptedPacket, usedCipher, gen, err := t.decryptPacketForServer(packet)
 		if err != nil {
 			log.Printf("Client decryption error from %s (wrong key?): %v", client.conn.RemoteAddr(), err)
 			continue
+		}
+
+		if usedCipher != nil {
+			client.setCipherWithGen(usedCipher, gen)
 		}
 
 		if len(decryptedPacket) < 1 {
@@ -1363,7 +1421,7 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 			copy(fullPacket[1:], packet)
 
 			// Encrypt if cipher is available
-			encryptedPacket, err := t.encryptPacket(fullPacket)
+			encryptedPacket, err := t.encryptForClient(client, fullPacket)
 			if err != nil {
 				log.Printf("Client encryption error: %v", err)
 				continue
@@ -1404,7 +1462,7 @@ func (t *Tunnel) clientKeepalive(client *ClientConnection) {
 			return
 		case <-ticker.C:
 			// Encrypt if cipher is available
-			encryptedPacket, err := t.encryptPacket(keepalivePacket)
+			encryptedPacket, err := t.encryptForClient(client, keepalivePacket)
 			if err != nil {
 				log.Printf("Client keepalive encryption error: %v", err)
 				continue
@@ -1884,7 +1942,18 @@ func (t *Tunnel) sendRoutesToClient(client *ClientConnection) {
 	if len(routes) == 0 {
 		return
 	}
-	if err := t.sendRoutePacket(client.conn, routes); err != nil {
+	payload := strings.Join(routes, ",")
+	fullPacket := make([]byte, len(payload)+1)
+	fullPacket[0] = PacketTypeRouteInfo
+	copy(fullPacket[1:], []byte(payload))
+
+	encryptedPacket, err := t.encryptForClient(client, fullPacket)
+	if err != nil {
+		log.Printf("Failed to encrypt routes for client: %v", err)
+		return
+	}
+
+	if err := client.conn.WritePacket(encryptedPacket); err != nil {
 		log.Printf("Failed to send routes to client: %v", err)
 	}
 }
@@ -2176,15 +2245,99 @@ func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 	return c.Encrypt(data)
 }
 
+func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint64, error) {
+	t.cipherMux.RLock()
+	active := t.cipher
+	activeGen := t.cipherGen
+	prev := t.prevCipher
+	prevGen := t.prevCipherGen
+	exp := t.prevCipherExp
+	t.cipherMux.RUnlock()
+
+	var activeErr error
+	if active != nil {
+		if plain, err := active.Decrypt(data); err == nil {
+			if prev != nil && t.isPrevCipherActive(prev) {
+				t.deactivatePrevCipher(prev, "new key confirmed in use")
+			}
+			return plain, active, activeGen, nil
+		} else {
+			activeErr = err
+		}
+	}
+
+	if prev != nil {
+		if time.Now().After(exp) && t.isPrevCipherActive(prev) {
+			t.deactivatePrevCipher(prev, "grace period expired")
+		} else if plain, err := prev.Decrypt(data); err == nil {
+			return plain, prev, prevGen, nil
+		}
+	}
+
+	if activeErr != nil {
+		return nil, nil, 0, activeErr
+	}
+	return nil, nil, 0, errors.New("decryption failed")
+}
+
 // decryptPacket decrypts a packet if cipher is available
 func (t *Tunnel) decryptPacket(data []byte) ([]byte, error) {
-	t.cipherMux.RLock()
-	c := t.cipher
-	t.cipherMux.RUnlock()
-	if c == nil {
-		return data, nil
+	plain, _, _, err := t.decryptWithFallback(data)
+	return plain, err
+}
+
+func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, uint64, error) {
+	return t.decryptWithFallback(data)
+}
+
+func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
+	if client != nil {
+		if c, _ := client.getCipher(); c != nil {
+			return c.Encrypt(data)
+		}
 	}
-	return c.Decrypt(data)
+	return t.encryptPacket(data)
+}
+
+func (t *Tunnel) isPrevCipherActive(prev *crypto.Cipher) bool {
+	t.cipherMux.RLock()
+	defer t.cipherMux.RUnlock()
+	return prev != nil && t.prevCipher == prev
+}
+
+func (t *Tunnel) deactivatePrevCipher(prev *crypto.Cipher, reason string) {
+	if prev == nil {
+		return
+	}
+
+	t.cipherMux.Lock()
+	prevGen := t.prevCipherGen
+	if t.prevCipher != prev {
+		t.cipherMux.Unlock()
+		return
+	}
+	t.prevCipher = nil
+	t.prevCipherGen = 0
+	t.prevCipherExp = time.Time{}
+	t.cipherMux.Unlock()
+
+	t.allClientsMux.RLock()
+	clients := make([]*ClientConnection, 0, len(t.allClients))
+	for client := range t.allClients {
+		clients = append(clients, client)
+	}
+	t.allClientsMux.RUnlock()
+
+	for _, client := range clients {
+		if _, gen := client.getCipher(); gen != 0 && gen == prevGen {
+			client.stopOnce.Do(func() {
+				_ = client.conn.Close()
+				close(client.stopCh)
+			})
+		}
+	}
+
+	log.Printf("Deactivated previous cipher (%s)", reason)
 }
 
 // registerServerPeer seeds the routing table with the server endpoint so stats
@@ -2214,6 +2367,9 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 	if newKey == "" {
 		return errors.New("new key is empty")
 	}
+	if len(newKey) < 16 {
+		return errors.New("new key must be at least 16 characters")
+	}
 	newCipher, err := crypto.NewCipher(newKey)
 	if err != nil {
 		return err
@@ -2223,9 +2379,51 @@ func (t *Tunnel) rotateCipher(newKey string) error {
 	t.configMux.Unlock()
 
 	t.cipherMux.Lock()
+	oldCipher := t.cipher
+	oldGen := t.cipherGen
 	t.cipher = newCipher
+	t.cipherGen++
+	if oldCipher != nil {
+		t.prevCipher = oldCipher
+		t.prevCipherGen = oldGen
+		t.prevCipherExp = time.Now().Add(KeyRotationGracePeriod)
+	} else {
+		t.prevCipher = nil
+		t.prevCipherGen = 0
+		t.prevCipherExp = time.Time{}
+	}
 	t.cipherMux.Unlock()
+
+	if oldCipher != nil {
+		go t.expirePrevCipher(oldCipher)
+	}
+
+	t.persistKeyToConfigFile(newKey)
 	return nil
+}
+
+func (t *Tunnel) persistKeyToConfigFile(newKey string) {
+	path := t.configFilePath
+	if path == "" {
+		return
+	}
+
+	if err := config.UpdateConfigKey(path, newKey); err != nil {
+		log.Printf("Failed to update config file with new key: %v", err)
+		return
+	}
+
+	log.Printf("Updated config file (%s) with rotated key", filepath.Base(path))
+}
+
+func (t *Tunnel) expirePrevCipher(prev *crypto.Cipher) {
+	timer := time.NewTimer(KeyRotationGracePeriod)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		t.deactivatePrevCipher(prev, "grace period expired")
+	case <-t.stopCh:
+	}
 }
 
 // reannounceP2PInfoAfterReconnect re-announces P2P info after reconnection with retry logic
@@ -2348,7 +2546,7 @@ func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	copy(fullPacket[1:], []byte(publicAddrStr))
 
 	// Encrypt the packet (don't rely on clientNetWriter since this is not a data packet)
-	encryptedPacket, err := t.encryptPacket(fullPacket)
+	encryptedPacket, err := t.encryptForClient(client, fullPacket)
 	if err != nil {
 		log.Printf("Failed to encrypt public address: %v", err)
 		return
@@ -2411,21 +2609,21 @@ func (t *Tunnel) pushConfigUpdate() error {
 	fullPacket[0] = PacketTypeConfigUpdate
 	copy(fullPacket[1:], payload)
 
-	encryptedPacket, err := t.encryptPacket(fullPacket)
-	if err != nil {
-		return fmt.Errorf("failed to encrypt config update: %w", err)
-	}
-
 	// Snapshot clients to avoid holding lock during network IO
-	t.clientsMux.RLock()
-	clients := make([]*ClientConnection, 0, len(t.clients))
-	for _, c := range t.clients {
+	t.allClientsMux.RLock()
+	clients := make([]*ClientConnection, 0, len(t.allClients))
+	for c := range t.allClients {
 		clients = append(clients, c)
 	}
-	t.clientsMux.RUnlock()
+	t.allClientsMux.RUnlock()
 
 	for _, client := range clients {
 		if client == nil {
+			continue
+		}
+		encryptedPacket, err := t.encryptForClient(client, fullPacket)
+		if err != nil {
+			log.Printf("Failed to encrypt config update for client: %v", err)
 			continue
 		}
 		if err := client.conn.WritePacket(encryptedPacket); err != nil {
@@ -2433,28 +2631,13 @@ func (t *Tunnel) pushConfigUpdate() error {
 		}
 	}
 
-	// Disconnect clients to force reconnect with new key
-	for _, client := range clients {
-		client.stopOnce.Do(func() {
-			select {
-			case <-client.stopCh:
-				return
-			default:
-			}
-			if err := client.conn.Close(); err != nil {
-				log.Printf("Error closing client during rotation: %v", err)
-			}
-			close(client.stopCh)
-		})
-	}
-
-	// Allow in-flight disconnects to settle before rotating cipher
-	time.Sleep(KeyRotationSettleTime)
-
-	// Rotate server cipher after clients are disconnected to avoid decrypt mismatches
+	// Rotate server cipher while keeping existing connections. The previous cipher
+	// remains active for the grace period, allowing in-flight packets from
+	// clients that have not yet switched keys to be decrypted seamlessly.
 	if err := t.rotateCipher(newKey); err != nil {
 		return fmt.Errorf("failed to rotate cipher: %w", err)
 	}
+
 	log.Printf("Rotated tunnel key and pushed new config to %d client(s)", len(clients))
 
 	return nil
@@ -2473,7 +2656,7 @@ func (t *Tunnel) handleConfigUpdate(payload []byte) {
 		return
 	}
 
-	log.Printf("Received config update with new key; rotating cipher and reconnecting...")
+	log.Printf("Received config update with new key; rotating cipher without reconnect...")
 
 	if len(msg.Routes) > 0 {
 		t.configMux.Lock()
@@ -2487,15 +2670,6 @@ func (t *Tunnel) handleConfigUpdate(payload []byte) {
 		return
 	}
 
-	// Force reconnection with new key
-	t.connMux.Lock()
-	if t.conn != nil {
-		if err := t.conn.Close(); err != nil {
-			log.Printf("Error closing connection during key rotation: %v", err)
-		}
-		t.conn = nil
-	}
-	t.connMux.Unlock()
 }
 
 func generateRandomKey() (string, error) {
@@ -2517,19 +2691,17 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(peerInfo))
 
-	// Encrypt
-	encryptedPacket, err := t.encryptPacket(fullPacket)
-	if err != nil {
-		log.Printf("Failed to encrypt peer info for broadcast: %v", err)
-		return
-	}
-
 	// Broadcast to all clients except the sender and also send a PUNCH control to prompt simultaneous hole-punching
 	t.clientsMux.RLock()
 	defer t.clientsMux.RUnlock()
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(newClientIP) {
 			// Send peer info to existing client
+			encryptedPacket, err := t.encryptForClient(client, fullPacket)
+			if err != nil {
+				log.Printf("Failed to encrypt peer info for broadcast: %v", err)
+				continue
+			}
 			if err := client.conn.WritePacket(encryptedPacket); err != nil {
 				log.Printf("Failed to broadcast peer info to %s: %v", client.clientIP, err)
 				client.stopOnce.Do(func() { close(client.stopCh) })
@@ -2541,7 +2713,7 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 			punchPacket := make([]byte, len(peerInfo)+1)
 			punchPacket[0] = PacketTypePunch
 			copy(punchPacket[1:], []byte(peerInfo))
-			encryptedPunch, err := t.encryptPacket(punchPacket)
+			encryptedPunch, err := t.encryptForClient(client, punchPacket)
 			if err == nil {
 				if err := client.conn.WritePacket(encryptedPunch); err != nil {
 					log.Printf("Failed to send PUNCH to %s: %v", client.clientIP, err)
@@ -2560,18 +2732,17 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 				punchBack := make([]byte, len(clientInfo)+1)
 				punchBack[0] = PacketTypePunch
 				copy(punchBack[1:], []byte(clientInfo))
-				encryptedPunchBack, err := t.encryptPacket(punchBack)
-				if err == nil {
-					// Need to send to the new client's connection; find it by IP
-					if newClient := t.getClientByIP(newClientIP); newClient != nil {
+				if newClient := t.getClientByIP(newClientIP); newClient != nil {
+					encryptedPunchBack, err := t.encryptForClient(newClient, punchBack)
+					if err == nil {
 						if err := newClient.conn.WritePacket(encryptedPunchBack); err != nil {
 							log.Printf("Failed to send PUNCH back to new client %s: %v", newClientIP, err)
 						} else {
 							log.Printf("Sent PUNCH (existing %s) to new client %s", client.clientIP, newClientIP)
 						}
+					} else {
+						log.Printf("Failed to encrypt PUNCH back packet: %v", err)
 					}
-				} else {
-					log.Printf("Failed to encrypt PUNCH back packet: %v", err)
 				}
 			}
 		}
