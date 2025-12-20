@@ -37,6 +37,7 @@ type Config struct {
 	RouteUpdateInterval int  `json:"route_update_interval"` // Route quality check interval in seconds (default 30)
 	P2PTimeout          int  `json:"p2p_timeout"`           // P2P connection timeout in seconds (default 5)
 	EnableNATDetection  bool `json:"enable_nat_detection"`  // Enable automatic NAT type detection (default true)
+	EnableXDP           bool `json:"enable_xdp"`            // Enable lightweight XDP/eBPF fast-path classification
 }
 
 // DefaultConfig returns a default configuration
@@ -67,6 +68,7 @@ func DefaultConfig() *Config {
 		RouteUpdateInterval: 30,
 		P2PTimeout:          5,
 		EnableNATDetection:  true,
+		EnableXDP:           true,
 	}
 }
 
@@ -140,6 +142,9 @@ func LoadConfig(filename string) (*Config, error) {
 	}
 	if _, exists := rawConfig["enable_nat_detection"]; !exists {
 		config.EnableNATDetection = true
+	}
+	if _, exists := rawConfig["enable_xdp"]; !exists {
+		config.EnableXDP = true
 	}
 
 	return &config, nil

@@ -23,6 +23,7 @@ import (
 	"github.com/openbmx/lightweight-tunnel/pkg/nat"
 	"github.com/openbmx/lightweight-tunnel/pkg/p2p"
 	"github.com/openbmx/lightweight-tunnel/pkg/routing"
+	"github.com/openbmx/lightweight-tunnel/pkg/xdp"
 )
 
 const (
@@ -152,6 +153,8 @@ type Tunnel struct {
 
 	packetPool    *sync.Pool
 	packetBufSize int
+
+	xdpAccel *xdp.Accelerator
 
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
@@ -297,6 +300,15 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	if packetBufSize < packetBufferSlack {
 		packetBufSize = packetBufferSlack
 	}
+
+	var accel *xdp.Accelerator
+	if cfg.EnableXDP {
+		accel = xdp.NewAccelerator(true)
+		log.Println("✅ 启用 eBPF/XDP Fast Path：针对加密流量的快速分类")
+	} else {
+		log.Println("XDP Fast Path 已关闭，使用常规路径")
+	}
+
 	t := &Tunnel{
 		config:         cfg,
 		configFilePath: configFilePath,
@@ -307,6 +319,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		packetBufSize:  packetBufSize,
 		clientRoutes:   make(map[*ClientConnection][]string),
 		allClients:     make(map[*ClientConnection]struct{}),
+		xdpAccel:       accel,
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -2415,12 +2428,30 @@ func GetPeerIP(tunnelAddr string) (string, error) {
 	return fmt.Sprintf("%s/%s", ip4.String(), parts[1]), nil
 }
 
+func (t *Tunnel) shouldSkipOuterEncryption(data []byte) bool {
+	if len(data) < 1 || data[0] != PacketTypeData {
+		return false
+	}
+
+	classifier := func(pkt []byte) bool {
+		return isLikelyEncryptedTraffic(pkt)
+	}
+	ipPacket := data[1:]
+	if t.xdpAccel != nil {
+		return t.xdpAccel.Classify(ipPacket, classifier)
+	}
+	return classifier(ipPacket)
+}
+
 // encryptPacket encrypts a packet if cipher is available
 func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 	t.cipherMux.RLock()
 	c := t.cipher
 	t.cipherMux.RUnlock()
 	if c == nil {
+		return data, nil
+	}
+	if t.shouldSkipOuterEncryption(data) {
 		return data, nil
 	}
 	return c.Encrypt(data)
@@ -2455,6 +2486,10 @@ func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint6
 		}
 	}
 
+	if (active != nil || prev != nil) && isPlainPassThroughPacket(data) {
+		return data, nil, 0, nil
+	}
+
 	if activeErr != nil {
 		return nil, nil, 0, activeErr
 	}
@@ -2472,6 +2507,9 @@ func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, ui
 }
 
 func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
+	if t.shouldSkipOuterEncryption(data) {
+		return data, nil
+	}
 	if client != nil {
 		if c, _ := client.getCipher(); c != nil {
 			return c.Encrypt(data)
