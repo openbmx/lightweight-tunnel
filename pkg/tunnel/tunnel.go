@@ -50,6 +50,11 @@ const (
 	// Queue management constants
 	QueueSendTimeout = 100 * time.Millisecond // Timeout for queue send operations to handle temporary congestion
 
+	// Connection health constants
+	// IdleConnectionTimeout is the maximum time without receiving packets before considering connection dead
+	// Set to 3x the keepalive interval to allow for some packet loss
+	IdleConnectionTimeout = 30 * time.Second // 3x default keepalive (10s)
+
 	// Rotation and advertisement timing
 	KeyRotationGracePeriod     = 15 * time.Second
 	DefaultRouteAdvertInterval = 60 * time.Second
@@ -57,17 +62,17 @@ const (
 
 // ClientConnection represents a single client connection
 type ClientConnection struct {
-	conn      faketcp.ConnAdapter // Changed to interface for both UDP and Raw socket modes
-	sendQueue chan []byte
-	recvQueue chan []byte
-	clientIP  net.IP
-	stopCh    chan struct{}
-	stopOnce  sync.Once
-	wg        sync.WaitGroup
-	// lastPeerInfo stores the last peer info string sent by this client
-	lastPeerInfo string
+	conn         faketcp.ConnAdapter // Changed to interface for both UDP and Raw socket modes
+	sendQueue    chan []byte
+	recvQueue    chan []byte
+	clientIP     net.IP
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	wg           sync.WaitGroup
+	lastPeerInfo string         // Last peer info string sent by this client
 	cipher       *crypto.Cipher
 	cipherGen    uint64
+	lastRecvTime time.Time // Last time we received a packet from this client
 	mu           sync.RWMutex
 }
 
@@ -128,6 +133,10 @@ type Tunnel struct {
 	publicAddr    string                // Public address as seen by server (for NAT traversal)
 	publicAddrMux sync.RWMutex          // Protects publicAddr
 	connMux       sync.Mutex            // Protects t.conn during reconnects
+
+	// Connection health tracking (client mode)
+	lastRecvTime time.Time  // Last time we received ANY packet from server
+	lastRecvMux  sync.Mutex // Protects lastRecvTime
 
 	routeMux         sync.RWMutex
 	advertisedRoutes []clientRoute
@@ -963,11 +972,49 @@ func (t *Tunnel) tunWriter() {
 func (t *Tunnel) netReader() {
 	defer t.wg.Done()
 
+	// Initialize last receive time
+	t.lastRecvMux.Lock()
+	t.lastRecvTime = time.Now()
+	t.lastRecvMux.Unlock()
+
 	for {
 		select {
 		case <-t.stopCh:
 			return
 		default:
+		}
+
+		// Check for idle connection timeout before attempting read
+		t.lastRecvMux.Lock()
+		timeSinceLastRecv := time.Since(t.lastRecvTime)
+		t.lastRecvMux.Unlock()
+
+		if timeSinceLastRecv > IdleConnectionTimeout {
+			log.Printf("Connection idle for %v (threshold: %v), forcing reconnection...", 
+				timeSinceLastRecv, IdleConnectionTimeout)
+			
+			// Close and clear current connection
+			t.connMux.Lock()
+			if t.conn != nil {
+				_ = t.conn.Close()
+				t.conn = nil
+			}
+			t.connMux.Unlock()
+
+			// Reset last receive time before reconnecting
+			t.lastRecvMux.Lock()
+			t.lastRecvTime = time.Now()
+			t.lastRecvMux.Unlock()
+
+			// Attempt reconnection
+			if err := t.reconnectToServer(); err != nil {
+				// Only returns error when stopCh is closed
+				return
+			}
+
+			log.Printf("Reconnection successful after idle timeout")
+			t.reannounceP2PInfoAfterReconnect()
+			continue
 		}
 
 		// Ensure we have a live connection
@@ -977,11 +1024,15 @@ func (t *Tunnel) netReader() {
 				// reconnectToServer only returns error when stopCh is closed
 				return
 			}
+			// Reset last receive time after reconnection
+			t.lastRecvMux.Lock()
+			t.lastRecvTime = time.Now()
+			t.lastRecvMux.Unlock()
 		}
 
 		packet, err := t.conn.ReadPacket()
 		if err != nil {
-			// Check if it's a timeout - if so, continue to allow checking stopCh
+			// Check if it's a timeout - if so, continue to allow checking stopCh and idle timeout
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
@@ -1011,6 +1062,11 @@ func (t *Tunnel) netReader() {
 			// Successfully reconnected, continue reading
 			log.Printf("Reconnection successful, resuming packet reception")
 
+			// Reset last receive time after reconnection
+			t.lastRecvMux.Lock()
+			t.lastRecvTime = time.Now()
+			t.lastRecvMux.Unlock()
+
 			// Re-announce P2P info after reconnection to re-establish P2P connections
 			t.reannounceP2PInfoAfterReconnect()
 
@@ -1020,6 +1076,11 @@ func (t *Tunnel) netReader() {
 		if len(packet) < 1 {
 			continue
 		}
+
+		// Update last receive time for any packet received
+		t.lastRecvMux.Lock()
+		t.lastRecvTime = time.Now()
+		t.lastRecvMux.Unlock()
 
 		// Decrypt if cipher is available
 		decryptedPacket, err := t.decryptPacket(packet)
@@ -1245,6 +1306,11 @@ func (t *Tunnel) keepalive() {
 func (t *Tunnel) clientNetReader(client *ClientConnection) {
 	defer client.wg.Done()
 
+	// Initialize last receive time
+	client.mu.Lock()
+	client.lastRecvTime = time.Now()
+	client.mu.Unlock()
+
 	for {
 		select {
 		case <-t.stopCh:
@@ -1254,9 +1320,23 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		default:
 		}
 
+		// Check for idle connection timeout
+		client.mu.RLock()
+		timeSinceLastRecv := time.Since(client.lastRecvTime)
+		client.mu.RUnlock()
+
+		if timeSinceLastRecv > IdleConnectionTimeout {
+			log.Printf("Client connection from %s idle for %v (threshold: %v), closing...", 
+				client.conn.RemoteAddr(), timeSinceLastRecv, IdleConnectionTimeout)
+			client.stopOnce.Do(func() {
+				close(client.stopCh)
+			})
+			return
+		}
+
 		packet, err := client.conn.ReadPacket()
 		if err != nil {
-			// Check if it's a timeout - if so, continue to allow checking stopCh
+			// Check if it's a timeout - if so, continue to allow checking stopCh and idle timeout
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
@@ -1277,6 +1357,11 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		if len(packet) < 1 {
 			continue
 		}
+
+		// Update last receive time for any packet received
+		client.mu.Lock()
+		client.lastRecvTime = time.Now()
+		client.mu.Unlock()
 
 		// Decrypt if cipher is available (supports previous key during grace)
 		decryptedPacket, usedCipher, gen, err := t.decryptPacketForServer(packet)
