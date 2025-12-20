@@ -54,7 +54,7 @@ func TestAcceleratorFlushResetsCache(t *testing.T) {
 		t.Fatalf("expected first classification to return true")
 	}
 	accel.Flush()
-	if accel.Classify(packet, fallback) != false {
+	if accel.Classify(packet, fallback) {
 		t.Fatalf("expected fallback result after flush to be false")
 	}
 	if callCount != 2 {
