@@ -148,6 +148,9 @@ type Tunnel struct {
 	sendQueue      chan []byte // Used in client mode
 	recvQueue      chan []byte // Used in client mode
 
+	packetPool    *sync.Pool
+	packetBufSize int
+
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
 	routingTable  *routing.RoutingTable // Routing table
@@ -163,6 +166,37 @@ type Tunnel struct {
 	routeMux         sync.RWMutex
 	advertisedRoutes []clientRoute
 	clientRoutes     map[*ClientConnection][]string
+}
+
+func prependPacketType(packet []byte, packetType byte) ([]byte, bool) {
+	origLen := len(packet)
+	if cap(packet) > origLen {
+		packet = packet[:origLen+1]
+		copy(packet[1:], packet[:origLen])
+		packet[0] = packetType
+		return packet, true
+	}
+
+	newPacket := make([]byte, origLen+1)
+	newPacket[0] = packetType
+	copy(newPacket[1:], packet)
+	return newPacket, false
+}
+
+func (t *Tunnel) getPacketBuffer() []byte {
+	if t.packetPool == nil || t.packetBufSize == 0 {
+		return make([]byte, t.config.MTU+128)
+	}
+	return t.packetPool.Get().([]byte)
+}
+
+func (t *Tunnel) releasePacketBuffer(buf []byte) {
+	if t.packetPool == nil || t.packetBufSize == 0 {
+		return
+	}
+	if cap(buf) == t.packetBufSize {
+		t.packetPool.Put(buf[:t.packetBufSize])
+	}
 }
 
 // NewTunnel creates a new tunnel instance
@@ -250,6 +284,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		}
 	}
 
+	packetBufSize := cfg.MTU + 128
 	t := &Tunnel{
 		config:         cfg,
 		configFilePath: configFilePath,
@@ -257,8 +292,14 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		cipher:         cipher,
 		stopCh:         make(chan struct{}),
 		myTunnelIP:     myIP,
+		packetBufSize:  packetBufSize,
 		clientRoutes:   make(map[*ClientConnection][]string),
 		allClients:     make(map[*ClientConnection]struct{}),
+	}
+	t.packetPool = &sync.Pool{
+		New: func() any {
+			return make([]byte, packetBufSize)
+		},
 	}
 
 	if cipher != nil {
@@ -823,8 +864,6 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 func (t *Tunnel) tunReader() {
 	defer t.wg.Done()
 
-	buf := make([]byte, t.config.MTU+100)
-
 	for {
 		select {
 		case <-t.stopCh:
@@ -832,7 +871,9 @@ func (t *Tunnel) tunReader() {
 		default:
 		}
 
-		n, err := t.tunFile.Read(buf)
+		buf := t.getPacketBuffer()
+		readBuf := buf[:t.packetBufSize-1]
+		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
 			select {
 			case <-t.stopCh:
@@ -840,27 +881,32 @@ func (t *Tunnel) tunReader() {
 			default:
 				log.Printf("TUN read error: %v", err)
 			}
+			t.releasePacketBuffer(buf)
 			return
 		}
 
 		if n > 0 {
 			// Skip packets that are too small or not IPv4
 			if n < IPv4MinHeaderLen {
+				t.releasePacketBuffer(buf)
 				continue
 			}
 
 			// Check if packet is IPv4 (skip non-IPv4 packets like IPv6)
-			if buf[0]>>4 != IPv4Version {
+			if readBuf[0]>>4 != IPv4Version {
+				t.releasePacketBuffer(buf)
 				continue
 			}
 
-			// Copy packet data
-			packet := make([]byte, n)
-			copy(packet, buf[:n])
+			packet := readBuf[:n]
 
 			// Use intelligent routing if P2P is enabled
 			if t.config.P2PEnabled && t.routingTable != nil {
-				if err := t.sendPacketWithRouting(packet); err != nil {
+				queued, err := t.sendPacketWithRouting(packet)
+				if !queued {
+					t.releasePacketBuffer(packet)
+				}
+				if err != nil {
 					log.Printf("Failed to send packet: %v", err)
 				}
 			} else {
@@ -868,10 +914,12 @@ func (t *Tunnel) tunReader() {
 				if !enqueueWithTimeout(t.sendQueue, packet, t.stopCh) {
 					select {
 					case <-t.stopCh:
+						t.releasePacketBuffer(packet)
 						return
 					default:
 						log.Printf("Send queue full after timeout, dropping packet")
 					}
+					t.releasePacketBuffer(packet)
 				}
 			}
 		}
@@ -882,8 +930,6 @@ func (t *Tunnel) tunReader() {
 func (t *Tunnel) tunReaderServer() {
 	defer t.wg.Done()
 
-	buf := make([]byte, t.config.MTU+100)
-
 	for {
 		select {
 		case <-t.stopCh:
@@ -891,7 +937,9 @@ func (t *Tunnel) tunReaderServer() {
 		default:
 		}
 
-		n, err := t.tunFile.Read(buf)
+		buf := t.getPacketBuffer()
+		readBuf := buf[:t.packetBufSize-1]
+		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
 			select {
 			case <-t.stopCh:
@@ -899,21 +947,22 @@ func (t *Tunnel) tunReaderServer() {
 			default:
 				log.Printf("TUN read error: %v", err)
 			}
+			t.releasePacketBuffer(buf)
 			return
 		}
 
 		if n < IPv4MinHeaderLen {
+			t.releasePacketBuffer(buf)
 			continue
 		}
 
-		// Copy packet data
-		packet := make([]byte, n)
-		copy(packet, buf[:n])
+		packet := readBuf[:n]
 
 		// Parse destination IP from packet (IPv4)
 		// IP header: version(4 bits) + IHL(4 bits) + ... + dst IP (4 bytes starting at offset 16 for IPv4)
 		if packet[0]>>4 != IPv4Version {
 			// Not IPv4, skip
+			t.releasePacketBuffer(packet)
 			continue
 		}
 
@@ -936,15 +985,18 @@ func (t *Tunnel) tunReaderServer() {
 			select {
 			case client.sendQueue <- packet:
 			case <-t.stopCh:
+				t.releasePacketBuffer(packet)
 				return
 			case <-time.After(QueueSendTimeout):
 				// Wait for queue space before logging and dropping
 				select {
 				case client.sendQueue <- packet:
 				case <-t.stopCh:
+					t.releasePacketBuffer(packet)
 					return
 				default:
 					log.Printf("⚠️  Client send queue full for %s after timeout, dropping packet", dstIP)
+					t.releasePacketBuffer(packet)
 				}
 			}
 		} else {
@@ -953,16 +1005,21 @@ func (t *Tunnel) tunReaderServer() {
 				select {
 				case routeClient.sendQueue <- packet:
 				case <-t.stopCh:
+					t.releasePacketBuffer(packet)
 					return
 				case <-time.After(QueueSendTimeout):
 					select {
 					case routeClient.sendQueue <- packet:
 					case <-t.stopCh:
+						t.releasePacketBuffer(packet)
 						return
 					default:
 						log.Printf("⚠️  Route client queue full for %s after timeout, dropping packet", dstIP)
+						t.releasePacketBuffer(packet)
 					}
 				}
+			} else {
+				t.releasePacketBuffer(packet)
 			}
 		}
 		// If no client found, packet is dropped
@@ -1201,65 +1258,66 @@ func (t *Tunnel) netWriter() {
 		case <-t.stopCh:
 			return
 		case packet := <-t.sendQueue:
-			// Prepend packet type
-			fullPacket := make([]byte, len(packet)+1)
-			fullPacket[0] = PacketTypeData
-			copy(fullPacket[1:], packet)
+			func() {
+				defer t.releasePacketBuffer(packet)
 
-			// Encrypt if cipher is available
-			encryptedPacket, err := t.encryptPacket(fullPacket)
-			if err != nil {
-				log.Printf("Encryption error: %v", err)
-				continue
-			}
+				fullPacket, _ := prependPacketType(packet, PacketTypeData)
 
-			// Ensure we have a live connection before writing
-			if t.conn == nil {
-				if err := t.reconnectToServer(); err != nil {
-					// Only returns error when stopCh is closed
-					return
-				}
-			}
-
-			if err := t.conn.WritePacket(encryptedPacket); err != nil {
-				select {
-				case <-t.stopCh:
-					// Tunnel is stopping, no need to log
-					return
-				default:
-					log.Printf("Network write error: %v, attempting reconnection...", err)
-				}
-
-				// Close and clear connection then try to reconnect
-				t.connMux.Lock()
-				if t.conn != nil {
-					_ = t.conn.Close()
-					t.conn = nil
-				}
-				t.connMux.Unlock()
-
-				// Keep trying to reconnect - only exits if tunnel is stopping
-				if err := t.reconnectToServer(); err != nil {
-					// Only returns error when stopCh is closed
+				// Encrypt if cipher is available
+				encryptedPacket, err := t.encryptPacket(fullPacket)
+				if err != nil {
+					log.Printf("Encryption error: %v", err)
 					return
 				}
 
-				// Try writing once more after reconnect
-				log.Printf("Reconnection successful, retrying packet send")
-
-				// Re-announce P2P info after reconnection to re-establish P2P connections
-				t.reannounceP2PInfoAfterReconnect()
-
-				if t.conn != nil {
-					if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
-						log.Printf("Network write retry failed: %v, packet will be lost", err2)
-						// Don't return - continue processing queue
-						// Accept packet loss to maintain tunnel connectivity for subsequent packets.
-						// This is better than exiting the goroutine, which would prevent any future
-						// packets from being sent even after the connection is restored.
+				// Ensure we have a live connection before writing
+				if t.conn == nil {
+					if err := t.reconnectToServer(); err != nil {
+						// Only returns error when stopCh is closed
+						return
 					}
 				}
-			}
+
+				if err := t.conn.WritePacket(encryptedPacket); err != nil {
+					select {
+					case <-t.stopCh:
+						// Tunnel is stopping, no need to log
+						return
+					default:
+						log.Printf("Network write error: %v, attempting reconnection...", err)
+					}
+
+					// Close and clear connection then try to reconnect
+					t.connMux.Lock()
+					if t.conn != nil {
+						_ = t.conn.Close()
+						t.conn = nil
+					}
+					t.connMux.Unlock()
+
+					// Keep trying to reconnect - only exits if tunnel is stopping
+					if err := t.reconnectToServer(); err != nil {
+						// Only returns error when stopCh is closed
+						return
+					}
+
+					// Try writing once more after reconnect
+					log.Printf("Reconnection successful, retrying packet send")
+
+					// Re-announce P2P info after reconnection to re-establish P2P connections
+					t.reannounceP2PInfoAfterReconnect()
+
+					if t.conn != nil {
+						if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
+							log.Printf("Network write retry failed: %v, packet will be lost", err2)
+							// Don't return - continue processing queue
+							// Accept packet loss to maintain tunnel connectivity for subsequent packets.
+							// This is better than exiting the goroutine, which would prevent any future
+							// packets from being sent even after the connection is restored.
+						}
+					}
+				}
+			}()
 		}
 	}
 }
@@ -1524,32 +1582,32 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 		case <-client.stopCh:
 			return
 		case packet := <-client.sendQueue:
-			// Prepend packet type
-			fullPacket := make([]byte, len(packet)+1)
-			fullPacket[0] = PacketTypeData
-			copy(fullPacket[1:], packet)
+			func() {
+				defer t.releasePacketBuffer(packet)
 
-			// Encrypt if cipher is available
-			encryptedPacket, err := t.encryptForClient(client, fullPacket)
-			if err != nil {
-				log.Printf("Client encryption error: %v", err)
-				continue
-			}
+				fullPacket, _ := prependPacketType(packet, PacketTypeData)
 
-			if err := client.conn.WritePacket(encryptedPacket); err != nil {
-				select {
-				case <-t.stopCh:
-					// Tunnel is stopping, no need to log
-				case <-client.stopCh:
-					// Client already stopped, no need to log
-				default:
-					log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), err)
+				// Encrypt if cipher is available
+				encryptedPacket, err := t.encryptForClient(client, fullPacket)
+				if err != nil {
+					log.Printf("Client encryption error: %v", err)
+					return
 				}
-				client.stopOnce.Do(func() {
-					close(client.stopCh)
-				})
-				return
-			}
+
+				if err := client.conn.WritePacket(encryptedPacket); err != nil {
+					select {
+					case <-t.stopCh:
+						// Tunnel is stopping, no need to log
+					case <-client.stopCh:
+						// Client already stopped, no need to log
+					default:
+						log.Printf("Client network write error to %s: %v", client.conn.RemoteAddr(), err)
+					}
+					client.stopOnce.Do(func() {
+						close(client.stopCh)
+					})
+				}
+			}()
 		}
 	}
 }
@@ -2203,14 +2261,15 @@ func (t *Tunnel) deleteRoute(route string) {
 }
 
 // sendPacketWithRouting sends a packet using intelligent routing
-func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
+// Returns true when the packet is queued to the server send queue.
+func (t *Tunnel) sendPacketWithRouting(packet []byte) (bool, error) {
 	if len(packet) < IPv4MinHeaderLen {
-		return errors.New("packet too small")
+		return false, errors.New("packet too small")
 	}
 
 	// Parse destination IP
 	if packet[0]>>4 != IPv4Version {
-		return errors.New("not IPv4 packet")
+		return false, errors.New("not IPv4 packet")
 	}
 
 	dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
@@ -2243,7 +2302,7 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 						// Fall back to server
 						return t.sendViaServer(packet)
 					}
-					return nil
+					return false, nil
 				}
 				// P2P not connected despite direct route - update peer state
 				t.markPeerFallbackToServer(dstIP)
@@ -2263,22 +2322,22 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) error {
 
 // sendViaServer sends packet through the server connection
 // Uses timeout-based approach to handle queue congestion
-func (t *Tunnel) sendViaServer(packet []byte) error {
+func (t *Tunnel) sendViaServer(packet []byte) (bool, error) {
 	select {
 	case t.sendQueue <- packet:
-		return nil
+		return true, nil
 	case <-t.stopCh:
-		return errors.New("tunnel stopped")
+		return false, errors.New("tunnel stopped")
 	case <-time.After(QueueSendTimeout):
 		// Wait for queue space before giving up
 		// This handles temporary bursts without immediately dropping packets
 		select {
 		case t.sendQueue <- packet:
-			return nil
+			return true, nil
 		case <-t.stopCh:
-			return errors.New("tunnel stopped")
+			return false, errors.New("tunnel stopped")
 		default:
-			return errors.New("send queue full after timeout")
+			return false, errors.New("send queue full after timeout")
 		}
 	}
 }
