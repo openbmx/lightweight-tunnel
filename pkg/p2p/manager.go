@@ -330,11 +330,8 @@ func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo)
 	conn.IsLocalNetwork = false
 	m.mu.Unlock()
 	
-	// Perform handshake to public address (without defer since it's called as function)
-	// Note: performHandshake will not clear the flag since we have defer here
-	conn.mu.Lock()
-	conn.handshakeInProgress = true // Reset flag for the public handshake
-	conn.mu.Unlock()
+	// Perform handshake to public address directly (not via wrapper)
+	// The defer above will clear the flag when this function returns
 	m.performHandshakeInternal(conn, false)
 }
 
@@ -388,13 +385,21 @@ func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 	
 	// Phase 1: Initial rapid burst
 	for i := 0; i < HandshakeAttempts; i++ {
-		// Check if connection established before each packet (more responsive)
-		m.mu.RLock()
-		connected := m.isPeerConnected(conn.PeerIP.String())
-		m.mu.RUnlock()
-		if connected {
-			log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
-			return
+		// Check connection status every few iterations to reduce lock contention
+		// Check more frequently towards the end when connection is more likely established
+		checkInterval := HandshakeCheckInterval
+		if i > HandshakeAttempts/2 {
+			checkInterval = 2 // Check more frequently in second half
+		}
+		
+		if i > 0 && i%checkInterval == 0 {
+			m.mu.RLock()
+			connected := m.isPeerConnected(conn.PeerIP.String())
+			m.mu.RUnlock()
+			if connected {
+				log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
+				return
+			}
 		}
 		
 		conn.mu.Lock()
@@ -426,13 +431,15 @@ func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 		// Send another burst
 		log.Printf("Retry phase %d/%d for %s", retry+1, HandshakeContinuousRetries, conn.PeerIP)
 		for i := 0; i < HandshakeAttempts/2; i++ {
-			// Check connection status before each packet in retry phase too
-			m.mu.RLock()
-			connected := m.isPeerConnected(conn.PeerIP.String())
-			m.mu.RUnlock()
-			if connected {
-				log.Printf("P2P connection established during retry burst (retry %d, attempt %d)", retry+1, i+1)
-				return
+			// Check connection status every few packets in retry phase to reduce lock contention
+			if i > 0 && i%2 == 0 {
+				m.mu.RLock()
+				connected := m.isPeerConnected(conn.PeerIP.String())
+				m.mu.RUnlock()
+				if connected {
+					log.Printf("P2P connection established during retry burst (retry %d, attempt %d)", retry+1, i+1)
+					return
+				}
 			}
 			
 			conn.mu.Lock()
