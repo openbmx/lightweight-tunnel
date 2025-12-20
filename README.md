@@ -477,6 +477,28 @@ sudo ./lightweight-tunnel \
 }
 ```
 
+#### 服务端配置示例（含优化开关）
+
+**config-server.json**：
+
+```json
+{
+  "mode": "server",
+  "local_addr": "0.0.0.0:9000",
+  "tunnel_addr": "10.0.0.1/24",
+  "key": "请修改为您的强密钥",
+  "mtu": 0,
+  "tun_name": "tun0",
+  "routes": [],
+  "multi_client": true,
+  "max_clients": 100,
+  "client_isolation": false,
+  "enable_nat_detection": true,
+  "enable_xdp": true,
+  "enable_kernel_tune": true
+}
+```
+
 #### 使用配置文件运行
 
 ```bash
