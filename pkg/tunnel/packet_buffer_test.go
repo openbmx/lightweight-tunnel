@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
+	"unsafe"
 )
 
 func TestPrependPacketTypeInPlace(t *testing.T) {
@@ -14,7 +16,9 @@ func TestPrependPacketTypeInPlace(t *testing.T) {
 	if !reused {
 		t.Fatalf("expected in-place reuse when capacity allows")
 	}
-	if &out[0] != &buf[0] {
+	outHdr := (*reflect.SliceHeader)(unsafe.Pointer(&out))
+	bufHdr := (*reflect.SliceHeader)(unsafe.Pointer(&buf))
+	if outHdr.Data != bufHdr.Data {
 		t.Fatalf("expected slice to keep backing array after prepend")
 	}
 	if !bytes.Equal(out, []byte{0xAA, 0x1, 0x2, 0x3}) {
