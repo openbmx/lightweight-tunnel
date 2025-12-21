@@ -1074,44 +1074,31 @@ func (m *Manager) sendKeepalives() {
 			conn.mu.Unlock()
 			continue
 		}
-		
-		// Send keepalive to maintain NAT mapping
-		conn.lastKeepaliveTime = now
 		conn.mu.Unlock()
 		
+		// Send keepalive to maintain NAT mapping
 		_, err := m.listener.WriteToUDP(keepaliveMsg, conn.RemoteAddr)
 		if err != nil {
 			log.Printf("Keepalive send error to %s: %v", ipStr, err)
-
 			// Mark peer as disconnected so routing will not rely on an invalid P2P path
 			if peer != nil {
 				peer.SetConnected(false)
 			}
-
 			// Update connection backoff state to allow immediate retry
 			conn.mu.Lock()
 			conn.consecutiveFailures++
-			conn.nextHandshakeAttemptAt = time.Time{}
-			already := conn.handshakeInProgress
+			conn.nextHandshakeAttemptAt = time.Time{} // Allow immediate handshake retry
 			conn.mu.Unlock()
-
-			// Trigger an immediate handshake attempt in background if not already running
-			if !already {
-				go func(c *Connection) {
-					c.mu.Lock()
-					c.handshakeInProgress = true
-					c.mu.Unlock()
-
-					m.performHandshake(c, c.IsLocalNetwork)
-
-					c.mu.Lock()
-					c.handshakeInProgress = false
-					c.mu.Unlock()
-				}(conn)
-			}
+			continue
 		}
+		
+		// Update last keepalive time only after successful send
+		conn.mu.Lock()
+		conn.lastKeepaliveTime = now
+		conn.mu.Unlock()
 	}
 }
+
 
 // qualityMonitorLoop periodically checks connection quality and updates metrics
 func (m *Manager) qualityMonitorLoop() {
