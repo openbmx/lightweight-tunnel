@@ -12,13 +12,14 @@ import (
 
 const (
 	// HandshakeAttempts is the number of handshake packets to send in initial burst
-	// Increased from 5 to 20 for better NAT traversal success rate
-	HandshakeAttempts = 20
+	// Based on N2N recommendations: increased to 30 for better NAT traversal success rate
+	HandshakeAttempts = 30
 	// HandshakeInterval is the delay between handshake packets in initial burst
-	// Reduced from 200ms to 100ms for faster hole punching
-	HandshakeInterval = 100 * time.Millisecond
+	// Based on N2N recommendations: reduced to 50ms for faster simultaneous open
+	HandshakeInterval = 50 * time.Millisecond
 	// HandshakeContinuousRetries is the number of additional retry phases after initial burst
-	HandshakeContinuousRetries = 3
+	// Increased for symmetric NAT scenarios
+	HandshakeContinuousRetries = 5
 	// HandshakeRetryInterval is the delay between retry phases
 	HandshakeRetryInterval = 1 * time.Second
 	// HandshakeCheckInterval is how often to check connection status during handshake burst (first half)
@@ -30,7 +31,13 @@ const (
 	// LocalConnectionTimeout is the timeout to wait for local connection before trying public
 	LocalConnectionTimeout = 2 * time.Second
 	// KeepaliveInterval is the interval for sending keepalive packets to maintain NAT mappings
-	KeepaliveInterval = 15 * time.Second
+	// Based on N2N recommendations: reduced to 10s (configurable) for better NAT mapping persistence
+	KeepaliveInterval = 10 * time.Second
+	// FastKeepaliveInterval is used during connection establishment for aggressive NAT mapping
+	// Based on N2N: frequent keepalive during initial phase (3-5 seconds)
+	FastKeepaliveInterval = 3 * time.Second
+	// FastKeepaliveDuration is how long to use fast keepalive after connection establishment
+	FastKeepaliveDuration = 30 * time.Second
 	// ConnectionStaleTimeout is the timeout after which a connection is considered stale
 	ConnectionStaleTimeout = 60 * time.Second
 	// ConnectionStaleCheckThreshold is the fraction of stale timeout for quality fallback checks
@@ -40,12 +47,15 @@ const (
 	// QualityCheckCriticalThreshold is the quality score below which fallback to server is considered
 	QualityCheckCriticalThreshold = 30
 	// PortPredictionRange is the range of ports to try around known port for symmetric NAT
-	PortPredictionRange = 20
+	// Based on N2N recommendations: increased to 50 for better coverage
+	PortPredictionRange = 50
 	// PortPredictionSequentialRange is the range of sequential ports to prioritize
 	// Most NATs allocate ports sequentially, so try these first
-	PortPredictionSequentialRange = 5
+	PortPredictionSequentialRange = 10
+	// PortPredictionBidirectional enables trying both +/- offsets from known port
+	PortPredictionBidirectional = true
 	// MaxBackoffMultiplier is the maximum multiplier for exponential backoff (caps retry interval)
-	// Max interval = KeepaliveInterval * MaxBackoffMultiplier = 15s * 8 = 120s
+	// Max interval = KeepaliveInterval * MaxBackoffMultiplier = 10s * 8 = 80s
 	MaxBackoffMultiplier = 8
 )
 
@@ -64,6 +74,7 @@ type Connection struct {
 	lastReceivedTime        time.Time     // Last time data was received
 	estimatedRTT            time.Duration // Estimated round-trip time
 	handshakeStartTime      time.Time     // When handshake started (for RTT measurement)
+	connectionEstablishedAt time.Time     // When connection was established (for fast keepalive logic)
 	consecutiveFailures     int           // Number of consecutive failed handshake attempts
 	nextHandshakeAttemptAt  time.Time     // When next handshake attempt is allowed (for rate limiting)
 	handshakeInProgress     bool          // Whether a handshake goroutine is currently running
@@ -604,6 +615,18 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 			peer.SetLocalConnection(isLocalConnection)
 			if !alreadyConnected {
 				peer.SetConnected(true)
+				
+				// Set connection established time for fast keepalive logic
+				if conn, exists := m.connections[ipStr]; exists {
+					conn.mu.Lock()
+					if conn.connectionEstablishedAt.IsZero() {
+						conn.connectionEstablishedAt = time.Now()
+						log.Printf("P2P connection established to %s, enabling fast keepalive for %v", 
+							ipStr, FastKeepaliveDuration)
+					}
+					conn.mu.Unlock()
+				}
+				
 				if isLocalConnection {
 					log.Printf("P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
 				} else {
@@ -961,6 +984,7 @@ func (m *Manager) keepaliveLoop() {
 
 // sendKeepalives sends keepalive packets to all connected peers
 // Also sends periodic handshakes to not-yet-connected peers (continuous handshake mode)
+// Based on N2N recommendations: uses adaptive keepalive intervals
 func (m *Manager) sendKeepalives() {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1002,7 +1026,8 @@ func (m *Manager) sendKeepalives() {
 				log.Printf("Continuous handshake send error to %s: %v", ipStr, err)
 			}
 			
-			// Update rate limiting with exponential backoff: 15s, 30s, 60s, 120s (capped)
+			// Update rate limiting with exponential backoff: 10s, 20s, 40s, 80s (capped)
+			// Based on updated KeepaliveInterval (10s instead of 15s)
 			conn.mu.Lock()
 			conn.consecutiveFailures++
 			backoffMultiplier := 1 << uint(failures) // 2^failures
@@ -1032,8 +1057,25 @@ func (m *Manager) sendKeepalives() {
 			continue
 		}
 		
-		// Send keepalive to maintain NAT mapping
+		// Determine appropriate keepalive interval based on connection age
+		// Based on N2N recommendations: use fast keepalive (3s) during initial phase (first 30s)
 		conn.mu.Lock()
+		keepaliveInterval := m.keepaliveInterval
+		if !conn.connectionEstablishedAt.IsZero() {
+			timeSinceEstablished := now.Sub(conn.connectionEstablishedAt)
+			if timeSinceEstablished < FastKeepaliveDuration {
+				// Use fast keepalive for newly established connections
+				keepaliveInterval = FastKeepaliveInterval
+			}
+		}
+		
+		// Check if it's time to send a keepalive (respect adaptive interval)
+		if now.Sub(conn.lastKeepaliveTime) < keepaliveInterval {
+			conn.mu.Unlock()
+			continue
+		}
+		
+		// Send keepalive to maintain NAT mapping
 		conn.lastKeepaliveTime = now
 		conn.mu.Unlock()
 		
