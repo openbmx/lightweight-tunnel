@@ -2858,9 +2858,6 @@ func (t *Tunnel) retryAnnouncePeerInfo() {
 	for retries < maxRetries {
 		// Wait with exponential backoff
 		backoffSeconds := 1 << uint(retries) // 1, 2, 4, 8, 16 seconds
-		if backoffSeconds > 16 {
-			backoffSeconds = 16
-		}
 		
 		select {
 		case <-time.After(time.Duration(backoffSeconds) * time.Second):
@@ -3080,8 +3077,11 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 		// This helps in case peer info was not announced due to network issues
 		// Wait a bit and retry (peer info should arrive soon after NAT detection)
 		go func() {
+			// Limit to prevent infinite recursion
+			const maxWaitAttempts = 10
+			
 			// Wait for peer info to become available (up to 10 seconds)
-			for attempt := 0; attempt < 10; attempt++ {
+			for attempt := 0; attempt < maxWaitAttempts; attempt++ {
 				time.Sleep(1 * time.Second)
 				
 				// Re-check peer info
@@ -3094,13 +3094,37 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 				targetClient.mu.RUnlock()
 				
 				if reqInfo != "" && tgtInfo != "" {
-					log.Printf("Peer info now available, retrying P2P request from %s to %s", requestingIP, targetIP)
-					// Recursive call with now-available peer info
-					t.handleP2PRequest(requestingClient, payload)
+					log.Printf("Peer info now available after %d seconds, processing P2P request from %s to %s", 
+						attempt+1, requestingIP, targetIP)
+					
+					// Process the request now that peer info is available
+					// Note: We reconstruct the logic here instead of recursive call to avoid recursion issues
+					requestingNAT := t.parseNATTypeFromPeerInfo(reqInfo)
+					targetNAT := t.parseNATTypeFromPeerInfo(tgtInfo)
+					
+					var initiator, responder *ClientConnection
+					var initiatorPeerInfo, responderPeerInfo string
+					
+					if requestingNAT.ShouldInitiateConnection(targetNAT) {
+						initiator = requestingClient
+						responder = targetClient
+						initiatorPeerInfo = reqInfo
+						responderPeerInfo = tgtInfo
+					} else {
+						initiator = targetClient
+						responder = requestingClient
+						initiatorPeerInfo = tgtInfo
+						responderPeerInfo = reqInfo
+					}
+					
+					// Send peer info to both clients for hole punching
+					t.sendPeerInfoAndPunch(initiator, responderPeerInfo)
+					t.sendPeerInfoAndPunch(responder, initiatorPeerInfo)
 					return
 				}
 			}
-			log.Printf("Timeout waiting for peer info for P2P request from %s to %s", requestingIP, targetIP)
+			log.Printf("Timeout waiting for peer info for P2P request from %s to %s after %d seconds", 
+				requestingIP, targetIP, maxWaitAttempts)
 		}()
 		return
 	}

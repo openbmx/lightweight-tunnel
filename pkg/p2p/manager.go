@@ -126,15 +126,10 @@ func (m *Manager) Start() error {
 	
 	log.Printf("P2P manager listening on UDP port %d", m.localPort)
 	
-	// Try to configure UPnP port forwarding (best-effort, non-blocking)
-	// This improves P2P connectivity when behind NAT routers that support UPnP
-	go func() {
-		log.Printf("Attempting UPnP port forwarding for P2P port %d...", m.localPort)
-		// Note: UPnP implementation is basic and may not work on all routers
-		// Full UPnP/IGD support would require additional libraries
-		// For production use, consider integrating github.com/huin/goupnp
-		log.Printf("UPnP: Basic discovery will be attempted (full IGD implementation not included)")
-	}()
+	// Note: UPnP automatic port forwarding is not fully implemented yet
+	// Gateway discovery works, but full IGD port mapping requires additional libraries
+	// For production use with UPnP, integrate github.com/huin/goupnp
+	// Manual port forwarding or STUN/hole-punching remains the primary method
 	
 	// Start packet receiver
 	m.wg.Add(1)
