@@ -14,9 +14,9 @@ func TestTCPHeaderSerialization(t *testing.T) {
 		seqNum:  1000,
 		ackNum:  2000,
 	}
-	
+
 	header := conn.buildTCPHeader(100)
-	
+
 	if header.SrcPort != 12345 {
 		t.Errorf("Expected SrcPort 12345, got %d", header.SrcPort)
 	}
@@ -38,16 +38,16 @@ func TestTCPHeaderParseAndSerialize(t *testing.T) {
 		seqNum:  1000,
 		ackNum:  2000,
 	}
-	
+
 	originalHeader := conn.buildTCPHeader(100)
 	serialized := conn.serializeTCPHeader(originalHeader)
-	
+
 	if len(serialized) != TCPHeaderSize {
 		t.Errorf("Expected serialized header size %d, got %d", TCPHeaderSize, len(serialized))
 	}
-	
+
 	parsedHeader := parseTCPHeader(serialized)
-	
+
 	if parsedHeader.SrcPort != originalHeader.SrcPort {
 		t.Errorf("SrcPort mismatch: expected %d, got %d", originalHeader.SrcPort, parsedHeader.SrcPort)
 	}
@@ -72,13 +72,13 @@ func TestDialAndListen(t *testing.T) {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
 	defer listener.Close()
-	
+
 	listenerAddr := listener.Addr().String()
 	t.Logf("Listener started on %s", listenerAddr)
-	
+
 	// Test data
 	testData := []byte("Hello, fake TCP!")
-	
+
 	// Start server goroutine
 	serverDone := make(chan error, 1)
 	go func() {
@@ -89,7 +89,7 @@ func TestDialAndListen(t *testing.T) {
 			return
 		}
 		t.Log("Server: connection accepted")
-		
+
 		// Read packet
 		t.Log("Server: reading packet...")
 		data, err := conn.ReadPacket()
@@ -98,12 +98,12 @@ func TestDialAndListen(t *testing.T) {
 			return
 		}
 		t.Logf("Server: received %d bytes", len(data))
-		
+
 		if !bytes.Equal(data, testData) {
 			serverDone <- fmt.Errorf("data mismatch: expected %s, got %s", testData, data)
 			return
 		}
-		
+
 		// Echo back
 		t.Log("Server: echoing packet...")
 		err = conn.WritePacket(data)
@@ -112,13 +112,13 @@ func TestDialAndListen(t *testing.T) {
 			return
 		}
 		t.Log("Server: done")
-		
+
 		serverDone <- nil
 	}()
-	
+
 	// Give server time to start
 	time.Sleep(200 * time.Millisecond)
-	
+
 	// Client connects
 	t.Logf("Client: dialing %s...", listenerAddr)
 	conn, err := Dial(listenerAddr, 5*time.Second)
@@ -127,7 +127,7 @@ func TestDialAndListen(t *testing.T) {
 	}
 	defer conn.Close()
 	t.Log("Client: connected")
-	
+
 	// Send data
 	t.Log("Client: sending packet...")
 	err = conn.WritePacket(testData)
@@ -135,7 +135,7 @@ func TestDialAndListen(t *testing.T) {
 		t.Fatalf("Failed to write packet: %v", err)
 	}
 	t.Log("Client: packet sent")
-	
+
 	// Read echo
 	t.Log("Client: reading echo...")
 	receivedData, err := conn.ReadPacket()
@@ -143,11 +143,11 @@ func TestDialAndListen(t *testing.T) {
 		t.Fatalf("Failed to read packet: %v", err)
 	}
 	t.Logf("Client: received %d bytes", len(receivedData))
-	
+
 	if !bytes.Equal(receivedData, testData) {
 		t.Errorf("Echo data mismatch: expected %s, got %s", testData, receivedData)
 	}
-	
+
 	// Wait for server
 	t.Log("Waiting for server...")
 	select {
@@ -166,29 +166,29 @@ func TestSequenceNumberIncrement(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 	defer conn.Close()
-	
+
 	initialSeq := conn.seqNum
-	
+
 	testData := []byte("test")
 	// We can't actually send without a server, but we can test the sequence logic
 	// by directly calling the methods
-	
+
 	conn.mu.Lock()
 	header := conn.buildTCPHeader(len(testData))
 	conn.mu.Unlock()
-	
+
 	if header.SeqNum != initialSeq {
 		t.Errorf("Expected SeqNum %d, got %d", initialSeq, header.SeqNum)
 	}
-	
+
 	// After sending, sequence number should increment
 	expectedNewSeq := initialSeq + uint32(len(testData))
-	
+
 	conn.mu.Lock()
 	conn.seqNum += uint32(len(testData))
 	newSeq := conn.seqNum
 	conn.mu.Unlock()
-	
+
 	if newSeq != expectedNewSeq {
 		t.Errorf("Expected new SeqNum %d, got %d", expectedNewSeq, newSeq)
 	}
@@ -200,14 +200,14 @@ func TestMaxPayloadSize(t *testing.T) {
 		t.Fatalf("Failed to dial: %v", err)
 	}
 	defer conn.Close()
-	
+
 	// Test with data that's too large
 	largeData := make([]byte, MaxPayloadSize+1)
 	err = conn.WritePacket(largeData)
 	if err == nil {
 		t.Error("Expected error for oversized packet, got nil")
 	}
-	
+
 	// Test with maximum allowed size
 	maxData := make([]byte, MaxPayloadSize)
 	// This will fail to send without a server, but should pass size check
@@ -215,5 +215,64 @@ func TestMaxPayloadSize(t *testing.T) {
 	// The error will be from sending, not from size check
 	if err != nil && err.Error() == "packet too large" {
 		t.Error("MaxPayloadSize should be acceptable")
+	}
+}
+
+// Ensure a closed server-side connection does not block new sessions from the same peer.
+func TestClosedConnectionAllowsNewSession(t *testing.T) {
+	listener, err := Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	client, err := Dial(listener.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer client.Close()
+
+	// Accept initial connection then close it to simulate idle timeout cleanup.
+	firstConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Failed to accept initial connection: %v", err)
+	}
+	if err := firstConn.Close(); err != nil {
+		t.Fatalf("Failed to close initial connection: %v", err)
+	}
+
+	// Give the listener a moment to record the closed state.
+	time.Sleep(ChannelCloseDelay + 50*time.Millisecond)
+
+	acceptCh := make(chan *Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		acceptCh <- conn
+	}()
+
+	payload := []byte("reconnect")
+	if err := client.WritePacket(payload); err != nil {
+		t.Fatalf("Failed to send payload after close: %v", err)
+	}
+
+	select {
+	case conn := <-acceptCh:
+		defer conn.Close()
+		data, err := conn.ReadPacket()
+		if err != nil {
+			t.Fatalf("Failed to read payload on new session: %v", err)
+		}
+		if !bytes.Equal(data, payload) {
+			t.Fatalf("Payload mismatch on new session: expected %s, got %s", payload, data)
+		}
+	case err := <-errCh:
+		t.Fatalf("Second accept failed: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Timeout waiting for reconnection after closed entry")
 	}
 }

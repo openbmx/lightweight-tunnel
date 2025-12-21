@@ -177,6 +177,15 @@ func (l *Listener) dispatch() {
 		conn, exists := l.connMap[connKey]
 		l.mu.RUnlock()
 
+		// Drop stale closed connection entries so new traffic can recreate connections
+		if exists && atomic.LoadInt32(&conn.closed) != 0 {
+			l.mu.Lock()
+			delete(l.connMap, connKey)
+			l.mu.Unlock()
+			conn = nil
+			exists = false
+		}
+
 		if !exists {
 			conn = l.createConnection(remoteAddr, tcpHeader)
 			if conn == nil {

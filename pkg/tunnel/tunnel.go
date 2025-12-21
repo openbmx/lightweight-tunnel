@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -467,6 +468,9 @@ func (t *Tunnel) Start() error {
 func (t *Tunnel) Stop() {
 	// Use sync.Once to ensure Stop() logic only runs once
 	t.stopOnce.Do(func() {
+		// Signal all tunnel goroutines to stop as early as possible
+		close(t.stopCh)
+
 		// Close TUN device FIRST - this will unblock Read/Write operations
 		if t.tunFile != nil {
 			if err := t.tunFile.Close(); err != nil {
@@ -487,9 +491,6 @@ func (t *Tunnel) Stop() {
 				log.Printf("Error closing connection: %v", err)
 			}
 		}
-
-		// Signal all tunnel goroutines to stop
-		close(t.stopCh)
 
 		// Close all client connections and signal client goroutines (server mode)
 		t.clientsMux.Lock()
@@ -904,6 +905,10 @@ func (t *Tunnel) tunReader() {
 		readBuf := buf[:t.packetBufSize-1]
 		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
+			if errors.Is(err, syscall.EBADF) {
+				t.releasePacketBuffer(buf)
+				return
+			}
 			select {
 			case <-t.stopCh:
 				// Tunnel is stopping, no need to log
@@ -970,6 +975,10 @@ func (t *Tunnel) tunReaderServer() {
 		readBuf := buf[:t.packetBufSize-1]
 		n, err := t.tunFile.Read(readBuf)
 		if err != nil {
+			if errors.Is(err, syscall.EBADF) {
+				t.releasePacketBuffer(buf)
+				return
+			}
 			select {
 			case <-t.stopCh:
 				// Tunnel is stopping, no need to log

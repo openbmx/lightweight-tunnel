@@ -609,6 +609,13 @@ func (l *ListenerRaw) acceptLoop() {
 		l.mu.Lock()
 		conn, exists := l.connMap[connKey]
 
+		// Remove stale closed connection entries to allow reconnection from the same peer
+		if exists && atomic.LoadInt32(&conn.closed) != 0 {
+			delete(l.connMap, connKey)
+			conn = nil
+			exists = false
+		}
+
 		// 1. 处理新连接的SYN
 		if !exists && (flags&SYN != 0) && (flags&ACK == 0) {
 			isn, _ := randomUint32()
