@@ -535,6 +535,8 @@ const (
 	staleConnectionTimeout = 60 * time.Second
 	// cleanupInterval defines how often to run the connection cleanup
 	cleanupInterval = 30 * time.Second
+	// shutdownTimeout is the maximum time to wait for goroutines during listener shutdown
+	shutdownTimeout = 3 * time.Second
 )
 
 // ListenRaw creates a raw socket listener
@@ -857,7 +859,7 @@ func (l *ListenerRaw) Close() error {
 	select {
 	case <-done:
 		// All goroutines finished cleanly
-	case <-time.After(3 * time.Second):
+	case <-time.After(shutdownTimeout):
 		log.Printf("Timeout waiting for listener goroutines to stop; continuing shutdown")
 	}
 
