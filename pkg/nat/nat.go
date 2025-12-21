@@ -232,28 +232,29 @@ func bytesInRange(ip, start, end net.IP) bool {
 		return false
 	}
 
-	// Compare IP addresses byte by byte in big-endian order
-	// IP >= start
+	// Check if IP >= start (compare byte by byte in big-endian order)
 	for i := range ip {
+		if ip[i] > start[i] {
+			break // IP is definitely >= start
+		}
 		if ip[i] < start[i] {
 			return false // IP is less than start
 		}
-		if ip[i] > start[i] {
-			break // IP is definitely >= start, move to end check
-		}
-		// If ip[i] == start[i], continue to next byte
 	}
+	// If we get here without returning false,
+	// then IP >= start (either broke early because IP > start, or IP == start)
 
-	// IP <= end
+	// Check if IP <= end (compare byte by byte in big-endian order)
 	for i := range ip {
-		if ip[i] > end[i] {
-			return false // IP is greater than end
-		}
 		if ip[i] < end[i] {
 			break // IP is definitely <= end
 		}
-		// If ip[i] == end[i], continue to next byte
+		if ip[i] > end[i] {
+			return false // IP is greater than end
+		}
 	}
+	// If we get here without returning false,
+	// then IP <= end (either broke early because IP < end, or IP == end)
 
 	return true
 }

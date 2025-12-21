@@ -80,14 +80,9 @@ func (c *STUNClient) Query(localAddr *net.UDPAddr, changeIP, changePort bool) (*
 		return nil, fmt.Errorf("failed to resolve STUN server: %v", err)
 	}
 
-	// Create UDP connection
-	// Use ListenUDP if we need to specify local address, or DialUDP with server address
-	var conn *net.UDPConn
-	if localAddr != nil {
-		conn, err = net.ListenUDP("udp4", localAddr)
-	} else {
-		conn, err = net.DialUDP("udp4", nil, serverUDPAddr)
-	}
+	// Use ListenUDP for consistent connection handling
+	// This allows us to optionally bind to a specific local address
+	conn, err := net.ListenUDP("udp4", localAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create UDP connection: %v", err)
 	}
@@ -105,17 +100,10 @@ func (c *STUNClient) Query(localAddr *net.UDPAddr, changeIP, changePort bool) (*
 	// Set deadline
 	conn.SetDeadline(time.Now().Add(c.timeout))
 
-	// Send request
-	var sendErr error
-	if localAddr != nil {
-		// Using ListenUDP, so need WriteToUDP with explicit address
-		_, sendErr = conn.WriteToUDP(request, serverUDPAddr)
-	} else {
-		// Using DialUDP, connection is already bound to server
-		_, sendErr = conn.Write(request)
-	}
-	if sendErr != nil {
-		return nil, fmt.Errorf("failed to send STUN request: %v", sendErr)
+	// Send request to server
+	_, err = conn.WriteToUDP(request, serverUDPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send STUN request: %v", err)
 	}
 
 	// Receive response
