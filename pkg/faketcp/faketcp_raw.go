@@ -38,8 +38,9 @@ type ConnRaw struct {
 	iptablesMgr   *iptables.IPTablesManager
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
-	isListener    bool // true表示这是listener接受的连接，不需要启动recvLoop
-	ownsResources bool // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
+	isListener    bool      // true表示这是listener接受的连接，不需要启动recvLoop
+	ownsResources bool      // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
+	lastActivity  time.Time // Last time this connection had activity (for cleanup)
 }
 
 // NewConnRaw creates a new raw socket connection
@@ -529,6 +530,13 @@ type ListenerRaw struct {
 	wg          sync.WaitGroup
 }
 
+const (
+	// staleConnectionTimeout defines how long a connection can be idle before being cleaned up
+	staleConnectionTimeout = 60 * time.Second
+	// cleanupInterval defines how often to run the connection cleanup
+	cleanupInterval = 30 * time.Second
+)
+
 // ListenRaw creates a raw socket listener
 func ListenRaw(addr string) (*ListenerRaw, error) {
 	host, portStr, err := net.SplitHostPort(addr)
@@ -576,6 +584,10 @@ func ListenRaw(addr string) (*ListenerRaw, error) {
 	// Start accept loop
 	listener.wg.Add(1)
 	go listener.acceptLoop()
+
+	// Start cleanup loop for stale connections
+	listener.wg.Add(1)
+	go listener.cleanupLoop()
 
 	log.Printf("Raw TCP listener started on %s:%d", localIP, localPort)
 	return listener, nil
@@ -635,7 +647,8 @@ func (l *ListenerRaw) acceptLoop() {
 				iptablesMgr:   l.iptablesMgr,
 				stopCh:        make(chan struct{}),
 				isListener:    true,
-				ownsResources: false, // 服务端连接不拥有资源（共享）
+				ownsResources: false,        // 服务端连接不拥有资源（共享）
+				lastActivity:  time.Now(),   // Initialize lastActivity
 			}
 
 			// Send SYN-ACK
@@ -658,6 +671,7 @@ func (l *ListenerRaw) acceptLoop() {
 			conn.isConnected = true
 			conn.mu.Lock()
 			conn.ackNum = seq + uint32(len(payload))
+			conn.lastActivity = time.Now()
 			conn.mu.Unlock()
 			l.mu.Unlock()
 
@@ -702,6 +716,7 @@ func (l *ListenerRaw) acceptLoop() {
 			if len(payload) > 0 {
 				conn.mu.Lock()
 				conn.ackNum = seq + uint32(len(payload))
+				conn.lastActivity = time.Now()
 				ackToSend := conn.ackNum
 				seqToUse := conn.seqNum
 				conn.mu.Unlock()
@@ -761,10 +776,90 @@ func (l *ListenerRaw) Accept() (*ConnRaw, error) {
 	}
 }
 
+// cleanupLoop periodically removes stale connections from connMap
+func (l *ListenerRaw) cleanupLoop() {
+	defer l.wg.Done()
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-l.stopCh:
+			return
+		case <-ticker.C:
+			l.cleanupStaleConnections()
+		}
+	}
+}
+
+// cleanupStaleConnections removes connections that are closed or have been idle too long
+func (l *ListenerRaw) cleanupStaleConnections() {
+	now := time.Now()
+	staleKeys := make([]string, 0)
+
+	// First pass: find stale connections (with read lock)
+	l.mu.RLock()
+	for key, conn := range l.connMap {
+		// Mark closed connections for removal
+		if atomic.LoadInt32(&conn.closed) != 0 {
+			staleKeys = append(staleKeys, key)
+			continue
+		}
+
+		// Mark idle connections for removal
+		conn.mu.Lock()
+		lastActivity := conn.lastActivity
+		conn.mu.Unlock()
+
+		if !lastActivity.IsZero() && now.Sub(lastActivity) > staleConnectionTimeout {
+			staleKeys = append(staleKeys, key)
+		}
+	}
+	l.mu.RUnlock()
+
+	// Second pass: remove stale connections (with write lock)
+	if len(staleKeys) > 0 {
+		l.mu.Lock()
+		for _, key := range staleKeys {
+			if conn, exists := l.connMap[key]; exists {
+				// Double-check the connection is still stale
+				if atomic.LoadInt32(&conn.closed) != 0 {
+					delete(l.connMap, key)
+					continue
+				}
+				conn.mu.Lock()
+				lastActivity := conn.lastActivity
+				conn.mu.Unlock()
+				if !lastActivity.IsZero() && now.Sub(lastActivity) > staleConnectionTimeout {
+					// Close the stale connection
+					atomic.StoreInt32(&conn.closed, 1)
+					delete(l.connMap, key)
+					log.Printf("Cleaned up stale connection from %s (idle for %v)", key, now.Sub(lastActivity))
+				}
+			}
+		}
+		l.mu.Unlock()
+	}
+}
+
 // Close closes the listener
 func (l *ListenerRaw) Close() error {
 	close(l.stopCh)
-	l.wg.Wait()
+
+	// Wait for goroutines with timeout to avoid hang
+	done := make(chan struct{})
+	go func() {
+		l.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All goroutines finished cleanly
+	case <-time.After(3 * time.Second):
+		log.Printf("Timeout waiting for listener goroutines to stop; continuing shutdown")
+	}
 
 	// Remove iptables rules
 	if err := l.iptablesMgr.RemoveAllRules(); err != nil {

@@ -617,20 +617,25 @@ func (t *Tunnel) broadcastPeerDisconnect(disconnectedIP net.IP) {
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(disconnectInfo))
 
-	// Broadcast to all clients with its own lock
+	// Snapshot clients to avoid holding lock during network IO
 	t.clientsMux.RLock()
-	defer t.clientsMux.RUnlock()
-
+	clients := make([]*ClientConnection, 0, len(t.clients))
 	for _, client := range t.clients {
 		if client.clientIP != nil && !client.clientIP.Equal(disconnectedIP) {
-			encryptedPacket, err := t.encryptForClient(client, fullPacket)
-			if err != nil {
-				log.Printf("Failed to encrypt disconnect notification: %v", err)
-				continue
-			}
-			if err := client.conn.WritePacket(encryptedPacket); err != nil {
-				log.Printf("Failed to send disconnect notification to %s: %v", client.clientIP, err)
-			}
+			clients = append(clients, client)
+		}
+	}
+	t.clientsMux.RUnlock()
+
+	// Perform network I/O without holding the lock
+	for _, client := range clients {
+		encryptedPacket, err := t.encryptForClient(client, fullPacket)
+		if err != nil {
+			log.Printf("Failed to encrypt disconnect notification: %v", err)
+			continue
+		}
+		if err := client.conn.WritePacket(encryptedPacket); err != nil {
+			log.Printf("Failed to send disconnect notification to %s: %v", client.clientIP, err)
 		}
 	}
 }
@@ -2945,58 +2950,79 @@ func (t *Tunnel) broadcastPeerInfo(newClientIP net.IP, peerInfo string) {
 	fullPacket[0] = PacketTypePeerInfo
 	copy(fullPacket[1:], []byte(peerInfo))
 
-	// Broadcast to all clients except the sender and also send a PUNCH control to prompt simultaneous hole-punching
+	// Create PUNCH packet
+	punchPacket := make([]byte, len(peerInfo)+1)
+	punchPacket[0] = PacketTypePunch
+	copy(punchPacket[1:], []byte(peerInfo))
+
+	// Snapshot clients and their peer info to avoid holding lock during network IO
+	type clientInfo struct {
+		client       *ClientConnection
+		clientIP     net.IP
+		lastPeerInfo string
+	}
+
 	t.clientsMux.RLock()
-	defer t.clientsMux.RUnlock()
+	clients := make([]clientInfo, 0, len(t.clients))
+	var newClient *ClientConnection
 	for _, client := range t.clients {
-		if client.clientIP != nil && !client.clientIP.Equal(newClientIP) {
-			// Send peer info to existing client
-			encryptedPacket, err := t.encryptForClient(client, fullPacket)
-			if err != nil {
-				log.Printf("Failed to encrypt peer info for broadcast: %v", err)
-				continue
-			}
-			if err := client.conn.WritePacket(encryptedPacket); err != nil {
-				log.Printf("Failed to broadcast peer info to %s: %v", client.clientIP, err)
-				client.stopOnce.Do(func() { close(client.stopCh) })
+		if client.clientIP != nil {
+			if client.clientIP.Equal(newClientIP) {
+				newClient = client
 			} else {
-				log.Printf("Broadcasted peer info of %s to client %s", newClientIP, client.clientIP)
-			}
-
-			// Send PUNCH control to existing client so it will attempt punching to new client immediately
-			punchPacket := make([]byte, len(peerInfo)+1)
-			punchPacket[0] = PacketTypePunch
-			copy(punchPacket[1:], []byte(peerInfo))
-			encryptedPunch, err := t.encryptForClient(client, punchPacket)
-			if err == nil {
-				if err := client.conn.WritePacket(encryptedPunch); err != nil {
-					log.Printf("Failed to send PUNCH to %s: %v", client.clientIP, err)
-				} else {
-					log.Printf("Sent PUNCH for %s to client %s", newClientIP, client.clientIP)
+				client.mu.RLock()
+				info := clientInfo{
+					client:       client,
+					clientIP:     client.clientIP,
+					lastPeerInfo: client.lastPeerInfo,
 				}
-			} else {
-				log.Printf("Failed to encrypt PUNCH packet: %v", err)
+				client.mu.RUnlock()
+				clients = append(clients, info)
 			}
+		}
+	}
+	t.clientsMux.RUnlock()
 
-			// Also send existing client's peerInfo as a PUNCH to the new client so new client will punch back
-			client.mu.RLock()
-			clientInfo := client.lastPeerInfo
-			client.mu.RUnlock()
-			if clientInfo != "" {
-				punchBack := make([]byte, len(clientInfo)+1)
-				punchBack[0] = PacketTypePunch
-				copy(punchBack[1:], []byte(clientInfo))
-				if newClient := t.getClientByIP(newClientIP); newClient != nil {
-					encryptedPunchBack, err := t.encryptForClient(newClient, punchBack)
-					if err == nil {
-						if err := newClient.conn.WritePacket(encryptedPunchBack); err != nil {
-							log.Printf("Failed to send PUNCH back to new client %s: %v", newClientIP, err)
-						} else {
-							log.Printf("Sent PUNCH (existing %s) to new client %s", client.clientIP, newClientIP)
-						}
-					} else {
-						log.Printf("Failed to encrypt PUNCH back packet: %v", err)
-					}
+	// Perform network I/O without holding the lock
+	for _, info := range clients {
+		// Send peer info to existing client
+		encryptedPacket, err := t.encryptForClient(info.client, fullPacket)
+		if err != nil {
+			log.Printf("Failed to encrypt peer info for broadcast: %v", err)
+			continue
+		}
+		if err := info.client.conn.WritePacket(encryptedPacket); err != nil {
+			log.Printf("Failed to broadcast peer info to %s: %v", info.clientIP, err)
+			info.client.stopOnce.Do(func() { close(info.client.stopCh) })
+			continue
+		}
+		log.Printf("Broadcasted peer info of %s to client %s", newClientIP, info.clientIP)
+
+		// Send PUNCH control to existing client so it will attempt punching to new client immediately
+		encryptedPunch, err := t.encryptForClient(info.client, punchPacket)
+		if err != nil {
+			log.Printf("Failed to encrypt PUNCH packet: %v", err)
+		} else {
+			if err := info.client.conn.WritePacket(encryptedPunch); err != nil {
+				log.Printf("Failed to send PUNCH to %s: %v", info.clientIP, err)
+			} else {
+				log.Printf("Sent PUNCH for %s to client %s", newClientIP, info.clientIP)
+			}
+		}
+
+		// Also send existing client's peerInfo as a PUNCH to the new client so new client will punch back
+		if info.lastPeerInfo != "" && newClient != nil {
+			punchBack := make([]byte, len(info.lastPeerInfo)+1)
+			punchBack[0] = PacketTypePunch
+			copy(punchBack[1:], []byte(info.lastPeerInfo))
+			encryptedPunchBack, err := t.encryptForClient(newClient, punchBack)
+			if err != nil {
+				log.Printf("Failed to encrypt PUNCH back packet: %v", err)
+			} else {
+				if err := newClient.conn.WritePacket(encryptedPunchBack); err != nil {
+					log.Printf("Failed to send PUNCH back to new client %s: %v", newClientIP, err)
+				} else {
+					log.Printf("Sent PUNCH (existing %s) to new client %s", info.clientIP, newClientIP)
 				}
 			}
 		}
