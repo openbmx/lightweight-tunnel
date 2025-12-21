@@ -157,11 +157,25 @@ func (d *Detector) DetectNATType(serverAddr string) (NATType, error) {
 // detectWithSTUN performs NAT detection using STUN protocol
 func (d *Detector) detectWithSTUN(serverAddr string) (NATType, error) {
 	// Try multiple STUN servers for better reliability
+	// Includes servers accessible from China and other restricted regions
 	stunServers := []string{
-		serverAddr,
+		serverAddr, // User-configured server (if provided)
+		// Google STUN servers (may be blocked in some regions)
 		"stun.l.google.com:19302",
 		"stun1.l.google.com:19302",
 		"stun2.l.google.com:19302",
+		// Cloudflare STUN server (globally accessible)
+		"stun.cloudflare.com:3478",
+		// Twilio STUN servers (reliable and globally accessible)
+		"stun.twilio.com:3478",
+		// Xirsys STUN servers (good for Asia-Pacific region)
+		"stun.stunprotocol.org:3478",
+		// Additional public STUN servers for redundancy
+		"stun.ekiga.net:3478",
+		"stun.ideasip.com:3478",
+		// China-accessible alternatives
+		"stun.sipgate.net:3478",
+		"stun.voip.eutelia.it:3478",
 	}
 
 	var lastErr error

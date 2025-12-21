@@ -1257,17 +1257,37 @@ func (t *Tunnel) netReader() {
 			t.publicAddrMux.Unlock()
 			log.Printf("Received public address from server: %s", publicAddr)
 
-			// Detect NAT type if enabled
+			// Detect NAT type if enabled and announce peer info after detection
 			if t.config.EnableNATDetection && t.p2pManager != nil {
 				go func() {
 					// Perform NAT detection
 					t.p2pManager.DetectNATType(t.config.RemoteAddr)
+					
+					// After NAT detection completes, announce peer info to server
+					// This ensures peer info is available when P2P connections are requested
+					log.Printf("NAT detection complete, announcing peer info to server")
+					if err := t.announcePeerInfo(); err != nil {
+						log.Printf("Failed to announce peer info after NAT detection: %v", err)
+						// Retry with exponential backoff
+						go t.retryAnnouncePeerInfo()
+					} else {
+						log.Printf("Successfully announced peer info to server")
+					}
+				}()
+			} else if t.config.P2PEnabled && t.p2pManager != nil {
+				// If NAT detection is disabled but P2P is enabled, announce immediately
+				go func() {
+					// Wait a bit for connection to stabilize
+					time.Sleep(1 * time.Second)
+					log.Printf("P2P enabled without NAT detection, announcing peer info to server")
+					if err := t.announcePeerInfo(); err != nil {
+						log.Printf("Failed to announce peer info: %v", err)
+						go t.retryAnnouncePeerInfo()
+					} else {
+						log.Printf("Successfully announced peer info to server")
+					}
 				}()
 			}
-
-			// On-demand P2P: Do NOT automatically announce peer info
-			// P2P connections will be established on-demand when clients need to communicate
-			log.Printf("On-demand P2P mode: peer info will be announced only when needed")
 		case PacketTypePeerInfo:
 			// Received peer info from server about another client
 			if t.config.P2PEnabled && t.p2pManager != nil {
@@ -2830,6 +2850,39 @@ func (t *Tunnel) announcePeerInfo() error {
 	return nil
 }
 
+// retryAnnouncePeerInfo retries announcing peer info with exponential backoff
+func (t *Tunnel) retryAnnouncePeerInfo() {
+	const maxRetries = 5
+	retries := 0
+	
+	for retries < maxRetries {
+		// Wait with exponential backoff
+		backoffSeconds := 1 << uint(retries) // 1, 2, 4, 8, 16 seconds
+		if backoffSeconds > 16 {
+			backoffSeconds = 16
+		}
+		
+		select {
+		case <-time.After(time.Duration(backoffSeconds) * time.Second):
+			// Try to announce
+			if err := t.announcePeerInfo(); err != nil {
+				retries++
+				log.Printf("Retry %d/%d: Failed to announce peer info: %v", retries, maxRetries, err)
+				if retries >= maxRetries {
+					log.Printf("Failed to announce peer info after %d retries, giving up", maxRetries)
+					return
+				}
+			} else {
+				log.Printf("Successfully announced peer info after %d retries", retries)
+				return
+			}
+		case <-t.stopCh:
+			// Tunnel is stopping, exit
+			return
+		}
+	}
+}
+
 // sendPublicAddrToClient sends the client's public address for NAT traversal (server mode)
 func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	// Get client's public address from connection
@@ -3018,9 +3071,37 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 	targetPeerInfo := targetClient.lastPeerInfo
 	targetClient.mu.RUnlock()
 	
+	// Check if peer info is available
 	if requestingPeerInfo == "" || targetPeerInfo == "" {
-		log.Printf("P2P request but peer info not available (requesting=%v, target=%v)",
+		log.Printf("P2P request but peer info not available (requesting=%v, target=%v) - waiting for clients to announce",
 			requestingPeerInfo == "", targetPeerInfo == "")
+		
+		// Send a notification to clients to announce their peer info if not done yet
+		// This helps in case peer info was not announced due to network issues
+		// Wait a bit and retry (peer info should arrive soon after NAT detection)
+		go func() {
+			// Wait for peer info to become available (up to 10 seconds)
+			for attempt := 0; attempt < 10; attempt++ {
+				time.Sleep(1 * time.Second)
+				
+				// Re-check peer info
+				requestingClient.mu.RLock()
+				reqInfo := requestingClient.lastPeerInfo
+				requestingClient.mu.RUnlock()
+				
+				targetClient.mu.RLock()
+				tgtInfo := targetClient.lastPeerInfo
+				targetClient.mu.RUnlock()
+				
+				if reqInfo != "" && tgtInfo != "" {
+					log.Printf("Peer info now available, retrying P2P request from %s to %s", requestingIP, targetIP)
+					// Recursive call with now-available peer info
+					t.handleP2PRequest(requestingClient, payload)
+					return
+				}
+			}
+			log.Printf("Timeout waiting for peer info for P2P request from %s to %s", requestingIP, targetIP)
+		}()
 		return
 	}
 	
