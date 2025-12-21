@@ -697,6 +697,61 @@ sudo ./lightweight-tunnel \
 优化点：
 - 启用自动 MTU 检测适应网络变化
 
+#### 大规模部署（50+ 客户端）
+
+针对大规模部署的网络优化配置，防止广播风暴和连接不稳定：
+
+**服务端配置 (config-server.json)**：
+
+```json
+{
+  "mode": "server",
+  "local_addr": "0.0.0.0:9000",
+  "tunnel_addr": "10.0.0.1/24",
+  "key": "your-strong-key",
+  "multi_client": true,
+  "max_clients": 100,
+  
+  "broadcast_throttle_ms": 1000,
+  "enable_incremental_update": true,
+  "max_peer_info_batch_size": 10,
+  "route_advert_interval": 300,
+  "p2p_keepalive_interval": 25
+}
+```
+
+**客户端配置 (config-client.json)**：
+
+```json
+{
+  "mode": "client",
+  "remote_addr": "server-ip:9000",
+  "tunnel_addr": "10.0.0.2/24",
+  "key": "your-strong-key",
+  
+  "route_advert_interval": 300,
+  "p2p_keepalive_interval": 25
+}
+```
+
+**优化效果**：
+- 广播流量减少 ~80%
+- 路由通告流量减少 80% (从 60 秒增加到 300 秒)
+- P2P 保活流量减少 40% (从 15 秒增加到 25 秒)
+- 总体控制流量减少 ~60-70%
+
+**新增配置参数说明**：
+
+| 参数 | 说明 | 默认值 |
+|-----|------|--------|
+| `broadcast_throttle_ms` | 每个客户端广播之间的最小间隔（毫秒） | 1000 |
+| `enable_incremental_update` | 仅广播变化的对等节点信息 | true |
+| `max_peer_info_batch_size` | 每批次最大对等节点信息数量 | 10 |
+| `route_advert_interval` | 路由通告间隔（秒） | 300 |
+| `p2p_keepalive_interval` | P2P 保活间隔（秒） | 25 |
+
+详细的网络优化指南，请参阅 [docs/NETWORK_OPTIMIZATION.md](docs/NETWORK_OPTIMIZATION.md)
+
 ### 安全配置
 
 #### 生成强密钥
