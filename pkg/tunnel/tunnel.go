@@ -413,16 +413,14 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
 		
 		// Determine server's tunnel IP for P2P exclusion
-		serverTunnelAddr, err := GetPeerIP(cfg.TunnelAddr)
-		if err == nil {
-			parts := strings.Split(serverTunnelAddr, "/")
-			if len(parts) > 0 {
-				serverIP := net.ParseIP(parts[0])
-				if serverIP != nil {
-					t.serverTunnelIP = serverIP
-					log.Printf("Server tunnel IP: %s (will not use P2P for this address)", serverIP)
-				}
-			}
+		// The server always uses .1 in the tunnel network
+		serverIP, err := getServerTunnelIP(cfg.TunnelAddr)
+		if err != nil {
+			log.Printf("⚠️  Failed to determine server tunnel IP: %v", err)
+			log.Printf("⚠️  P2P requests to server IP may not be properly filtered")
+		} else {
+			t.serverTunnelIP = serverIP
+			log.Printf("Server tunnel IP: %s (will not use P2P for this address)", serverIP)
 		}
 		
 		// Register server as a peer in the routing table so stats show the
@@ -2700,6 +2698,39 @@ func GetPeerIP(tunnelAddr string) (string, error) {
 	}
 
 	return fmt.Sprintf("%s/%s", ip4.String(), parts[1]), nil
+}
+
+// getServerTunnelIP determines the server's tunnel IP from a client's tunnel address.
+// In this tunnel architecture, the server always uses .1 and clients use .2, .3, etc.
+// This function extracts the server IP (.1) from any client tunnel address.
+func getServerTunnelIP(clientTunnelAddr string) (net.IP, error) {
+	// Parse the tunnel address
+	parts := strings.Split(clientTunnelAddr, "/")
+	if len(parts) != 2 {
+		return nil, errors.New("invalid tunnel address format")
+	}
+
+	ip := net.ParseIP(parts[0])
+	if ip == nil {
+		return nil, errors.New("invalid IP address")
+	}
+
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return nil, errors.New("only IPv4 supported")
+	}
+
+	// If this is already .1, return it
+	if ip4[3] == 1 {
+		return ip4, nil
+	}
+
+	// Otherwise, derive .1 from the network
+	serverIP := make(net.IP, len(ip4))
+	copy(serverIP, ip4)
+	serverIP[3] = 1
+
+	return serverIP, nil
 }
 
 func applyKernelTunings(enabled bool) {
