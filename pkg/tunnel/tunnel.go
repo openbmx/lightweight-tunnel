@@ -3044,35 +3044,6 @@ func (t *Tunnel) announcePeerInfo() error {
 }
 
 // retryAnnouncePeerInfo retries announcing peer info with exponential backoff
-func (t *Tunnel) retryAnnouncePeerInfo() {
-	const maxRetries = 5
-	retries := 0
-	
-	for retries < maxRetries {
-		// Wait with exponential backoff
-		backoffSeconds := 1 << uint(retries) // 1, 2, 4, 8, 16 seconds
-		
-		select {
-		case <-time.After(time.Duration(backoffSeconds) * time.Second):
-			// Try to announce
-			if err := t.announcePeerInfo(); err != nil {
-				retries++
-				log.Printf("Retry %d/%d: Failed to announce peer info: %v", retries, maxRetries, err)
-				if retries >= maxRetries {
-					log.Printf("Failed to announce peer info after %d retries, giving up", maxRetries)
-					return
-				}
-			} else {
-				log.Printf("Successfully announced peer info after %d retries", retries)
-				return
-			}
-		case <-t.stopCh:
-			// Tunnel is stopping, exit
-			return
-		}
-	}
-}
-
 // sendPublicAddrToClient sends the client's public address for NAT traversal (server mode)
 func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	// Get client's public address from connection
