@@ -20,6 +20,20 @@ const (
 )
 
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)
+//
+// PERFORMANCE CONSIDERATIONS:
+// Raw sockets (IPPROTO_TCP) in Linux receive ALL TCP packets destined for the host.
+// In server mode, each client connection shares the same raw socket (via ListenerRaw),
+// which is efficient. However, the kernel still delivers ALL packets to each raw socket,
+// and filtering happens in user space.
+//
+// Server mode uses a shared raw socket in ListenerRaw which minimizes overhead.
+// Client connections created via DialRaw each get their own raw socket, but this
+// is acceptable since clients typically have only one connection.
+//
+// The recvLoop filters packets by connection tuple (src/dst IP:port) to ensure
+// only relevant packets are processed. This filtering is necessary since raw sockets
+// don't provide the automatic demultiplexing that normal TCP sockets do.
 type ConnRaw struct {
 	rawSocket     *rawsocket.RawSocket
 	localIP       net.IP
@@ -712,8 +726,47 @@ func (l *ListenerRaw) acceptLoop() {
 			continue
 		}
 
-		// 3. 处理已连接的数据包（只处理有payload的包）
+		// 3. 处理已连接的数据包
 		if exists && conn.isConnected {
+			// Update last activity time for all packets (including control packets)
+			conn.mu.Lock()
+			conn.lastActivity = time.Now()
+			conn.mu.Unlock()
+
+			// Handle FIN or RST packets (connection close)
+			if flags&(FIN|RST) != 0 {
+				// Connection is being closed
+				log.Printf("Received %s from %s:%d, closing connection",
+					func() string {
+						if flags&FIN != 0 {
+							return "FIN"
+						}
+						return "RST"
+					}(), srcIP, srcPort)
+				
+				// Mark connection as closed
+				atomic.StoreInt32(&conn.closed, 1)
+				
+				// Send ACK for FIN if needed
+				if flags&FIN != 0 {
+					conn.mu.Lock()
+					conn.ackNum = seq + 1 // FIN consumes one sequence number
+					ackToSend := conn.ackNum
+					seqToUse := conn.seqNum
+					conn.mu.Unlock()
+					
+					if err := l.rawSocket.SendPacket(conn.localIP, conn.srcPort, conn.remoteIP, conn.dstPort,
+						seqToUse, ackToSend, ACK, conn.buildTCPOptions(), nil); err != nil {
+						log.Printf("Failed to send ACK for FIN to %s:%d: %v", conn.remoteIP, conn.remotePort, err)
+					}
+				}
+				
+				// Remove from connection map
+				delete(l.connMap, connKey)
+				l.mu.Unlock()
+				continue
+			}
+
 			// 只处理有实际数据的包，忽略纯ACK、keepalive等控制包
 			if len(payload) > 0 {
 				conn.mu.Lock()
