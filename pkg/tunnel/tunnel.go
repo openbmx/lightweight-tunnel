@@ -1380,7 +1380,7 @@ func (t *Tunnel) netReader() {
 						if err := t.announcePeerInfo(); err != nil {
 							log.Printf("Failed to announce peer info (attempt %d/%d): %v", attempt+1, maxRetries, err)
 							// Exponential backoff: 1s, 2s, 4s, 8s, 16s
-							backoff := time.Duration(1<<uint(attempt)) * time.Second
+							backoff := exponentialBackoff(attempt, 1*time.Second)
 							time.Sleep(backoff)
 						} else {
 							log.Printf("Successfully announced peer info to server on attempt %d", attempt+1)
@@ -1399,7 +1399,7 @@ func (t *Tunnel) netReader() {
 					for attempt := 0; attempt < maxRetries; attempt++ {
 						if err := t.announcePeerInfo(); err != nil {
 							log.Printf("Failed to announce peer info (attempt %d/%d): %v", attempt+1, maxRetries, err)
-							backoff := time.Duration(1<<uint(attempt)) * time.Second
+							backoff := exponentialBackoff(attempt, 1*time.Second)
 							time.Sleep(backoff)
 						} else {
 							log.Printf("Successfully announced peer info to server on attempt %d", attempt+1)
@@ -2567,7 +2567,8 @@ func (t *Tunnel) requestP2PConnection(targetIP net.IP) {
 			if err := conn.WritePacket(encryptedPacket); err != nil {
 				log.Printf("Failed to send P2P request to server (attempt %d/%d): %v", attempt+1, maxRetries, err)
 				if attempt < maxRetries-1 {
-					time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+					backoff := exponentialBackoff(attempt, 1*time.Second)
+					time.Sleep(backoff)
 				}
 			} else {
 				log.Printf("Sent P2P connection request for %s to server", targetIPStr)
@@ -2576,7 +2577,8 @@ func (t *Tunnel) requestP2PConnection(targetIP net.IP) {
 		} else {
 			log.Printf("No connection available to send P2P request (attempt %d/%d)", attempt+1, maxRetries)
 			if attempt < maxRetries-1 {
-				time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				backoff := exponentialBackoff(attempt, 1*time.Second)
+				time.Sleep(backoff)
 			}
 		}
 	}
@@ -2633,6 +2635,20 @@ func (t *Tunnel) updateRoutesAfterP2PAttempt(tunnelIP net.IP, source string) {
 			log.Printf("⚠ P2P connection to %s not established, will use server relay", tunnelIP)
 		}
 	}
+}
+
+// exponentialBackoff calculates exponential backoff delay with a maximum cap
+// Returns delay = baseDelay * 2^attempt, capped at 32 seconds
+func exponentialBackoff(attempt int, baseDelay time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	// Cap attempt at 5 to prevent overflow (2^5 = 32)
+	if attempt > 5 {
+		attempt = 5
+	}
+	multiplier := 1 << uint(attempt) // Safe: attempt is capped at 5, so max is 2^5 = 32
+	return baseDelay * time.Duration(multiplier)
 }
 
 // Helper to get local IP for the other peer
