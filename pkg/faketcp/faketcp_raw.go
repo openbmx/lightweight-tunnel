@@ -88,6 +88,12 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 		return nil, fmt.Errorf("failed to create raw socket: %v", err)
 	}
 
+	// Cleanup any stale iptables rules from previous runs before adding new ones
+	if err := iptables.CleanupStaleRulesForPort(localPort); err != nil {
+		log.Printf("Warning: failed to cleanup stale iptables rules: %v", err)
+		// Continue anyway - cleanup is best-effort
+	}
+
 	// Create iptables manager and add rules
 	iptablesMgr := iptables.NewIPTablesManager()
 	if err := iptablesMgr.AddRuleForPort(localPort, !isClient); err != nil {
@@ -687,6 +693,12 @@ func ListenRaw(addr string) (*ListenerRaw, error) {
 	rawSock, err := rawsocket.NewRawSocket(localIP, localPort, nil, 0, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raw socket: %v", err)
+	}
+
+	// Cleanup any stale iptables rules from previous runs before adding new ones
+	if err := iptables.CleanupStaleRulesForPort(localPort); err != nil {
+		log.Printf("Warning: failed to cleanup stale iptables rules: %v", err)
+		// Continue anyway - cleanup is best-effort
 	}
 
 	// Create iptables manager and add rules
