@@ -245,6 +245,10 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 }
 
 // recvLoop continuously receives packets from raw socket (只用于客户端连接)
+// PERFORMANCE NOTE: Raw sockets receive ALL TCP packets destined for the host.
+// Current implementation filters packets in user space by checking connection tuple.
+// Future optimization: Consider using BPF (Berkeley Packet Filter) for kernel-space
+// filtering to reduce CPU usage in high-traffic environments.
 func (c *ConnRaw) recvLoop() {
 	defer c.wg.Done()
 
@@ -252,12 +256,30 @@ func (c *ConnRaw) recvLoop() {
 	if c.isListener {
 		return
 	}
+	
+	// Metrics for monitoring filtering efficiency
+	var totalPacketsReceived uint64
+	var packetsFiltered uint64
+	var packetsProcessed uint64
+	metricsInterval := time.NewTicker(60 * time.Second)
+	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-c.stopCh:
 			return
+		case <-metricsInterval.C:
+			// Log filtering efficiency metrics periodically
+			if totalPacketsReceived > 0 {
+				filterRate := float64(packetsFiltered) / float64(totalPacketsReceived) * 100
+				log.Printf("Raw socket filtering efficiency: %d total, %d filtered (%.1f%%), %d processed",
+					totalPacketsReceived, packetsFiltered, filterRate, packetsProcessed)
+			}
+			// Reset counters
+			totalPacketsReceived = 0
+			packetsFiltered = 0
+			packetsProcessed = 0
 		default:
 		}
 
@@ -269,22 +291,30 @@ func (c *ConnRaw) recvLoop() {
 			// Timeout or other errors - continue
 			continue
 		}
+		
+		totalPacketsReceived++
 
 		// Filter packets: only accept packets for our connection
+		// This is necessary because raw sockets don't provide automatic demultiplexing
 		if c.isConnected {
 			// Client mode: accept packets from server
 			if !srcIP.Equal(c.remoteIP) || srcPort != c.remotePort {
+				packetsFiltered++
 				continue
 			}
 			if !dstIP.Equal(c.localIP) || dstPort != c.localPort {
+				packetsFiltered++
 				continue
 			}
 		} else {
 			// Server mode: accept packets from any client (will be handled by listener)
 			if !dstIP.Equal(c.localIP) || dstPort != c.localPort {
+				packetsFiltered++
 				continue
 			}
 		}
+		
+		packetsProcessed++
 
 		// Update ack number and immediately acknowledge payload to keep TCP disguise realistic
 		if len(payload) > 0 {
@@ -626,12 +656,30 @@ func ListenRaw(addr string) (*ListenerRaw, error) {
 // acceptLoop handles incoming connections
 func (l *ListenerRaw) acceptLoop() {
 	defer l.wg.Done()
+	
+	// Metrics for monitoring server-side filtering efficiency
+	var totalPacketsReceived uint64
+	var packetsFiltered uint64
+	var packetsProcessed uint64
+	metricsInterval := time.NewTicker(60 * time.Second)
+	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-l.stopCh:
 			return
+		case <-metricsInterval.C:
+			// Log filtering efficiency metrics periodically
+			if totalPacketsReceived > 0 {
+				filterRate := float64(packetsFiltered) / float64(totalPacketsReceived) * 100
+				log.Printf("Server raw socket filtering: %d total, %d filtered (%.1f%%), %d processed",
+					totalPacketsReceived, packetsFiltered, filterRate, packetsProcessed)
+			}
+			// Reset counters
+			totalPacketsReceived = 0
+			packetsFiltered = 0
+			packetsProcessed = 0
 		default:
 		}
 
@@ -640,11 +688,18 @@ func (l *ListenerRaw) acceptLoop() {
 		if err != nil {
 			continue
 		}
+		
+		totalPacketsReceived++
 
 		// Filter packets for our port
+		// PERFORMANCE: This is basic port-based filtering in user space
+		// For production with high traffic, consider BPF for kernel-space filtering
 		if dstPort != l.localPort {
+			packetsFiltered++
 			continue
 		}
+		
+		packetsProcessed++
 
 		connKey := fmt.Sprintf("%s:%d", srcIP.String(), srcPort)
 
