@@ -2522,7 +2522,7 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) (bool, error) {
 // shouldRequestP2P checks if we should request a P2P connection to the target IP
 // Returns false if a request is already pending or was recently made
 func (t *Tunnel) shouldRequestP2P(targetIP net.IP) bool {
-	// Never request P2P to the server itself
+	// Never request P2P connections to the server's tunnel IP
 	if t.serverTunnelIP != nil && targetIP.Equal(t.serverTunnelIP) {
 		return false
 	}
@@ -3262,7 +3262,7 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 
 	// Reject P2P requests targeting the server itself
 	if targetIP.Equal(t.myTunnelIP) {
-		log.Printf("P2P request for server IP %s rejected (server should not use P2P)", targetIPStr)
+		log.Printf("P2P request targeting server IP %s rejected (clients should not establish P2P with server)", targetIPStr)
 		return
 	}
 
