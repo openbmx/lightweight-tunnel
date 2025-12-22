@@ -178,12 +178,20 @@ func (d *Detector) detectWithSTUN(serverAddr string) (NATType, error) {
 		"stun.voip.eutelia.it:3478",
 	}
 
+	// Use the same port for STUN queries as P2P connections
+	// This ensures NAT type detection reflects actual P2P behavior
+	localAddr := &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: d.testPort,
+	}
+
 	var lastErr error
 	for _, server := range stunServers {
 		client := NewSTUNClient(server, d.testTimeout)
-		natType, err := client.DetectNATTypeWithSTUN()
+		natType, err := client.DetectNATTypeWithSTUN(localAddr)
 		if err == nil {
-			log.Printf("Successfully detected NAT type using STUN server %s: %s", server, natType)
+			log.Printf("Successfully detected NAT type using STUN server %s on local port %d: %s", 
+				server, d.testPort, natType)
 			return natType, nil
 		}
 		lastErr = err

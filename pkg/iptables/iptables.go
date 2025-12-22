@@ -21,6 +21,60 @@ func NewIPTablesManager() *IPTablesManager {
 	}
 }
 
+// CleanupStaleRulesForPort removes any leftover iptables rules from previous runs for a specific port
+// This prevents rule accumulation from crashes or kill -9
+// Should be called before adding new rules for the port
+func CleanupStaleRulesForPort(port uint16) error {
+	log.Printf("Cleaning up any stale iptables rules for port %d from previous runs...", port)
+	
+	// List all OUTPUT rules
+	cmd := exec.Command("iptables", "-S", "OUTPUT")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to list iptables rules: %v", err)
+	}
+	
+	lines := strings.Split(string(output), "\n")
+	removedCount := 0
+	
+	for _, line := range lines {
+		// Look for RST drop rules for this port
+		// Match both sport and dport rules
+		if strings.Contains(line, fmt.Sprintf("--sport %d", port)) ||
+		   strings.Contains(line, fmt.Sprintf("--dport %d", port)) {
+			if strings.Contains(line, "tcp-flags RST RST") && strings.Contains(line, "-j DROP") {
+				// This is our rule, remove it
+				// Convert from -S format to -D format
+				// -A OUTPUT ... becomes -D OUTPUT ...
+				ruleStr := strings.TrimPrefix(line, "-A ")
+				if ruleStr == line {
+					continue // Not an -A rule, skip
+				}
+				
+				// Delete the rule
+				args := []string{"-D"}
+				args = append(args, strings.Split(ruleStr, " ")...)
+				
+				delCmd := exec.Command("iptables", args...)
+				if err := delCmd.Run(); err != nil {
+					log.Printf("Warning: failed to remove stale rule '%s': %v", line, err)
+				} else {
+					removedCount++
+					log.Printf("Removed stale iptables rule: %s", line)
+				}
+			}
+		}
+	}
+	
+	if removedCount > 0 {
+		log.Printf("Cleaned up %d stale iptables rule(s) for port %d", removedCount, port)
+	} else {
+		log.Printf("No stale iptables rules found for port %d", port)
+	}
+	
+	return nil
+}
+
 // AddRuleForPort adds an iptables rule to drop RST packets for a specific port
 // This is essential for raw socket TCP to work properly
 func (m *IPTablesManager) AddRuleForPort(port uint16, isServer bool) error {
