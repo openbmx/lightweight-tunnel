@@ -55,6 +55,12 @@ type ConnRaw struct {
 	isListener    bool      // true表示这是listener接受的连接，不需要启动recvLoop
 	ownsResources bool      // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
 	lastActivity  time.Time // Last time this connection had activity (for cleanup)
+	
+	// DPI resistance: sliding window and out-of-order handling
+	recvWindow     map[uint32][]byte // out-of-order packet buffer (seq -> payload)
+	recvWindowMu   sync.Mutex        // protects recvWindow
+	expectedSeq    uint32            // next expected sequence number
+	windowSize     uint32            // TCP receive window size
 }
 
 // NewConnRaw creates a new raw socket connection
@@ -94,6 +100,9 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 		stopCh:        make(chan struct{}),
 		isListener:    false,
 		ownsResources: true, // 客户端连接拥有资源所有权
+		recvWindow:    make(map[uint32][]byte),
+		expectedSeq:   0,       // Will be set after handshake
+		windowSize:    65535,   // Standard TCP window size
 	}
 
 	// 只有客户端连接才启动recvLoop，服务端连接由acceptLoop统一分发
@@ -198,6 +207,11 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					// Got SYN-ACK
 					c.seqNum++ // SYN consumes one sequence number
 					c.ackNum = hdr.SeqNum + 1
+					
+					// Initialize expected sequence for DPI resistance
+					c.recvWindowMu.Lock()
+					c.expectedSeq = c.ackNum
+					c.recvWindowMu.Unlock()
 
 					// Send ACK
 					err = c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
@@ -665,6 +679,9 @@ func (l *ListenerRaw) acceptLoop() {
 				isListener:    true,
 				ownsResources: false,        // 服务端连接不拥有资源（共享）
 				lastActivity:  time.Now(),   // Initialize lastActivity
+				recvWindow:    make(map[uint32][]byte),
+				expectedSeq:   seq + 1,      // Expect next byte after SYN
+				windowSize:    65535,        // Standard TCP window size
 			}
 
 			// Send SYN-ACK
@@ -931,4 +948,44 @@ func (l *ListenerRaw) Addr() net.Addr {
 		IP:   l.localIP,
 		Port: int(l.localPort),
 	}
+}
+
+// handleOutOfOrderPacket buffers out-of-order packets and returns ordered payloads when gaps are filled
+// This makes the TCP stream more realistic for DPI inspection
+func (c *ConnRaw) handleOutOfOrderPacket(seq uint32, payload []byte) [][]byte {
+	c.recvWindowMu.Lock()
+	defer c.recvWindowMu.Unlock()
+	
+	// Fast path: packet is in order
+	if seq == c.expectedSeq {
+		result := make([][]byte, 0, 1)
+		result = append(result, payload)
+		c.expectedSeq += uint32(len(payload))
+		
+		// Check if we can deliver buffered packets
+		for {
+			if buffered, exists := c.recvWindow[c.expectedSeq]; exists {
+				result = append(result, buffered)
+				delete(c.recvWindow, c.expectedSeq)
+				c.expectedSeq += uint32(len(buffered))
+			} else {
+				break
+			}
+		}
+		
+		return result
+	}
+	
+	// Out of order packet - buffer it if within window
+	// Prevent memory exhaustion from too many buffered packets
+	const maxBufferedPackets = 32
+	if len(c.recvWindow) < maxBufferedPackets {
+		// Only buffer future packets (not duplicates or old packets)
+		if seq > c.expectedSeq && seq < c.expectedSeq+c.windowSize {
+			c.recvWindow[seq] = payload
+		}
+	}
+	
+	// Return empty slice - packet was buffered
+	return nil
 }

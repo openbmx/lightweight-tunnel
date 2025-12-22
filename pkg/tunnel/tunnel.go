@@ -272,7 +272,25 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	}
 
 	// Create FEC encoder/decoder
-	fecCodec, err := fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, cfg.MTU/cfg.FECDataShards)
+	// Calculate optimal shard size to avoid excessive header overhead
+	// Account for protocol overhead: IP(20) + TCP(20) + encryption(~50) = ~90 bytes per packet
+	const protocolOverhead = 90
+	const minShardSize = 512 // Minimum shard size to avoid creating too many small fragments
+	
+	// Calculate shard size: use full MTU minus overhead for each shard
+	shardSize := cfg.MTU - protocolOverhead
+	if shardSize < minShardSize {
+		log.Printf("Warning: MTU (%d) too small for optimal FEC performance. Minimum recommended: %d", cfg.MTU, minShardSize+protocolOverhead)
+		shardSize = minShardSize
+	}
+	
+	// Log FEC configuration for debugging
+	bandwidthOverhead := float64(cfg.FECParityShards) / float64(cfg.FECDataShards) * 100
+	log.Printf("FEC configuration: %d data shards + %d parity shards (%.1f%% bandwidth overhead)", 
+		cfg.FECDataShards, cfg.FECParityShards, bandwidthOverhead)
+	log.Printf("FEC shard size: %d bytes (avoids small packet fragmentation)", shardSize)
+	
+	fecCodec, err := fec.NewFEC(cfg.FECDataShards, cfg.FECParityShards, shardSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create FEC: %v", err)
 	}
