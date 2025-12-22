@@ -241,16 +241,9 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					c.isConnected = true
 					c.mu.Unlock()
 
-					// 清空recvQueue中的握手包（可能有重传的SYN-ACK等）
-					for {
-						select {
-						case <-c.recvQueue:
-							// 丢弃握手期间积压的包
-						default:
-							// 队列已空，返回
-							return nil
-						}
-					}
+					// DO NOT clear recvQueue - early data packets may already be queued
+					// The old code caused packet loss for data sent immediately after handshake
+					return nil
 				}
 			case <-time.After(200 * time.Millisecond):
 				// Continue waiting
@@ -992,15 +985,10 @@ func (l *ListenerRaw) acceptLoop() {
 func (l *ListenerRaw) Accept() (*ConnRaw, error) {
 	select {
 	case conn := <-l.acceptQueue:
-		// 清空握手期间积压的控制包
-		for {
-			select {
-			case <-conn.recvQueue:
-				// 丢弃
-			default:
-				return conn, nil
-			}
-		}
+		// DO NOT clear recvQueue - packets queued during/after handshake are valid data packets
+		// The old code incorrectly dropped initial data packets sent immediately after handshake
+		// This was causing "server not responding" issues where client sends data but server drops it
+		return conn, nil
 	case <-l.stopCh:
 		return nil, fmt.Errorf("listener closed")
 	}

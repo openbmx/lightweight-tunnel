@@ -1372,27 +1372,39 @@ func (t *Tunnel) netReader() {
 					t.p2pManager.DetectNATType(t.config.RemoteAddr)
 					
 					// After NAT detection completes, announce peer info to server
-					// This ensures peer info is available when P2P connections are requested
+					// Retry with exponential backoff to ensure it gets through
 					log.Printf("NAT detection complete, announcing peer info to server")
-					if err := t.announcePeerInfo(); err != nil {
-						log.Printf("Failed to announce peer info after NAT detection: %v", err)
-						// Retry with exponential backoff
-						go t.retryAnnouncePeerInfo()
-					} else {
-						log.Printf("Successfully announced peer info to server")
+					
+					maxRetries := 5
+					for attempt := 0; attempt < maxRetries; attempt++ {
+						if err := t.announcePeerInfo(); err != nil {
+							log.Printf("Failed to announce peer info (attempt %d/%d): %v", attempt+1, maxRetries, err)
+							// Exponential backoff: 1s, 2s, 4s, 8s, 16s
+							backoff := exponentialBackoff(attempt, 1*time.Second)
+							time.Sleep(backoff)
+						} else {
+							log.Printf("Successfully announced peer info to server on attempt %d", attempt+1)
+							break
+						}
 					}
 				}()
 			} else if t.config.P2PEnabled && t.p2pManager != nil {
-				// If NAT detection is disabled but P2P is enabled, announce immediately
+				// If NAT detection is disabled but P2P is enabled, announce immediately with retry
 				go func() {
 					// Wait a bit for connection to stabilize
 					time.Sleep(1 * time.Second)
 					log.Printf("P2P enabled without NAT detection, announcing peer info to server")
-					if err := t.announcePeerInfo(); err != nil {
-						log.Printf("Failed to announce peer info: %v", err)
-						go t.retryAnnouncePeerInfo()
-					} else {
-						log.Printf("Successfully announced peer info to server")
+					
+					maxRetries := 5
+					for attempt := 0; attempt < maxRetries; attempt++ {
+						if err := t.announcePeerInfo(); err != nil {
+							log.Printf("Failed to announce peer info (attempt %d/%d): %v", attempt+1, maxRetries, err)
+							backoff := exponentialBackoff(attempt, 1*time.Second)
+							time.Sleep(backoff)
+						} else {
+							log.Printf("Successfully announced peer info to server on attempt %d", attempt+1)
+							break
+						}
 					}
 				}()
 			}
@@ -2504,10 +2516,19 @@ func (t *Tunnel) shouldRequestP2P(targetIP net.IP) bool {
 	
 	// Check if request already pending
 	if lastReq, exists := t.pendingP2PRequests[targetIPStr]; exists {
-		// Don't request again if less than 5 seconds since last request
-		if time.Since(lastReq) < 5*time.Second {
+		// Allow retry after 10 seconds if P2P hasn't been established
+		// This gives time for peer info to be announced and processed
+		if time.Since(lastReq) < 10*time.Second {
 			return false
 		}
+		// Check if P2P is actually connected now before retrying
+		if t.p2pManager != nil && t.p2pManager.IsConnected(targetIP) {
+			// P2P established, no need to request again
+			delete(t.pendingP2PRequests, targetIPStr)
+			return false
+		}
+		// P2P not established after 10s, allow retry
+		log.Printf("P2P request for %s timed out after 10s, will retry", targetIPStr)
 	}
 	
 	return true
@@ -2535,18 +2556,34 @@ func (t *Tunnel) requestP2PConnection(targetIP net.IP) {
 		return
 	}
 	
-	// Send to server
-	t.connMux.Lock()
-	conn := t.conn
-	t.connMux.Unlock()
-	
-	if conn != nil {
-		if err := conn.WritePacket(encryptedPacket); err != nil {
-			log.Printf("Failed to send P2P request to server: %v", err)
+	// Send to server with retry logic
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		t.connMux.Lock()
+		conn := t.conn
+		t.connMux.Unlock()
+		
+		if conn != nil {
+			if err := conn.WritePacket(encryptedPacket); err != nil {
+				log.Printf("Failed to send P2P request to server (attempt %d/%d): %v", attempt+1, maxRetries, err)
+				if attempt < maxRetries-1 {
+					backoff := exponentialBackoff(attempt, 1*time.Second)
+					time.Sleep(backoff)
+				}
+			} else {
+				log.Printf("Sent P2P connection request for %s to server", targetIPStr)
+				return
+			}
 		} else {
-			log.Printf("Sent P2P connection request for %s to server", targetIPStr)
+			log.Printf("No connection available to send P2P request (attempt %d/%d)", attempt+1, maxRetries)
+			if attempt < maxRetries-1 {
+				backoff := exponentialBackoff(attempt, 1*time.Second)
+				time.Sleep(backoff)
+			}
 		}
 	}
+	
+	log.Printf("Failed to send P2P request after %d attempts", maxRetries)
 }
 
 // sendViaServer sends packet through the server connection
@@ -2598,6 +2635,20 @@ func (t *Tunnel) updateRoutesAfterP2PAttempt(tunnelIP net.IP, source string) {
 			log.Printf("⚠ P2P connection to %s not established, will use server relay", tunnelIP)
 		}
 	}
+}
+
+// exponentialBackoff calculates exponential backoff delay with a maximum cap
+// Returns delay = baseDelay * 2^attempt, capped at 32 seconds
+func exponentialBackoff(attempt int, baseDelay time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	// Cap attempt at 5 to prevent overflow (2^5 = 32)
+	if attempt > 5 {
+		attempt = 5
+	}
+	multiplier := 1 << uint(attempt) // Safe: attempt is capped at 5, so max is 2^5 = 32
+	return baseDelay * time.Duration(multiplier)
 }
 
 // Helper to get local IP for the other peer
@@ -2993,35 +3044,6 @@ func (t *Tunnel) announcePeerInfo() error {
 }
 
 // retryAnnouncePeerInfo retries announcing peer info with exponential backoff
-func (t *Tunnel) retryAnnouncePeerInfo() {
-	const maxRetries = 5
-	retries := 0
-	
-	for retries < maxRetries {
-		// Wait with exponential backoff
-		backoffSeconds := 1 << uint(retries) // 1, 2, 4, 8, 16 seconds
-		
-		select {
-		case <-time.After(time.Duration(backoffSeconds) * time.Second):
-			// Try to announce
-			if err := t.announcePeerInfo(); err != nil {
-				retries++
-				log.Printf("Retry %d/%d: Failed to announce peer info: %v", retries, maxRetries, err)
-				if retries >= maxRetries {
-					log.Printf("Failed to announce peer info after %d retries, giving up", maxRetries)
-					return
-				}
-			} else {
-				log.Printf("Successfully announced peer info after %d retries", retries)
-				return
-			}
-		case <-t.stopCh:
-			// Tunnel is stopping, exit
-			return
-		}
-	}
-}
-
 // sendPublicAddrToClient sends the client's public address for NAT traversal (server mode)
 func (t *Tunnel) sendPublicAddrToClient(client *ClientConnection) {
 	// Get client's public address from connection
@@ -3212,41 +3234,12 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 	
 	// Check if peer info is available
 	if requestingPeerInfo == "" || targetPeerInfo == "" {
-		log.Printf("P2P request but peer info not available (requesting=%v, target=%v) - waiting for clients to announce",
+		log.Printf("P2P request but peer info not available (requesting=%v, target=%v)",
 			requestingPeerInfo == "", targetPeerInfo == "")
 		
-		// Send a notification to clients to announce their peer info if not done yet
-		// This helps in case peer info was not announced due to network issues
-		// Wait a bit and retry (peer info should arrive soon after NAT detection)
-		go func() {
-			// Limit to prevent infinite recursion
-			const maxWaitAttempts = 10
-			
-			// Wait for peer info to become available (up to 10 seconds)
-			for attempt := 0; attempt < maxWaitAttempts; attempt++ {
-				time.Sleep(1 * time.Second)
-				
-				// Re-check peer info
-				requestingClient.mu.RLock()
-				reqInfo := requestingClient.lastPeerInfo
-				requestingClient.mu.RUnlock()
-				
-				targetClient.mu.RLock()
-				tgtInfo := targetClient.lastPeerInfo
-				targetClient.mu.RUnlock()
-				
-				if reqInfo != "" && tgtInfo != "" {
-					log.Printf("Peer info now available after %d seconds, processing P2P request from %s to %s", 
-						attempt+1, requestingIP, targetIP)
-					
-					// Process the request now that peer info is available
-					t.processP2PConnection(requestingClient, targetClient, reqInfo, tgtInfo)
-					return
-				}
-			}
-			log.Printf("Timeout waiting for peer info for P2P request from %s to %s after %d seconds", 
-				requestingIP, targetIP, maxWaitAttempts)
-		}()
+		// Instead of waiting asynchronously, reject the request immediately
+		// The client will retry when it receives traffic destined for the target
+		// This prevents accumulating stale requests and hanging goroutines
 		return
 	}
 	
