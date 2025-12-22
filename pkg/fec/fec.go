@@ -40,11 +40,6 @@ func (f *FEC) Encode(data []byte) ([][]byte, error) {
 	totalShards := f.dataShards
 	shardSize := (len(data) + totalShards - 1) / totalShards
 	
-	// Align to shardSize if specified
-	if f.shardSize > 0 && shardSize < f.shardSize {
-		shardSize = f.shardSize
-	}
-
 	// Create data shards
 	shards := make([][]byte, f.dataShards+f.parityShards)
 	for i := 0; i < f.dataShards; i++ {

@@ -1334,15 +1334,16 @@ func (t *Tunnel) netReader() {
 			}
 		case PacketTypeFEC:
 			if t.fecManager != nil {
-				if len(payload) < 6 {
+				if len(payload) < 8 {
 					continue
 				}
 				packetID := binary.BigEndian.Uint32(payload[0:4])
 				shardIdx := int(payload[4])
 				totalShards := int(payload[5])
-				shardData := payload[6:]
+				origLen := int(binary.BigEndian.Uint16(payload[6:8]))
+				shardData := payload[8:]
 
-				reconstructed := t.fecManager.AddShard(packetID, shardIdx, totalShards, shardData)
+				reconstructed := t.fecManager.AddShard(packetID, shardIdx, totalShards, origLen, shardData)
 				if reconstructed != nil {
 					if !enqueueWithTimeout(t.recvQueue, reconstructed, t.stopCh) {
 						select {
@@ -1657,15 +1658,16 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 		case PacketTypeFEC:
 			if client.fecManager != nil {
-				if len(payload) < 6 {
+				if len(payload) < 8 {
 					continue
 				}
 				packetID := binary.BigEndian.Uint32(payload[0:4])
 				shardIdx := int(payload[4])
 				totalShards := int(payload[5])
-				shardData := payload[6:]
+				origLen := int(binary.BigEndian.Uint16(payload[6:8]))
+				shardData := payload[8:]
 
-				reconstructed := client.fecManager.AddShard(packetID, shardIdx, totalShards, shardData)
+				reconstructed := client.fecManager.AddShard(packetID, shardIdx, totalShards, origLen, shardData)
 				if reconstructed != nil {
 					if len(reconstructed) >= IPv4MinHeaderLen {
 						t.routePacket(client, reconstructed)
@@ -3441,7 +3443,13 @@ func (t *Tunnel) routePacket(client *ClientConnection, payload []byte) {
 				// IMPORTANT: payload comes from aead.Open which allocates a new slice
 				// We need to copy it into a pooled buffer so it can be properly recycled
 				forwardBuf := t.getPacketBuffer()
-				forwardPacket := forwardBuf[:len(payload)]
+				
+				// Ensure we don't exceed buffer capacity
+				copyLen := len(payload)
+				if copyLen > len(forwardBuf) {
+					copyLen = len(forwardBuf)
+				}
+				forwardPacket := forwardBuf[:copyLen]
 				copy(forwardPacket, payload)
 
 				queued := false

@@ -10,7 +10,7 @@ import (
 
 const (
 	fecBlockExpiry = 5 * time.Second
-	fecHeaderSize  = 7 // 1 (type) + 4 (id) + 1 (idx) + 1 (total)
+	fecHeaderSize  = 9 // 1 (type) + 4 (id) + 1 (idx) + 1 (total) + 2 (origLen)
 )
 
 type fecBlock struct {
@@ -18,6 +18,7 @@ type fecBlock struct {
 	shardPresent []bool
 	count        int
 	total        int
+	origLen      int
 	expiry       time.Time
 }
 
@@ -57,7 +58,7 @@ func (m *FECManager) cleanupLoop() {
 
 // AddShard adds a shard and returns the reconstructed data if possible.
 // Returns nil if more shards are needed or reconstruction failed.
-func (m *FECManager) AddShard(packetID uint32, shardIdx int, totalShards int, data []byte) []byte {
+func (m *FECManager) AddShard(packetID uint32, shardIdx int, totalShards int, origLen int, data []byte) []byte {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -67,6 +68,7 @@ func (m *FECManager) AddShard(packetID uint32, shardIdx int, totalShards int, da
 			shards:       make([][]byte, totalShards),
 			shardPresent: make([]bool, totalShards),
 			total:        totalShards,
+			origLen:      origLen,
 			expiry:       time.Now().Add(fecBlockExpiry),
 		}
 		m.blocks[packetID] = block
@@ -87,17 +89,19 @@ func (m *FECManager) AddShard(packetID uint32, shardIdx int, totalShards int, da
 	// If we have enough shards, try to reconstruct
 	if block.count >= m.dataShards {
 		// Check if we already reconstructed this block
-		// (We might get more shards after reconstruction)
 		if block.count > m.dataShards && m.isDataComplete(block) {
 			return nil
 		}
 
 		reconstructed, err := m.fec.Decode(block.shards, block.shardPresent)
 		if err == nil {
-			// Mark as complete by setting all data shards as present
-			// to avoid multiple reconstructions of the same block
+			// Mark as complete
 			for i := 0; i < m.dataShards; i++ {
 				block.shardPresent[i] = true
+			}
+			// Trim to original length
+			if len(reconstructed) > block.origLen {
+				return reconstructed[:block.origLen]
 			}
 			return reconstructed
 		}
@@ -123,14 +127,16 @@ func (m *FECManager) EncodePacket(packetID uint32, data []byte) ([][]byte, error
 	}
 
 	total := len(shards)
+	origLen := len(data)
 	result := make([][]byte, total)
 	for i := 0; i < total; i++ {
-		// Header: [0]Type [1-4]ID [5]Idx [6]Total
+		// Header: [0]Type [1-4]ID [5]Idx [6]Total [7-8]OrigLen
 		shardPacket := make([]byte, fecHeaderSize+len(shards[i]))
 		shardPacket[0] = PacketTypeFEC
 		binary.BigEndian.PutUint32(shardPacket[1:5], packetID)
 		shardPacket[5] = byte(i)
 		shardPacket[6] = byte(total)
+		binary.BigEndian.PutUint16(shardPacket[7:9], uint16(origLen))
 		copy(shardPacket[fecHeaderSize:], shards[i])
 		result[i] = shardPacket
 	}
