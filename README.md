@@ -1089,17 +1089,14 @@ lightweight-tunnel/
 │       └── main.go            # 主函数，命令行参数解析
 ├── internal/                   # 内部包（不对外暴露）
 │   └── config/                # 配置管理
-│       ├── config.go          # 配置结构和加载/保存
-│       └── config_test.go     # 配置测试
+│       └── config.go          # 配置结构和加载/保存
 ├── pkg/                        # 公共包（可被外部引用）
 │   ├── crypto/                # 加密模块
-│   │   ├── crypto.go          # AES-256-GCM 实现
-│   │   └── crypto_test.go     # 加密测试
+│   │   └── crypto.go          # AES-256-GCM 实现
 │   ├── faketcp/               # TCP 伪装模块
 │   │   ├── faketcp.go         # 接口定义
 │   │   ├── faketcp_raw.go     # Raw Socket 实现
-│   │   ├── adapter.go         # 适配器接口
-│   │   └── *_test.go          # 测试文件
+│   │   └── adapter.go         # 适配器接口
 │   ├── rawsocket/             # 原始套接字
 │   │   └── rawsocket.go       # 底层 Raw Socket 操作
 │   ├── fec/                   # FEC 前向纠错
@@ -1108,19 +1105,15 @@ lightweight-tunnel/
 │   │   └── iptables.go        # 添加/删除 iptables 规则
 │   ├── p2p/                   # P2P 连接管理
 │   │   ├── manager.go         # P2P 管理器
-│   │   ├── peer.go            # 对等节点信息
-│   │   └── *_test.go          # 测试文件
+│   │   └── peer.go            # 对等节点信息
 │   ├── nat/                   # NAT 类型检测
-│   │   ├── nat.go             # NAT 类型检测实现
-│   │   └── nat_test.go        # NAT 测试
+│   │   └── nat.go             # NAT 类型检测实现
 │   ├── routing/               # 路由表管理
-│   │   ├── table.go           # 智能路由表
-│   │   └── table_test.go      # 路由测试
+│   │   └── table.go           # 智能路由表
 │   └── tunnel/                # 隧道核心逻辑
 │       ├── tunnel.go          # 隧道主逻辑
 │       ├── tun.go             # TUN 设备管理
-│       ├── mtu_discovery.go   # MTU 自动检测
-│       └── *_test.go          # 测试文件
+│       └── mtu_discovery.go   # MTU 自动检测
 ├── docs/                       # 文档目录
 │   ├── N2N_ANALYSIS.md        # N2N vs 本项目技术对比分析
 │   ├── NAT_DETECTION.md       # NAT 检测指南
@@ -1282,20 +1275,6 @@ go mod download
 
 # 编译
 make build
-
-# 运行所有测试
-make test
-
-# 或直接使用 go test
-go test -v ./...
-
-# 运行特定包的测试
-go test -v ./pkg/crypto
-go test -v ./pkg/p2p
-
-# 运行性能测试
-go test -bench=. ./pkg/crypto
-```
 
 ### 贡献指南
 

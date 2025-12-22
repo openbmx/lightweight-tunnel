@@ -1,4 +1,4 @@
-.PHONY: all build clean install test help install-service
+.PHONY: all build clean install help install-service
 
 # Binary name
 BINARY_NAME=lightweight-tunnel
@@ -16,7 +16,6 @@ GOBIN=$(GOBASE)/$(OUTPUT_DIR)
 GOCMD=go
 GOBUILD=$(GOCMD) build
 GOCLEAN=$(GOCMD) clean
-GOTEST=$(GOCMD) test
 GOGET=$(GOCMD) get
 GOMOD=$(GOCMD) mod
 
@@ -45,11 +44,6 @@ install:
 	$(GOMOD) download
 	$(GOMOD) tidy
 	@echo "Dependencies installed"
-
-## test: Run tests
-test:
-	@echo "Running tests..."
-	$(GOTEST) -v ./...
 
 ## install-service: Install systemd service (CONFIG_PATH=/path/to/config.json SERVICE_NAME=name)
 install-service:
