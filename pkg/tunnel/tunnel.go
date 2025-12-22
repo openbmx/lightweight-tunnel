@@ -36,6 +36,9 @@ const (
 	PacketTypePunch        = 0x06 // Server requests simultaneous hole-punch
 	PacketTypeConfigUpdate = 0x07 // Server pushes new config (e.g., rotated key)
 	PacketTypeP2PRequest   = 0x08 // Client requests P2P connection to another client
+	PacketTypeIPRegister   = 0x09 // Client requests IP registration (centralized management)
+	PacketTypeIPAccept     = 0x0A // Server accepts IP registration
+	PacketTypeIPReject     = 0x0B // Server rejects IP registration (conflict)
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -1571,12 +1574,26 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 				// Register client IP if not yet registered
 				if client.clientIP == nil {
+					// Prevent source IP spoofing: reject if srcIP is server's IP
+					if srcIP.Equal(t.myTunnelIP) {
+						log.Printf("WARNING: Client %s attempting to spoof source IP as server IP %s. Dropping packet.",
+							client.conn.RemoteAddr(), srcIP)
+						continue
+					}
+					
+					// Prevent source IP spoofing: reject if srcIP is already registered to another client
+					if existingClient := t.getClientByIP(srcIP); existingClient != nil && existingClient != client {
+						log.Printf("WARNING: Client %s attempting to use source IP %s already registered to %s. Dropping packet.",
+							client.conn.RemoteAddr(), srcIP, existingClient.conn.RemoteAddr())
+						continue
+					}
+					
 					// First packet from this client, register its IP
 					t.addClient(client, srcIP)
 				} else if !client.clientIP.Equal(srcIP) {
 					// Client is trying to send packets with a different source IP
-					// This is a potential DoS/hijacking attempt
-					log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Dropping packet.",
+					// This is a potential DoS/hijacking attempt or routing loop
+					log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Possible IP spoofing or routing loop. Dropping packet.",
 						client.conn.RemoteAddr(), srcIP, client.clientIP)
 					continue
 				}
@@ -1999,7 +2016,8 @@ func (t *Tunnel) handlePeerInfoFromServer(data []byte) {
 // handlePunchFromServer handles a server-initiated punch control packet
 func (t *Tunnel) handlePunchFromServer(data []byte) {
 	// Parse peer information from packet
-	// Format: TunnelIP|PublicAddr|LocalAddr|NATType (NAT type is optional)
+	// Format: TunnelIP|PublicAddr|LocalAddr|NATType|timestamp_ms
+	// The timestamp_ms (if present) indicates coordinated punch time for symmetric NAT
 	info := string(data)
 	parts := strings.Split(info, "|")
 	if len(parts) < 3 {
@@ -2027,13 +2045,27 @@ func (t *Tunnel) handlePunchFromServer(data []byte) {
 			peer.SetNATType(nat.NATType(natTypeNum))
 		}
 	}
+	
+	// Parse coordination timestamp if available (5th parameter) for symmetric NAT
+	var punchDelay time.Duration
+	if len(parts) >= 5 {
+		var targetTimestamp int64
+		if _, err := fmt.Sscanf(parts[4], "%d", &targetTimestamp); err == nil {
+			now := time.Now().UnixMilli()
+			delay := targetTimestamp - now
+			if delay > 0 && delay < 5000 { // Reasonable range: 0-5 seconds
+				punchDelay = time.Duration(delay) * time.Millisecond
+				log.Printf("PUNCH for %s: coordinated start in %dms", tunnelIP, delay)
+			}
+		}
+	}
 
 	// Add to routing table first
 	if t.routingTable != nil {
 		t.routingTable.AddPeer(peer)
 	}
 
-	// Then add to P2P manager and immediately attempt connection (no delay for PUNCH)
+	// Then add to P2P manager and attempt connection with timing coordination
 	// PUNCH messages indicate both sides should attempt simultaneously
 	if t.p2pManager != nil {
 		t.p2pManager.AddPeer(peer)
@@ -2045,6 +2077,11 @@ func (t *Tunnel) handlePunchFromServer(data []byte) {
 		}
 
 		go func() {
+			// Wait for coordinated timing if specified (symmetric NAT optimization)
+			if punchDelay > 0 {
+				time.Sleep(punchDelay)
+			}
+			
 			t.p2pManager.ConnectToPeer(tunnelIP)
 			// Update routes after P2P handshake attempt
 			t.updateRoutesAfterP2PAttempt(tunnelIP, "PUNCH")
@@ -3263,7 +3300,7 @@ func (t *Tunnel) parseNATTypeFromPeerInfo(peerInfo string) nat.NATType {
 	return nat.NATUnknown
 }
 
-// sendPeerInfoAndPunch sends peer info and punch request to a client
+// sendPeerInfoAndPunch sends peer info and punch request to a client with timing coordination
 func (t *Tunnel) sendPeerInfoAndPunch(client *ClientConnection, peerInfo string) {
 	// Send peer info
 	peerInfoPacket := make([]byte, len(peerInfo)+1)
@@ -3281,10 +3318,13 @@ func (t *Tunnel) sendPeerInfoAndPunch(client *ClientConnection, peerInfo string)
 		return
 	}
 	
-	// Send PUNCH command
-	punchPacket := make([]byte, len(peerInfo)+1)
+	// Send PUNCH command with timing hint for symmetric NAT
+	// Format: peerInfo|timestamp_ms (timestamp for coordination)
+	punchDelay := 200 // milliseconds - delay before starting punch attempts
+	punchInfo := fmt.Sprintf("%s|%d", peerInfo, time.Now().UnixMilli()+int64(punchDelay))
+	punchPacket := make([]byte, len(punchInfo)+1)
 	punchPacket[0] = PacketTypePunch
-	copy(punchPacket[1:], []byte(peerInfo))
+	copy(punchPacket[1:], []byte(punchInfo))
 	
 	encryptedPunch, err := t.encryptForClient(client, punchPacket)
 	if err != nil {
