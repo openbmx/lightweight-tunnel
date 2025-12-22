@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -357,7 +358,7 @@ func (m *Manager) performHandshakeWithFallback(conn *Connection, peer *PeerInfo)
 	
 	// Perform handshake to public address directly (not via wrapper)
 	// The defer above will clear the flag when this function returns
-	m.performHandshakeInternal(conn, false)
+	m.performHandshakeInternal(conn, false, nil)
 }
 
 // tryHandshakeWithTimeout attempts handshake with a specific timeout
@@ -390,6 +391,11 @@ func (m *Manager) tryHandshakeWithTimeout(conn *Connection, timeout time.Duratio
 
 // performHandshake is a wrapper that manages the handshakeInProgress flag
 func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
+	m.performHandshakeWithCallback(conn, isLocal, nil)
+}
+
+// performHandshakeWithCallback is like performHandshake but calls a callback on success
+func (m *Manager) performHandshakeWithCallback(conn *Connection, isLocal bool, onSuccess func(*net.UDPAddr)) {
 	// Ensure we clear the handshakeInProgress flag when done
 	defer func() {
 		conn.mu.Lock()
@@ -397,19 +403,41 @@ func (m *Manager) performHandshake(conn *Connection, isLocal bool) {
 		conn.mu.Unlock()
 	}()
 	
-	m.performHandshakeInternal(conn, isLocal)
+	m.performHandshakeInternal(conn, isLocal, onSuccess)
 }
 
 // performHandshakeInternal performs NAT hole punching handshake with aggressive retry strategy
-func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
+func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool, onSuccess func(*net.UDPAddr)) {
 	// Initial burst: Send multiple handshake packets rapidly to establish NAT mapping
 	handshakeMsg := []byte("P2P_HANDSHAKE")
 	
 	log.Printf("Starting aggressive handshake to %s (%d attempts, %v interval)", 
 		conn.PeerIP, HandshakeAttempts, HandshakeInterval)
 	
+	// Helper to check connection and call callback
+	checkAndNotify := func(context string) bool {
+		m.mu.RLock()
+		connected := m.isPeerConnected(conn.PeerIP.String())
+		m.mu.RUnlock()
+		if connected {
+			log.Printf("P2P connection established %s", context)
+			if onSuccess != nil {
+				onSuccess(conn.RemoteAddr)
+			}
+			return true
+		}
+		return false
+	}
+	
 	// Phase 1: Initial rapid burst
 	for i := 0; i < HandshakeAttempts; i++ {
+		// Check stop channel before each attempt
+		select {
+		case <-conn.stopCh:
+			return
+		default:
+		}
+		
 		// Check connection status every few iterations to reduce lock contention
 		// Check more frequently towards the end when connection is more likely established
 		checkInterval := HandshakeCheckInterval
@@ -418,11 +446,7 @@ func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 		}
 		
 		if i > 0 && i%checkInterval == 0 {
-			m.mu.RLock()
-			connected := m.isPeerConnected(conn.PeerIP.String())
-			m.mu.RUnlock()
-			if connected {
-				log.Printf("P2P connection established during handshake burst (attempt %d)", i+1)
+			if checkAndNotify(fmt.Sprintf("during handshake burst (attempt %d)", i+1)) {
 				return
 			}
 		}
@@ -441,12 +465,15 @@ func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 	
 	// Phase 2: Continuous retries with backoff
 	for retry := 0; retry < HandshakeContinuousRetries; retry++ {
+		// Check stop channel before each retry
+		select {
+		case <-conn.stopCh:
+			return
+		default:
+		}
+		
 		// Check if already connected
-		m.mu.RLock()
-		connected := m.isPeerConnected(conn.PeerIP.String())
-		m.mu.RUnlock()
-		if connected {
-			log.Printf("P2P connection established during retry phase %d", retry+1)
+		if checkAndNotify(fmt.Sprintf("during retry phase %d", retry+1)) {
 			return
 		}
 		
@@ -456,13 +483,16 @@ func (m *Manager) performHandshakeInternal(conn *Connection, isLocal bool) {
 		// Send another burst
 		log.Printf("Retry phase %d/%d for %s", retry+1, HandshakeContinuousRetries, conn.PeerIP)
 		for i := 0; i < HandshakeAttempts/2; i++ {
+			// Check stop channel
+			select {
+			case <-conn.stopCh:
+				return
+			default:
+			}
+			
 			// Check connection status periodically in retry phase to reduce lock contention
 			if i > 0 && i%HandshakeCheckIntervalAccelerated == 0 {
-				m.mu.RLock()
-				connected := m.isPeerConnected(conn.PeerIP.String())
-				m.mu.RUnlock()
-				if connected {
-					log.Printf("P2P connection established during retry burst (retry %d, attempt %d)", retry+1, i+1)
+				if checkAndNotify(fmt.Sprintf("during retry burst (retry %d, attempt %d)", retry+1, i+1)) {
 					return
 				}
 			}
@@ -670,15 +700,15 @@ func (m *Manager) findPeerByAddr(addr *net.UDPAddr) net.IP {
 	
 	addrStr := addr.String()
 	
-	// Check both public and local addresses
+	// Check both public and local addresses in peer info
 	for _, peer := range m.peers {
 		if peer.PublicAddr == addrStr || peer.LocalAddr == addrStr {
 			return peer.TunnelIP
 		}
 	}
 	
-	// Also check connections
-	for _, conn := range m.connections {
+	// Also check connections (including port prediction connections with composite keys)
+	for key, conn := range m.connections {
 		// Skip nil connections
 		if conn == nil || conn.RemoteAddr == nil {
 			continue
@@ -686,6 +716,14 @@ func (m *Manager) findPeerByAddr(addr *net.UDPAddr) net.IP {
 		// Exact match on remote address (IP:port)
 		if conn.RemoteAddr.String() == addrStr {
 			return conn.PeerIP
+		}
+		// Also check composite keys (ipStr|remoteAddr) used for port prediction
+		// Extract the remoteAddr part after the | separator
+		if strings.Contains(key, "|") {
+			parts := strings.SplitN(key, "|", 2)
+			if len(parts) == 2 && parts[1] == addrStr {
+				return conn.PeerIP
+			}
 		}
 	}
 	
@@ -877,36 +915,75 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 	basePort := publicAddr.Port
 	log.Printf("Symmetric NAT port prediction: trying ports around %d for %s", basePort, ipStr)
 	
+	// Create shared stop channel for all prediction attempts
+	// This allows early termination when first connection succeeds
+	sharedStopCh := make(chan struct{})
+	
 	// Create the primary connection with the known port
 	primaryConn := &Connection{
 		RemoteAddr:         publicAddr,
 		PeerIP:             peerTunnelIP,
 		IsLocalNetwork:     false,
 		sendQueue:          make(chan []byte, 100),
-		stopCh:             make(chan struct{}),
+		stopCh:             sharedStopCh,
 		handshakeStartTime: time.Now(),
 		lastHandshakeTime:  time.Now(),
 	}
 	
 	// Store the primary connection
+	m.mu.Lock()
 	m.connections[ipStr] = primaryConn
+	m.mu.Unlock()
+	
+	// Create a map to track all prediction connections by their remote address
+	// This allows findPeerByAddr to find them when responses arrive
+	predictionConns := make(map[string]*Connection)
+	var predictionMu sync.Mutex
+	
+	// Success callback: stops all other attempts when first succeeds
+	onSuccess := func(successfulAddr *net.UDPAddr) {
+		// Close shared stop channel to terminate all other attempts
+		select {
+		case <-sharedStopCh:
+			// Already closed
+		default:
+			close(sharedStopCh)
+		}
+		
+		// Remove all prediction connections from the map except the successful one
+		predictionMu.Lock()
+		defer predictionMu.Unlock()
+		for addrStr, conn := range predictionConns {
+			if conn.RemoteAddr.String() != successfulAddr.String() {
+				// Remove unsuccessful prediction connections
+				m.mu.Lock()
+				delete(m.connections, ipStr+"|"+addrStr)
+				m.mu.Unlock()
+			}
+		}
+		
+		log.Printf("✓ Port prediction successful for %s using port %d", ipStr, successfulAddr.Port)
+	}
 	
 	// Start handshake to primary port
-	go m.performHandshake(primaryConn, false)
+	go m.performHandshakeWithCallback(primaryConn, false, onSuccess)
 	
 	// Priority 1: Try sequential ports first (most common NAT behavior)
 	// Many NATs allocate ports sequentially, so try nearby sequential ports
-	// Generate list programmatically based on PortPredictionSequentialRange
-	// Pre-allocate slice for efficiency
 	sequentialPorts := make([]int, 0, PortPredictionSequentialRange*2)
 	for offset := 1; offset <= PortPredictionSequentialRange; offset++ {
 		sequentialPorts = append(sequentialPorts, basePort+offset)
 		sequentialPorts = append(sequentialPorts, basePort-offset)
 	}
 	
-	for _, predictedPort := range sequentialPorts {
+	// Rate limiting: add small delay between prediction attempts to avoid triggering ISP DDoS detection
+	// Send in batches of 10 with 10ms delay between batches
+	const batchSize = 10
+	const batchDelay = 10 * time.Millisecond
+	
+	attemptPort := func(predictedPort int, isSequential bool) {
 		if predictedPort < 1024 || predictedPort > 65535 {
-			continue // Skip invalid ports
+			return // Skip invalid ports
 		}
 		
 		predictedAddr := &net.UDPAddr{
@@ -920,47 +997,74 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 			PeerIP:             peerTunnelIP,
 			IsLocalNetwork:     false,
 			sendQueue:          make(chan []byte, 100),
-			stopCh:             primaryConn.stopCh, // Share stop channel
+			stopCh:             sharedStopCh, // Share stop channel for early termination
 			handshakeStartTime: time.Now(),
 			lastHandshakeTime:  time.Now(),
 		}
 		
-		// Start handshake to predicted port (will stop when primary succeeds)
-		go m.performHandshake(tempConn, false)
+		// Add to prediction connections map
+		predictionMu.Lock()
+		addrStr := predictedAddr.String()
+		predictionConns[addrStr] = tempConn
+		predictionMu.Unlock()
+		
+		// Add to main connections map with unique key so findPeerByAddr can find it
+		// Use composite key: ipStr|remoteAddr to avoid collision with primary connection
+		m.mu.Lock()
+		m.connections[ipStr+"|"+addrStr] = tempConn
+		m.mu.Unlock()
+		
+		// Start handshake to predicted port (will stop when any connection succeeds)
+		go m.performHandshakeWithCallback(tempConn, false, onSuccess)
+	}
+	
+	// Process sequential ports in batches
+	for i, predictedPort := range sequentialPorts {
+		// Check if already stopped
+		select {
+		case <-sharedStopCh:
+			log.Printf("Port prediction stopped early after %d sequential attempts", i)
+			return nil
+		default:
+		}
+		
+		attemptPort(predictedPort, true)
+		
+		// Add delay after each batch
+		if (i+1)%batchSize == 0 {
+			time.Sleep(batchDelay)
+		}
 	}
 	
 	// Priority 2: Try wider range for less predictable NATs
+	widerPorts := make([]int, 0, PortPredictionRange*2)
 	for offset := -PortPredictionRange; offset <= PortPredictionRange; offset++ {
 		if offset == 0 || (offset >= -PortPredictionSequentialRange && offset <= PortPredictionSequentialRange) {
 			continue // Already handled above
 		}
-		
-		predictedPort := basePort + offset
-		if predictedPort < 1024 || predictedPort > 65535 {
-			continue // Skip invalid ports
-		}
-		
-		predictedAddr := &net.UDPAddr{
-			IP:   publicAddr.IP,
-			Port: predictedPort,
-		}
-		
-		// Create temporary connection for prediction attempt
-		tempConn := &Connection{
-			RemoteAddr:         predictedAddr,
-			PeerIP:             peerTunnelIP,
-			IsLocalNetwork:     false,
-			sendQueue:          make(chan []byte, 100),
-			stopCh:             primaryConn.stopCh, // Share stop channel
-			handshakeStartTime: time.Now(),
-			lastHandshakeTime:  time.Now(),
-		}
-		
-		// Start handshake to predicted port (will stop when primary succeeds)
-		go m.performHandshake(tempConn, false)
+		widerPorts = append(widerPorts, basePort+offset)
 	}
 	
-	log.Printf("Started port prediction handshake for %s (sequential + wide range)", ipStr)
+	// Process wider range in batches with rate limiting
+	for i, predictedPort := range widerPorts {
+		// Check if already stopped
+		select {
+		case <-sharedStopCh:
+			log.Printf("Port prediction stopped early after %d total attempts", len(sequentialPorts)+i)
+			return nil
+		default:
+		}
+		
+		attemptPort(predictedPort, false)
+		
+		// Add delay after each batch
+		if (i+1)%batchSize == 0 {
+			time.Sleep(batchDelay)
+		}
+	}
+	
+	log.Printf("Started port prediction handshake for %s (%d sequential + %d wide range attempts with rate limiting)", 
+		ipStr, len(sequentialPorts), len(widerPorts))
 	return nil
 }
 
