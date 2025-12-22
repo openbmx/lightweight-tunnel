@@ -601,8 +601,14 @@ func (t *Tunnel) removeClient(client *ClientConnection) {
 	if client.clientIP != nil {
 		clientIP = client.clientIP
 		ipStr := clientIP.String()
-		delete(t.clients, ipStr)
-		log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
+		// Only remove if this client still owns the IP
+		// Prevents race where a new client with the same IP has already replaced this one
+		if currentClient, exists := t.clients[ipStr]; exists && currentClient == client {
+			delete(t.clients, ipStr)
+			log.Printf("Client unregistered: %s (remaining clients: %d)", ipStr, len(t.clients))
+		} else if exists {
+			log.Printf("Client %s no longer owns IP %s, skipping removal (already replaced)", client.conn.RemoteAddr(), ipStr)
+		}
 	}
 	t.clientsMux.Unlock()
 
@@ -1035,7 +1041,21 @@ func (t *Tunnel) tunReaderServer() {
 		if dstIP.Equal(t.myTunnelIP) {
 			log.Printf("WARNING: Unexpected packet from TUN destined for server itself (dstIP=%s). This might indicate a routing loop.", dstIP)
 			// Drop the packet to prevent infinite loop
+			t.releasePacketBuffer(buf)
 			continue
+		}
+
+		// Enforce client isolation: if enabled, block forwarding between clients
+		// This prevents packets from being forwarded from TUN back to clients
+		// even if kernel routing would normally route them
+		if t.config.ClientIsolation {
+			// Check if destination is a registered client
+			if t.getClientByIP(dstIP) != nil {
+				// Drop packet - client isolation prevents client-to-client communication
+				log.Printf("Client isolation: dropping packet to client %s from TUN (likely kernel route)", dstIP)
+				t.releasePacketBuffer(buf)
+				continue
+			}
 		}
 
 		// Find the client with this destination IP
@@ -1533,7 +1553,14 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 
 				// Register client IP if not yet registered
 				if client.clientIP == nil {
+					// First packet from this client, register its IP
 					t.addClient(client, srcIP)
+				} else if !client.clientIP.Equal(srcIP) {
+					// Client is trying to send packets with a different source IP
+					// This is a potential DoS/hijacking attempt
+					log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Dropping packet.",
+						client.conn.RemoteAddr(), srcIP, client.clientIP)
+					continue
 				}
 
 				// Route packet based on destination
@@ -1558,23 +1585,42 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 					if targetClient != nil && targetClient != client {
 						// Forward to target client (server relay mode)
 						// This is expected when P2P is not yet established or when P2P fails
+						// 
+						// IMPORTANT: payload comes from aead.Open which allocates a new slice
+						// We need to copy it into a pooled buffer so it can be properly recycled
+						forwardBuf := t.getPacketBuffer()
+						forwardPacket := forwardBuf[:len(payload)]
+						copy(forwardPacket, payload)
+						
+						queued := false
 						select {
-						case targetClient.sendQueue <- payload:
+						case targetClient.sendQueue <- forwardPacket:
+							queued = true
 						case <-t.stopCh:
+							t.releasePacketBuffer(forwardBuf)
 							return
 						case <-client.stopCh:
+							t.releasePacketBuffer(forwardBuf)
 							return
 						case <-time.After(QueueSendTimeout):
 							// Wait for queue space
 							select {
-							case targetClient.sendQueue <- payload:
+							case targetClient.sendQueue <- forwardPacket:
+								queued = true
 							case <-t.stopCh:
+								t.releasePacketBuffer(forwardBuf)
 								return
 							case <-client.stopCh:
+								t.releasePacketBuffer(forwardBuf)
 								return
 							default:
 								log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
+								t.releasePacketBuffer(forwardBuf)
 							}
+						}
+						// Only release if not queued (clientNetWriter will release if queued)
+						if !queued {
+							t.releasePacketBuffer(forwardBuf)
 						}
 					} else {
 						// Send to TUN device (for server or unknown destination)
@@ -3172,23 +3218,30 @@ func (t *Tunnel) processP2PConnection(requestingClient, targetClient *ClientConn
 // parseNATTypeFromPeerInfo extracts NAT type from peer info string
 func (t *Tunnel) parseNATTypeFromPeerInfo(peerInfo string) nat.NATType {
 	// Format: TunnelIP|PublicAddr|LocalAddr|NATType (NAT type is optional)
+	// NATType is sent as an integer (0-5) not as a string
 	parts := strings.Split(peerInfo, "|")
 	if len(parts) >= 4 {
-		// Try to parse NAT type
-		switch parts[3] {
-		case "None (Public IP)":
-			return nat.NATNone
-		case "Full Cone":
-			return nat.NATFullCone
-		case "Restricted Cone":
-			return nat.NATRestrictedCone
-		case "Port-Restricted Cone":
-			return nat.NATPortRestrictedCone
-		case "Symmetric":
-			return nat.NATSymmetric
+		// Parse NAT type as integer
+		var natTypeNum int
+		if _, err := fmt.Sscanf(parts[3], "%d", &natTypeNum); err == nil {
+			// Convert integer to NATType enum
+			switch natTypeNum {
+			case 0:
+				return nat.NATUnknown
+			case 1:
+				return nat.NATNone
+			case 2:
+				return nat.NATFullCone
+			case 3:
+				return nat.NATRestrictedCone
+			case 4:
+				return nat.NATPortRestrictedCone
+			case 5:
+				return nat.NATSymmetric
+			}
 		}
 	}
-	// Default to unknown if not specified
+	// Default to unknown if not specified or parse fails
 	return nat.NATUnknown
 }
 

@@ -712,8 +712,47 @@ func (l *ListenerRaw) acceptLoop() {
 			continue
 		}
 
-		// 3. 处理已连接的数据包（只处理有payload的包）
+		// 3. 处理已连接的数据包
 		if exists && conn.isConnected {
+			// Update last activity time for all packets (including control packets)
+			conn.mu.Lock()
+			conn.lastActivity = time.Now()
+			conn.mu.Unlock()
+
+			// Handle FIN or RST packets (connection close)
+			if flags&(FIN|RST) != 0 {
+				// Connection is being closed
+				log.Printf("Received %s from %s:%d, closing connection",
+					func() string {
+						if flags&FIN != 0 {
+							return "FIN"
+						}
+						return "RST"
+					}(), srcIP, srcPort)
+				
+				// Mark connection as closed
+				atomic.StoreInt32(&conn.closed, 1)
+				
+				// Send ACK for FIN if needed
+				if flags&FIN != 0 {
+					conn.mu.Lock()
+					conn.ackNum = seq + 1 // FIN consumes one sequence number
+					ackToSend := conn.ackNum
+					seqToUse := conn.seqNum
+					conn.mu.Unlock()
+					
+					if err := l.rawSocket.SendPacket(conn.localIP, conn.srcPort, conn.remoteIP, conn.dstPort,
+						seqToUse, ackToSend, ACK, conn.buildTCPOptions(), nil); err != nil {
+						log.Printf("Failed to send ACK for FIN to %s:%d: %v", conn.remoteIP, conn.remotePort, err)
+					}
+				}
+				
+				// Remove from connection map
+				delete(l.connMap, connKey)
+				l.mu.Unlock()
+				continue
+			}
+
 			// 只处理有实际数据的包，忽略纯ACK、keepalive等控制包
 			if len(payload) > 0 {
 				conn.mu.Lock()
