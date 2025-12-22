@@ -108,6 +108,18 @@ func LoadConfig(filename string) (*Config, error) {
 	if config.FECParityShards == 0 {
 		config.FECParityShards = 3
 	}
+	
+	// Validate FEC parameters to prevent bandwidth waste
+	if config.FECDataShards < 1 || config.FECDataShards > 255 {
+		return nil, fmt.Errorf("FECDataShards must be between 1 and 255, got %d", config.FECDataShards)
+	}
+	if config.FECParityShards < 1 || config.FECParityShards > 255 {
+		return nil, fmt.Errorf("FECParityShards must be between 1 and 255, got %d", config.FECParityShards)
+	}
+	// Warn if FEC configuration would cause excessive fragmentation
+	if config.FECDataShards > 20 {
+		return nil, fmt.Errorf("FECDataShards too high (%d), would cause excessive packet fragmentation. Recommended: 4-20", config.FECDataShards)
+	}
 	if config.Timeout == 0 {
 		config.Timeout = 30
 	}

@@ -17,6 +17,17 @@ import (
 
 const (
 	rawRecvQueueSize = 4096 // large buffer to avoid drops under high throughput
+	
+	// metricsReportInterval is how often to log packet filtering statistics
+	// Helps monitor raw socket filtering efficiency in production
+	metricsReportInterval = 60 * time.Second
+	
+	// maxBufferedPackets limits out-of-order packet buffer size
+	// Value chosen based on typical TCP window size and memory constraints:
+	// - 32 packets * 1500 bytes/packet = 48KB max memory per connection
+	// - Covers reasonable out-of-order scenarios without excessive memory usage
+	// - Prevents memory exhaustion from malicious out-of-order packet floods
+	maxBufferedPackets = 32
 )
 
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)
@@ -55,6 +66,12 @@ type ConnRaw struct {
 	isListener    bool      // true表示这是listener接受的连接，不需要启动recvLoop
 	ownsResources bool      // true表示拥有rawSocket和iptablesMgr的所有权，关闭时需要清理
 	lastActivity  time.Time // Last time this connection had activity (for cleanup)
+	
+	// DPI resistance: sliding window and out-of-order handling
+	recvWindow     map[uint32][]byte // out-of-order packet buffer (seq -> payload)
+	recvWindowMu   sync.Mutex        // protects recvWindow
+	expectedSeq    uint32            // next expected sequence number
+	windowSize     uint32            // TCP receive window size
 }
 
 // NewConnRaw creates a new raw socket connection
@@ -94,6 +111,9 @@ func NewConnRaw(localIP net.IP, localPort uint16, remoteIP net.IP, remotePort ui
 		stopCh:        make(chan struct{}),
 		isListener:    false,
 		ownsResources: true, // 客户端连接拥有资源所有权
+		recvWindow:    make(map[uint32][]byte),
+		expectedSeq:   0,       // Will be set after handshake
+		windowSize:    65535,   // Standard TCP window size
 	}
 
 	// 只有客户端连接才启动recvLoop，服务端连接由acceptLoop统一分发
@@ -198,6 +218,11 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 					// Got SYN-ACK
 					c.seqNum++ // SYN consumes one sequence number
 					c.ackNum = hdr.SeqNum + 1
+					
+					// Initialize expected sequence for DPI resistance
+					c.recvWindowMu.Lock()
+					c.expectedSeq = c.ackNum
+					c.recvWindowMu.Unlock()
 
 					// Send ACK
 					err = c.rawSocket.SendPacket(c.localIP, c.localPort, c.remoteIP, c.remotePort,
@@ -231,6 +256,10 @@ func (c *ConnRaw) performHandshake(timeout time.Duration) error {
 }
 
 // recvLoop continuously receives packets from raw socket (只用于客户端连接)
+// PERFORMANCE NOTE: Raw sockets receive ALL TCP packets destined for the host.
+// Current implementation filters packets in user space by checking connection tuple.
+// Future optimization: Consider using BPF (Berkeley Packet Filter) for kernel-space
+// filtering to reduce CPU usage in high-traffic environments.
 func (c *ConnRaw) recvLoop() {
 	defer c.wg.Done()
 
@@ -238,12 +267,30 @@ func (c *ConnRaw) recvLoop() {
 	if c.isListener {
 		return
 	}
+	
+	// Metrics for monitoring filtering efficiency
+	var totalPacketsReceived uint64
+	var packetsFiltered uint64
+	var packetsProcessed uint64
+	metricsInterval := time.NewTicker(metricsReportInterval)
+	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-c.stopCh:
 			return
+		case <-metricsInterval.C:
+			// Log filtering efficiency metrics periodically
+			if totalPacketsReceived > 0 {
+				filterRate := float64(packetsFiltered) / float64(totalPacketsReceived) * 100
+				log.Printf("Raw socket filtering efficiency: %d total, %d filtered (%.1f%%), %d processed",
+					totalPacketsReceived, packetsFiltered, filterRate, packetsProcessed)
+			}
+			// Reset counters
+			totalPacketsReceived = 0
+			packetsFiltered = 0
+			packetsProcessed = 0
 		default:
 		}
 
@@ -255,22 +302,30 @@ func (c *ConnRaw) recvLoop() {
 			// Timeout or other errors - continue
 			continue
 		}
+		
+		totalPacketsReceived++
 
 		// Filter packets: only accept packets for our connection
+		// This is necessary because raw sockets don't provide automatic demultiplexing
 		if c.isConnected {
 			// Client mode: accept packets from server
 			if !srcIP.Equal(c.remoteIP) || srcPort != c.remotePort {
+				packetsFiltered++
 				continue
 			}
 			if !dstIP.Equal(c.localIP) || dstPort != c.localPort {
+				packetsFiltered++
 				continue
 			}
 		} else {
 			// Server mode: accept packets from any client (will be handled by listener)
 			if !dstIP.Equal(c.localIP) || dstPort != c.localPort {
+				packetsFiltered++
 				continue
 			}
 		}
+		
+		packetsProcessed++
 
 		// Update ack number and immediately acknowledge payload to keep TCP disguise realistic
 		if len(payload) > 0 {
@@ -612,12 +667,30 @@ func ListenRaw(addr string) (*ListenerRaw, error) {
 // acceptLoop handles incoming connections
 func (l *ListenerRaw) acceptLoop() {
 	defer l.wg.Done()
+	
+	// Metrics for monitoring server-side filtering efficiency
+	var totalPacketsReceived uint64
+	var packetsFiltered uint64
+	var packetsProcessed uint64
+	metricsInterval := time.NewTicker(metricsReportInterval)
+	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
 	for {
 		select {
 		case <-l.stopCh:
 			return
+		case <-metricsInterval.C:
+			// Log filtering efficiency metrics periodically
+			if totalPacketsReceived > 0 {
+				filterRate := float64(packetsFiltered) / float64(totalPacketsReceived) * 100
+				log.Printf("Server raw socket filtering: %d total, %d filtered (%.1f%%), %d processed",
+					totalPacketsReceived, packetsFiltered, filterRate, packetsProcessed)
+			}
+			// Reset counters
+			totalPacketsReceived = 0
+			packetsFiltered = 0
+			packetsProcessed = 0
 		default:
 		}
 
@@ -626,11 +699,18 @@ func (l *ListenerRaw) acceptLoop() {
 		if err != nil {
 			continue
 		}
+		
+		totalPacketsReceived++
 
 		// Filter packets for our port
+		// PERFORMANCE: This is basic port-based filtering in user space
+		// For production with high traffic, consider BPF for kernel-space filtering
 		if dstPort != l.localPort {
+			packetsFiltered++
 			continue
 		}
+		
+		packetsProcessed++
 
 		connKey := fmt.Sprintf("%s:%d", srcIP.String(), srcPort)
 
@@ -665,6 +745,9 @@ func (l *ListenerRaw) acceptLoop() {
 				isListener:    true,
 				ownsResources: false,        // 服务端连接不拥有资源（共享）
 				lastActivity:  time.Now(),   // Initialize lastActivity
+				recvWindow:    make(map[uint32][]byte),
+				expectedSeq:   seq + 1,      // Expect next byte after SYN
+				windowSize:    65535,        // Standard TCP window size
 			}
 
 			// Send SYN-ACK
@@ -931,4 +1014,43 @@ func (l *ListenerRaw) Addr() net.Addr {
 		IP:   l.localIP,
 		Port: int(l.localPort),
 	}
+}
+
+// handleOutOfOrderPacket buffers out-of-order packets and returns ordered payloads when gaps are filled
+// This makes the TCP stream more realistic for DPI inspection
+func (c *ConnRaw) handleOutOfOrderPacket(seq uint32, payload []byte) [][]byte {
+	c.recvWindowMu.Lock()
+	defer c.recvWindowMu.Unlock()
+	
+	// Fast path: packet is in order
+	if seq == c.expectedSeq {
+		result := make([][]byte, 0, 1)
+		result = append(result, payload)
+		c.expectedSeq += uint32(len(payload))
+		
+		// Check if we can deliver buffered packets
+		for {
+			if buffered, exists := c.recvWindow[c.expectedSeq]; exists {
+				result = append(result, buffered)
+				delete(c.recvWindow, c.expectedSeq)
+				c.expectedSeq += uint32(len(buffered))
+			} else {
+				break
+			}
+		}
+		
+		return result
+	}
+	
+	// Out of order packet - buffer it if within window
+	// Prevent memory exhaustion from too many buffered packets
+	if len(c.recvWindow) < maxBufferedPackets {
+		// Only buffer future packets (not duplicates or old packets)
+		if seq > c.expectedSeq && seq < c.expectedSeq+c.windowSize {
+			c.recvWindow[seq] = payload
+		}
+	}
+	
+	// Return empty slice - packet was buffered
+	return nil
 }
