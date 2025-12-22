@@ -411,7 +411,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	if cfg.Mode == "client" {
 		t.sendQueue = make(chan []byte, cfg.SendQueueSize)
 		t.recvQueue = make(chan []byte, cfg.RecvQueueSize)
-		
+
 		// Determine server's tunnel IP for P2P exclusion
 		// The server always uses .1 in the tunnel network
 		serverIP, err := getServerTunnelIP(cfg.TunnelAddr)
@@ -422,7 +422,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 			t.serverTunnelIP = serverIP
 			log.Printf("Server tunnel IP: %s (will not use P2P for this address)", serverIP)
 		}
-		
+
 		// Register server as a peer in the routing table so stats show the
 		// server route even when no other clients are present.
 		if t.routingTable != nil {
@@ -2526,12 +2526,12 @@ func (t *Tunnel) shouldRequestP2P(targetIP net.IP) bool {
 	if t.serverTunnelIP != nil && targetIP.Equal(t.serverTunnelIP) {
 		return false
 	}
-	
+
 	targetIPStr := targetIP.String()
-	
+
 	t.p2pRequestMux.Lock()
 	defer t.p2pRequestMux.Unlock()
-	
+
 	// Check if request already pending
 	if lastReq, exists := t.pendingP2PRequests[targetIPStr]; exists {
 		// Allow retry after 10 seconds if P2P hasn't been established
@@ -3259,13 +3259,13 @@ func (t *Tunnel) handleP2PRequest(requestingClient *ClientConnection, payload []
 		log.Printf("Invalid P2P request: bad target IP %s", targetIPStr)
 		return
 	}
-	
+
 	// Reject P2P requests targeting the server itself
 	if targetIP.Equal(t.myTunnelIP) {
 		log.Printf("P2P request for server IP %s rejected (server should not use P2P)", targetIPStr)
 		return
 	}
-	
+
 	// Get requesting client's IP
 	requestingClient.mu.RLock()
 	requestingIP := requestingClient.clientIP
