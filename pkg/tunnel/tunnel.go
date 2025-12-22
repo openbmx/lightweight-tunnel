@@ -166,12 +166,13 @@ type Tunnel struct {
 	xdpAccel *xdp.Accelerator
 
 	// P2P and routing
-	p2pManager    *p2p.Manager          // P2P connection manager
-	routingTable  *routing.RoutingTable // Routing table
-	myTunnelIP    net.IP                // My tunnel IP address
-	publicAddr    string                // Public address as seen by server (for NAT traversal)
-	publicAddrMux sync.RWMutex          // Protects publicAddr
-	connMux       sync.Mutex            // Protects t.conn during reconnects
+	p2pManager     *p2p.Manager          // P2P connection manager
+	routingTable   *routing.RoutingTable // Routing table
+	myTunnelIP     net.IP                // My tunnel IP address
+	serverTunnelIP net.IP                // Server's tunnel IP address (client mode only)
+	publicAddr     string                // Public address as seen by server (for NAT traversal)
+	publicAddrMux  sync.RWMutex          // Protects publicAddr
+	connMux        sync.Mutex            // Protects t.conn during reconnects
 
 	// Connection health tracking (client mode)
 	lastRecvTime time.Time  // Last time we received ANY packet from server
@@ -2382,6 +2383,12 @@ func (t *Tunnel) sendPacketWithRouting(packet []byte) (bool, error) {
 
 	dstIP := net.IP(packet[IPv4DstIPOffset : IPv4DstIPOffset+4])
 
+	// Check if destination is the server's tunnel IP
+	// If so, always send via server connection (never attempt P2P with server)
+	if t.serverTunnelIP != nil && dstIP.Equal(t.serverTunnelIP) {
+		return t.sendViaServer(packet)
+	}
+
 	// On-demand P2P: Check if we have a P2P connection
 	if t.p2pManager != nil && t.p2pManager.IsConnected(dstIP) {
 		// Direct P2P connection exists, use it
@@ -2723,6 +2730,9 @@ func (t *Tunnel) registerServerPeer() {
 	if ip == nil {
 		return
 	}
+
+	// Store the server's tunnel IP for routing decisions
+	t.serverTunnelIP = ip
 
 	peer := p2p.NewPeerInfo(ip)
 	peer.SetThroughServer(true)
