@@ -866,9 +866,11 @@ func (l *ListenerRaw) acceptLoop() {
 				copy(fullData, headerBytes)
 				copy(fullData[len(headerBytes):], payload)
 
+				// Use timeout to avoid blocking if queue is full
 				select {
 				case conn.recvQueue <- fullData:
-				default:
+				case <-time.After(10 * time.Millisecond):
+					log.Printf("Warning: recv queue full during handshake for %s, dropping initial data packet", connKey)
 				}
 			}
 			continue
@@ -932,6 +934,7 @@ func (l *ListenerRaw) acceptLoop() {
 			l.mu.Unlock()
 
 			// Handle data packets with out-of-order reassembly for DPI resistance
+			// Empty payloads (ACK-only packets for keepalive) are ignored as they don't carry data
 			if len(payload) > 0 {
 				// Use handleOutOfOrderPacket to properly sequence packets
 				orderedPayloads := conn.handleOutOfOrderPacket(seq, payload)
