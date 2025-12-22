@@ -17,6 +17,17 @@ import (
 
 const (
 	rawRecvQueueSize = 4096 // large buffer to avoid drops under high throughput
+	
+	// metricsReportInterval is how often to log packet filtering statistics
+	// Helps monitor raw socket filtering efficiency in production
+	metricsReportInterval = 60 * time.Second
+	
+	// maxBufferedPackets limits out-of-order packet buffer size
+	// Value chosen based on typical TCP window size and memory constraints:
+	// - 32 packets * 1500 bytes/packet = 48KB max memory per connection
+	// - Covers reasonable out-of-order scenarios without excessive memory usage
+	// - Prevents memory exhaustion from malicious out-of-order packet floods
+	maxBufferedPackets = 32
 )
 
 // ConnRaw represents a fake TCP connection using raw sockets (真正的TCP伪装)
@@ -261,7 +272,7 @@ func (c *ConnRaw) recvLoop() {
 	var totalPacketsReceived uint64
 	var packetsFiltered uint64
 	var packetsProcessed uint64
-	metricsInterval := time.NewTicker(60 * time.Second)
+	metricsInterval := time.NewTicker(metricsReportInterval)
 	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
@@ -661,7 +672,7 @@ func (l *ListenerRaw) acceptLoop() {
 	var totalPacketsReceived uint64
 	var packetsFiltered uint64
 	var packetsProcessed uint64
-	metricsInterval := time.NewTicker(60 * time.Second)
+	metricsInterval := time.NewTicker(metricsReportInterval)
 	defer metricsInterval.Stop()
 
 	buf := make([]byte, 65535)
@@ -1033,7 +1044,6 @@ func (c *ConnRaw) handleOutOfOrderPacket(seq uint32, payload []byte) [][]byte {
 	
 	// Out of order packet - buffer it if within window
 	// Prevent memory exhaustion from too many buffered packets
-	const maxBufferedPackets = 32
 	if len(c.recvWindow) < maxBufferedPackets {
 		// Only buffer future packets (not duplicates or old packets)
 		if seq > c.expectedSeq && seq < c.expectedSeq+c.windowSize {

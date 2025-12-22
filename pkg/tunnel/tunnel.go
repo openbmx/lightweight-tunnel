@@ -276,9 +276,15 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 
 	// Create FEC encoder/decoder
 	// Calculate optimal shard size to avoid excessive header overhead
-	// Account for protocol overhead: IP(20) + TCP(20) + encryption(~50) = ~90 bytes per packet
+	// Protocol overhead breakdown:
+	//   - IP header: 20 bytes (IPv4 standard)
+	//   - TCP header: 20 bytes (without options)
+	//   - Encryption overhead: ~50 bytes (nonce + auth tag + padding)
+	//   Total: ~90 bytes per packet
 	const protocolOverhead = 90
-	const minShardSize = 512 // Minimum shard size to avoid creating too many small fragments
+	// Minimum shard size to avoid creating too many small fragments
+	// Small fragments (< 512 bytes) cause high PPS and trigger ISP QoS
+	const minShardSize = 512
 	
 	// Calculate shard size: use full MTU minus overhead for each shard
 	shardSize := cfg.MTU - protocolOverhead
@@ -2047,13 +2053,16 @@ func (t *Tunnel) handlePunchFromServer(data []byte) {
 	}
 	
 	// Parse coordination timestamp if available (5th parameter) for symmetric NAT
+	// Maximum delay for timing coordination (milliseconds)
+	// Prevents unreasonably long waits from malformed packets
+	const maxPunchDelayMs = 5000
 	var punchDelay time.Duration
 	if len(parts) >= 5 {
 		var targetTimestamp int64
 		if _, err := fmt.Sscanf(parts[4], "%d", &targetTimestamp); err == nil {
 			now := time.Now().UnixMilli()
 			delay := targetTimestamp - now
-			if delay > 0 && delay < 5000 { // Reasonable range: 0-5 seconds
+			if delay > 0 && delay < maxPunchDelayMs {
 				punchDelay = time.Duration(delay) * time.Millisecond
 				log.Printf("PUNCH for %s: coordinated start in %dms", tunnelIP, delay)
 			}
