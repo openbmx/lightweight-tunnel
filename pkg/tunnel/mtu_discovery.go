@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"runtime"
 	"syscall"
 	"time"
 )
@@ -138,13 +137,9 @@ func (m *MTUDiscovery) testMTU(targetIP string, mtu int) bool {
 	rawConn, err := conn.SyscallConn()
 	if err == nil {
 		rawConn.Control(func(fd uintptr) {
-			if runtime.GOOS == "windows" {
-				// Windows: IP_DONTFRAGMENT = 14
-				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, 14, 1)
-			} else if runtime.GOOS == "linux" {
-				// Linux: IP_MTU_DISCOVER = 10, IP_PMTUDISC_DO = 2
-				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 2)
-			}
+			// Linux: IP_MTU_DISCOVER = 10, IP_PMTUDISC_DO = 2
+			// This is the most common target for this tunnel
+			_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 2)
 		})
 	}
 	
