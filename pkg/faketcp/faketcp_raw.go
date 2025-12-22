@@ -327,7 +327,61 @@ func (c *ConnRaw) recvLoop() {
 		
 		packetsProcessed++
 
-		// Update ack number and immediately acknowledge payload to keep TCP disguise realistic
+		// Handle out-of-order packets for DPI resistance
+		// Only process packets with payload in connected state
+		if c.isConnected && len(payload) > 0 {
+			// Use handleOutOfOrderPacket to properly sequence packets
+			orderedPayloads := c.handleOutOfOrderPacket(seq, payload)
+			
+			// Update ack number based on expected sequence
+			c.recvWindowMu.Lock()
+			ackToSend := c.expectedSeq
+			c.recvWindowMu.Unlock()
+			
+			c.mu.Lock()
+			c.ackNum = ackToSend
+			seqToUse := c.seqNum
+			c.mu.Unlock()
+
+			// Send ACK with updated sequence
+			if err := c.rawSocket.SendPacket(c.localIP, c.srcPort, c.remoteIP, c.dstPort,
+				seqToUse, ackToSend, ACK, c.buildTCPOptions(), nil); err != nil {
+				log.Printf("Failed to send ACK to %s:%d: %v", c.remoteIP, c.remotePort, err)
+			}
+			
+			// Queue all ordered payloads (may be empty if packet was buffered)
+			for _, orderedPayload := range orderedPayloads {
+				// Build packet data including TCP header for compatibility
+				tcpHdr := &TCPHeader{
+					SrcPort:    srcPort,
+					DstPort:    dstPort,
+					SeqNum:     seq,
+					AckNum:     ack,
+					DataOffset: 5,
+					Flags:      flags,
+					Window:     65535,
+				}
+
+				headerBytes := serializeTCPHeaderStatic(tcpHdr)
+				fullData := make([]byte, len(headerBytes)+len(orderedPayload))
+				copy(fullData, headerBytes)
+				copy(fullData[len(headerBytes):], orderedPayload)
+
+				// Queue received data
+				if atomic.LoadInt32(&c.closed) == 0 {
+					select {
+					case c.recvQueue <- fullData:
+					default:
+						// Queue full, drop packet
+						log.Printf("Warning: recv queue full, dropping ordered packet")
+					}
+				}
+			}
+			continue
+		}
+
+		// For non-connected or empty payload packets (handshake, etc.)
+		// Process without ordering
 		if len(payload) > 0 {
 			c.mu.Lock()
 			c.ackNum = seq + uint32(len(payload))
@@ -349,7 +403,7 @@ func (c *ConnRaw) recvLoop() {
 			continue
 		}
 
-		// Build packet data including TCP header for compatibility
+		// Build packet data including TCP header for compatibility (for handshake packets)
 		// Format: TCP header + payload
 		tcpHdr := &TCPHeader{
 			SrcPort:    srcPort,

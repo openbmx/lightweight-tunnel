@@ -284,9 +284,10 @@ func (c *STUNClient) parseXorAddress(data []byte, transactionID []byte) *net.UDP
 
 // DetectNATTypeWithSTUN performs NAT type detection using STUN
 // Based on RFC 3489 NAT behavior discovery algorithm
-func (c *STUNClient) DetectNATTypeWithSTUN() (NATType, error) {
+// localAddr specifies the local address to bind to (must match the P2P port for accurate detection)
+func (c *STUNClient) DetectNATTypeWithSTUN(localAddr *net.UDPAddr) (NATType, error) {
 	// Test 1: Basic connectivity and check if we have a public IP
-	result1, err := c.Query(nil, false, false)
+	result1, err := c.Query(localAddr, false, false)
 	if err != nil {
 		return NATUnknown, fmt.Errorf("test 1 failed: %v", err)
 	}
@@ -305,14 +306,14 @@ func (c *STUNClient) DetectNATTypeWithSTUN() (NATType, error) {
 
 	// We're behind NAT, continue testing
 	// Test 2: Request response from different IP and port
-	result2, err := c.Query(nil, true, true)
+	result2, err := c.Query(localAddr, true, true)
 	if err == nil && result2 != nil {
 		// If we receive a response, it's a Full Cone NAT
 		return NATFullCone, nil
 	}
 
 	// Test 3: Request response from same IP but different port
-	result3, err := c.Query(nil, false, true)
+	result3, err := c.Query(localAddr, false, true)
 	if err == nil && result3 != nil {
 		// Received response from different port = Restricted Cone NAT
 		return NATRestrictedCone, nil
@@ -326,9 +327,9 @@ func (c *STUNClient) DetectNATTypeWithSTUN() (NATType, error) {
 	}
 	
 	if alternateServer != nil {
-		// Query alternate server
+		// Query alternate server using same local port
 		alternateClient := NewSTUNClient(alternateServer.String(), c.timeout)
-		result4, err := alternateClient.Query(nil, false, false)
+		result4, err := alternateClient.Query(localAddr, false, false)
 		if err == nil && result4 != nil {
 			// Compare ports
 			if result1.MappedAddr.Port != result4.MappedAddr.Port {

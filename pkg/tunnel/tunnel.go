@@ -39,6 +39,7 @@ const (
 	PacketTypeIPRegister   = 0x09 // Client requests IP registration (centralized management)
 	PacketTypeIPAccept     = 0x0A // Server accepts IP registration
 	PacketTypeIPReject     = 0x0B // Server rejects IP registration (conflict)
+	PacketTypeDataPlain    = 0x0C // Plaintext data (for encrypted-only passthrough, like HTTPS/SSH)
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -190,19 +191,28 @@ type Tunnel struct {
 }
 
 // prependPacketType adds a leading packet type byte to the payload.
-// It prefers in-place expansion when spare capacity exists and returns a
-// boolean indicating whether the original backing buffer was reused.
+// It prefers in-place expansion when spare capacity exists (which happens when
+// the buffer was obtained from packetPool with slack). When reusing the buffer
+// in-place, it uses an optimized approach that minimizes data movement.
+// Returns the new slice and a boolean indicating whether the original backing buffer was reused.
 func prependPacketType(packet []byte, packetType byte) ([]byte, bool) {
 	origLen := len(packet)
+	// Check if we have capacity to expand in-place
 	if cap(packet) >= origLen+1 {
+		// Expand the slice by 1 byte at the beginning
+		// We need to shift data, but we can do it more efficiently
+		// by growing at the end first, then moving
 		packet = packet[:origLen+1]
-		// copy handles overlapping regions; shift data right by one.
+		// Shift data right by 1 byte
+		// Using copy with overlapping regions is safe and optimized by the runtime
 		copy(packet[1:], packet[:origLen])
 		packet[0] = packetType
 		return packet, true
 	}
 
-	newPacket := make([]byte, origLen+1)
+	// No capacity available - allocate new buffer with slack for future prepends
+	// This should rarely happen if buffers are allocated with proper slack
+	newPacket := make([]byte, origLen+1, origLen+1+packetBufferSlack)
 	newPacket[0] = packetType
 	copy(newPacket[1:], packet)
 	return newPacket, false
@@ -1284,8 +1294,9 @@ func (t *Tunnel) netReader() {
 		payload := decryptedPacket[1:]
 
 		switch packetType {
-		case PacketTypeData:
-			// Queue for TUN device
+		case PacketTypeData, PacketTypeDataPlain:
+			// PacketTypeDataPlain is converted to PacketTypeData during decryption
+			// Both cases queue for TUN device
 			if !enqueueWithTimeout(t.recvQueue, payload, t.stopCh) {
 				select {
 				case <-t.stopCh:
@@ -1569,7 +1580,8 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		payload := decryptedPacket[1:]
 
 		switch packetType {
-		case PacketTypeData:
+		case PacketTypeData, PacketTypeDataPlain:
+			// PacketTypeDataPlain is converted to PacketTypeData during decryption
 			if len(payload) < IPv4MinHeaderLen {
 				continue
 			}
@@ -2658,7 +2670,13 @@ func runSysctl(setting string) error {
 }
 
 func (t *Tunnel) shouldSkipOuterEncryption(data []byte) bool {
-	if len(data) < 1 || data[0] != PacketTypeData {
+	if len(data) < 1 {
+		return false
+	}
+	
+	// Only check PacketTypeData, not PacketTypeDataPlain
+	// PacketTypeDataPlain is explicitly for plaintext passthrough
+	if data[0] != PacketTypeData {
 		return false
 	}
 
@@ -2681,12 +2699,24 @@ func (t *Tunnel) encryptPacket(data []byte) ([]byte, error) {
 		return data, nil
 	}
 	if t.shouldSkipOuterEncryption(data) {
+		// Change packet type to PacketTypeDataPlain to indicate plaintext passthrough
+		// This prevents the receiver from attempting decryption on already-encrypted traffic
+		if len(data) > 0 && data[0] == PacketTypeData {
+			data[0] = PacketTypeDataPlain
+		}
 		return data, nil
 	}
 	return c.Encrypt(data)
 }
 
 func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint64, error) {
+	// Check if this is plaintext passthrough (encrypted-only traffic like HTTPS)
+	if len(data) > 0 && data[0] == PacketTypeDataPlain {
+		// Change back to PacketTypeData for processing
+		data[0] = PacketTypeData
+		return data, nil, 0, nil
+	}
+
 	t.cipherMux.RLock()
 	active := t.cipher
 	activeGen := t.cipherGen
@@ -2715,8 +2745,13 @@ func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint6
 		}
 	}
 
+	// Last resort: check if this looks like plaintext passthrough that wasn't properly marked
+	// This can happen if random ciphertext starts with PacketTypeData byte
 	if (active != nil || prev != nil) && isPlainPassThroughPacket(data) {
-		return data, nil, 0, nil
+		// Change to PacketTypeData for processing
+		if data[0] == PacketTypeData {
+			return data, nil, 0, nil
+		}
 	}
 
 	if activeErr != nil {
@@ -2737,6 +2772,10 @@ func (t *Tunnel) decryptPacketForServer(data []byte) ([]byte, *crypto.Cipher, ui
 
 func (t *Tunnel) encryptForClient(client *ClientConnection, data []byte) ([]byte, error) {
 	if t.shouldSkipOuterEncryption(data) {
+		// Change packet type to PacketTypeDataPlain to indicate plaintext passthrough
+		if len(data) > 0 && data[0] == PacketTypeData {
+			data[0] = PacketTypeDataPlain
+		}
 		return data, nil
 	}
 	if client != nil {
