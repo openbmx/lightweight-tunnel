@@ -1,10 +1,12 @@
 package tunnel
 
 import (
-"fmt"
-"log"
-"net"
-"time"
+	"fmt"
+	"log"
+	"net"
+	"runtime"
+	"syscall"
+	"time"
 )
 
 const (
@@ -130,6 +132,21 @@ func (m *MTUDiscovery) testMTU(targetIP string, mtu int) bool {
 		return mtu <= conservativeMTU
 	}
 	defer conn.Close()
+
+	// Set DF (Don't Fragment) flag to test path MTU
+	// This ensures the packet is dropped if it exceeds any MTU on the path
+	rawConn, err := conn.SyscallConn()
+	if err == nil {
+		rawConn.Control(func(fd uintptr) {
+			if runtime.GOOS == "windows" {
+				// Windows: IP_DONTFRAGMENT = 14
+				_ = syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, 14, 1)
+			} else if runtime.GOOS == "linux" {
+				// Linux: IP_MTU_DISCOVER = 10, IP_PMTUDISC_DO = 2
+				_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 10, 2)
+			}
+		})
+	}
 	
 	// Set timeout for quick testing
 	conn.SetDeadline(time.Now().Add(500 * time.Millisecond))

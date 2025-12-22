@@ -67,6 +67,7 @@ type Connection struct {
 	Conn                    *net.UDPConn
 	PeerIP                  net.IP // Tunnel IP of the peer
 	IsLocalNetwork          bool   // Whether this connection is via local network
+	IsTemporary             bool   // Whether this is a temporary connection for port prediction
 	sendQueue               chan []byte
 	stopCh                  chan struct{}
 	wg                      sync.WaitGroup
@@ -697,36 +698,25 @@ func (m *Manager) handleKeepalive(remoteAddr *net.UDPAddr) {
 func (m *Manager) findPeerByAddr(addr *net.UDPAddr) net.IP {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	
+
+	// Check connections first (more likely to match active traffic)
+	for _, conn := range m.connections {
+		if conn != nil && conn.RemoteAddr != nil {
+			// Compare IP and Port directly for robustness
+			if conn.RemoteAddr.Port == addr.Port && conn.RemoteAddr.IP.Equal(addr.IP) {
+				return conn.PeerIP
+			}
+		}
+	}
+
+	// Check peer info as fallback
 	addrStr := addr.String()
-	
-	// Check both public and local addresses in peer info
 	for _, peer := range m.peers {
 		if peer.PublicAddr == addrStr || peer.LocalAddr == addrStr {
 			return peer.TunnelIP
 		}
 	}
-	
-	// Also check connections (including port prediction connections with composite keys)
-	for key, conn := range m.connections {
-		// Skip nil connections
-		if conn == nil || conn.RemoteAddr == nil {
-			continue
-		}
-		// Exact match on remote address (IP:port)
-		if conn.RemoteAddr.String() == addrStr {
-			return conn.PeerIP
-		}
-		// Also check composite keys (ipStr|remoteAddr) used for port prediction
-		// Extract the remoteAddr part after the | separator
-		if strings.Contains(key, "|") {
-			parts := strings.SplitN(key, "|", 2)
-			if len(parts) == 2 && parts[1] == addrStr {
-				return conn.PeerIP
-			}
-		}
-	}
-	
+
 	return nil
 }
 
@@ -964,6 +954,30 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 		
 		log.Printf("✓ Port prediction successful for %s using port %d", ipStr, successfulAddr.Port)
 	}
+
+	// Cleanup goroutine: ensure temporary connections are removed even if none succeed
+	go func() {
+		select {
+		case <-sharedStopCh:
+			// Success or already stopped
+		case <-time.After(30 * time.Second): // Timeout for port prediction
+			select {
+			case <-sharedStopCh:
+				return // Already stopped
+			default:
+				close(sharedStopCh)
+			}
+		}
+
+		// Final cleanup of all temporary connections for this peer
+		m.mu.Lock()
+		for key, conn := range m.connections {
+			if conn.PeerIP.Equal(peerTunnelIP) && conn.IsTemporary {
+				delete(m.connections, key)
+			}
+		}
+		m.mu.Unlock()
+	}()
 	
 	// Start handshake to primary port
 	go m.performHandshakeWithCallback(primaryConn, false, onSuccess)
@@ -996,6 +1010,7 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 			RemoteAddr:         predictedAddr,
 			PeerIP:             peerTunnelIP,
 			IsLocalNetwork:     false,
+			IsTemporary:        true,
 			sendQueue:          make(chan []byte, 100),
 			stopCh:             sharedStopCh, // Share stop channel for early termination
 			handshakeStartTime: time.Now(),
@@ -1098,6 +1113,11 @@ func (m *Manager) sendKeepalives() {
 	now := time.Now()
 	
 	for ipStr, conn := range m.connections {
+		// Skip temporary connections used for port prediction
+		if conn.IsTemporary {
+			continue
+		}
+
 		peer, exists := m.peers[ipStr]
 		if !exists {
 			continue

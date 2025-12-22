@@ -346,6 +346,10 @@ func (c *ConnRaw) recvLoop() {
 			
 			c.mu.Lock()
 			c.ackNum = ackToSend
+			// Update our sequence number based on peer's ACK to keep in sync
+			if ack > c.seqNum {
+				c.seqNum = ack
+			}
 			seqToUse := c.seqNum
 			c.mu.Unlock()
 
@@ -534,6 +538,8 @@ func (c *ConnRaw) ReadPacket() ([]byte, error) {
 			return []byte{}, nil
 		}
 		return data[headerLen:], nil
+	case <-c.stopCh:
+		return nil, fmt.Errorf("connection closed")
 	case <-time.After(30 * time.Second): // 30秒超时，适合隧道长连接
 		return nil, &net.OpError{Op: "read", Net: "tcp", Err: fmt.Errorf("timeout")}
 	}
@@ -880,6 +886,10 @@ func (l *ListenerRaw) acceptLoop() {
 			// Update last activity time for all packets (including control packets)
 			conn.mu.Lock()
 			conn.lastActivity = time.Now()
+			// Update our sequence number based on peer's ACK to keep in sync
+			if ack > conn.seqNum {
+				conn.seqNum = ack
+			}
 			conn.mu.Unlock()
 
 			// Handle FIN or RST packets (connection close)
@@ -895,6 +905,13 @@ func (l *ListenerRaw) acceptLoop() {
 				
 				// Mark connection as closed
 				atomic.StoreInt32(&conn.closed, 1)
+				
+				// Signal closure to ReadPacket
+				select {
+				case <-conn.stopCh:
+				default:
+					close(conn.stopCh)
+				}
 				
 				// Send ACK for FIN if needed
 				if flags&FIN != 0 {
@@ -916,12 +933,18 @@ func (l *ListenerRaw) acceptLoop() {
 				continue
 			}
 
-			// 只处理有实际数据的包，忽略纯ACK、keepalive等控制包
+			// Handle data packets with out-of-order reassembly for DPI resistance
 			if len(payload) > 0 {
+				// Use handleOutOfOrderPacket to properly sequence packets
+				orderedPayloads := conn.handleOutOfOrderPacket(seq, payload)
+				
+				// Update ack number based on expected sequence
+				conn.recvWindowMu.Lock()
+				ackToSend := conn.expectedSeq
+				conn.recvWindowMu.Unlock()
+				
 				conn.mu.Lock()
-				conn.ackNum = seq + uint32(len(payload))
-				conn.lastActivity = time.Now()
-				ackToSend := conn.ackNum
+				conn.ackNum = ackToSend
 				seqToUse := conn.seqNum
 				conn.mu.Unlock()
 
@@ -931,28 +954,31 @@ func (l *ListenerRaw) acceptLoop() {
 					log.Printf("Failed to send ACK to %s:%d: %v", conn.remoteIP, conn.remotePort, err)
 				}
 
-				tcpHdr := &TCPHeader{
-					SrcPort:    srcPort,
-					DstPort:    dstPort,
-					SeqNum:     seq,
-					AckNum:     ack,
-					DataOffset: 5,
-					Flags:      flags,
-					Window:     65535,
-				}
+				// Queue all ordered payloads
+				for _, orderedPayload := range orderedPayloads {
+					tcpHdr := &TCPHeader{
+						SrcPort:    srcPort,
+						DstPort:    dstPort,
+						SeqNum:     seq, // Note: using original seq for header compatibility
+						AckNum:     ack,
+						DataOffset: 5,
+						Flags:      flags,
+						Window:     65535,
+					}
 
-				headerBytes := serializeTCPHeaderStatic(tcpHdr)
-				fullData := make([]byte, len(headerBytes)+len(payload))
-				copy(fullData, headerBytes)
-				copy(fullData[len(headerBytes):], payload)
+					headerBytes := serializeTCPHeaderStatic(tcpHdr)
+					fullData := make([]byte, len(headerBytes)+len(orderedPayload))
+					copy(fullData, headerBytes)
+					copy(fullData[len(headerBytes):], orderedPayload)
 
-				select {
-				case conn.recvQueue <- fullData:
-				default:
-					// 队列满，丢弃
+					select {
+					case conn.recvQueue <- fullData:
+					default:
+						// 队列满，丢弃
+						log.Printf("Warning: server recv queue full for %s, dropping packet", connKey)
+					}
 				}
 			}
-			// FIN/RST包不需要放入queue，连接关闭会由其他机制处理
 			l.mu.Unlock()
 			continue
 		}

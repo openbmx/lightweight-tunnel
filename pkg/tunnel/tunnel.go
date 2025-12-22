@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -40,6 +41,7 @@ const (
 	PacketTypeIPAccept     = 0x0A // Server accepts IP registration
 	PacketTypeIPReject     = 0x0B // Server rejects IP registration (conflict)
 	PacketTypeDataPlain    = 0x0C // Plaintext data (for encrypted-only passthrough, like HTTPS/SSH)
+	PacketTypeFEC          = 0x0D // FEC shard packet
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -105,6 +107,8 @@ type ClientConnection struct {
 	cipherGen    uint64
 	lastRecvTime time.Time // Last time we received a packet from this client
 	mu           sync.RWMutex
+	fecManager   *FECManager
+	nextPacketID uint32
 }
 
 // ConfigUpdateMessage carries server-pushed configuration updates.
@@ -168,6 +172,9 @@ type Tunnel struct {
 	packetBufSize int
 
 	xdpAccel *xdp.Accelerator
+
+	fecManager   *FECManager
+	nextPacketID uint32
 
 	// P2P and routing
 	p2pManager    *p2p.Manager          // P2P connection manager
@@ -375,6 +382,11 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		xdpAccel:           accel,
 		pendingP2PRequests: make(map[string]time.Time),
 	}
+
+	if fecCodec != nil {
+		t.fecManager = NewFECManager(fecCodec)
+	}
+
 	t.packetPool = &sync.Pool{
 		New: func() any {
 			return make([]byte, packetBufSize)
@@ -612,8 +624,19 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 	t.clientsMux.Lock()
 	defer t.clientsMux.Unlock()
 
+	client.mu.Lock()
+	if client.clientIP != nil {
+		client.mu.Unlock()
+		return
+	}
+	client.clientIP = ip
+	client.mu.Unlock()
+
 	ipStr := ip.String()
 	if existing, ok := t.clients[ipStr]; ok {
+		if existing == client {
+			return
+		}
 		log.Printf("Warning: IP conflict detected for %s, closing old connection", ipStr)
 		existing.stopOnce.Do(func() {
 			// Close connection first to unblock I/O
@@ -625,7 +648,6 @@ func (t *Tunnel) addClient(client *ClientConnection, ip net.IP) {
 		})
 	}
 
-	client.clientIP = ip
 	t.clients[ipStr] = client
 	log.Printf("Client registered with IP: %s (total clients: %d)", ipStr, len(t.clients))
 }
@@ -926,6 +948,10 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 		sendQueue: make(chan []byte, t.config.SendQueueSize),
 		recvQueue: make(chan []byte, t.config.RecvQueueSize),
 		stopCh:    make(chan struct{}),
+	}
+
+	if t.fec != nil {
+		client.fecManager = NewFECManager(t.fec)
 	}
 
 	t.trackClientConnection(client)
@@ -1305,6 +1331,28 @@ func (t *Tunnel) netReader() {
 					log.Printf("Receive queue full after timeout, dropping packet")
 				}
 			}
+		case PacketTypeFEC:
+			if t.fecManager != nil {
+				if len(payload) < 6 {
+					continue
+				}
+				packetID := binary.BigEndian.Uint32(payload[0:4])
+				shardIdx := int(payload[4])
+				totalShards := int(payload[5])
+				shardData := payload[6:]
+
+				reconstructed := t.fecManager.AddShard(packetID, shardIdx, totalShards, shardData)
+				if reconstructed != nil {
+					if !enqueueWithTimeout(t.recvQueue, reconstructed, t.stopCh) {
+						select {
+						case <-t.stopCh:
+							return
+						default:
+							log.Printf("Receive queue full after timeout, dropping reconstructed packet")
+						}
+					}
+				}
+			}
 		case PacketTypeKeepalive:
 			// Keepalive received, no action needed
 		case PacketTypePublicAddr:
@@ -1375,6 +1423,25 @@ func (t *Tunnel) netWriter() {
 		case packet := <-t.sendQueue:
 			func() {
 				defer t.releasePacketBuffer(packet)
+
+				// Use FEC if enabled
+				if t.fecManager != nil {
+					packetID := atomic.AddUint32(&t.nextPacketID, 1)
+					shards, err := t.fecManager.EncodePacket(packetID, packet)
+					if err == nil {
+						for _, shard := range shards {
+							encryptedShard, err := t.encryptPacket(shard)
+							if err != nil {
+								continue
+							}
+							if t.conn != nil {
+								// Best effort for shards
+								_ = t.conn.WritePacket(encryptedShard)
+							}
+						}
+						return
+					}
+				}
 
 				fullPacket, _ := prependPacketType(packet, PacketTypeData)
 
@@ -1585,110 +1652,26 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 			if len(payload) < IPv4MinHeaderLen {
 				continue
 			}
+			t.routePacket(client, payload)
 
-			// Extract source IP from the packet to register client
-			if payload[0]>>4 == IPv4Version { // IPv4
-				srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
-
-				// Register client IP if not yet registered
-				if client.clientIP == nil {
-					// Prevent source IP spoofing: reject if srcIP is server's IP
-					if srcIP.Equal(t.myTunnelIP) {
-						log.Printf("WARNING: Client %s attempting to spoof source IP as server IP %s. Dropping packet.",
-							client.conn.RemoteAddr(), srcIP)
-						continue
-					}
-					
-					// Prevent source IP spoofing: reject if srcIP is already registered to another client
-					if existingClient := t.getClientByIP(srcIP); existingClient != nil && existingClient != client {
-						log.Printf("WARNING: Client %s attempting to use source IP %s already registered to %s. Dropping packet.",
-							client.conn.RemoteAddr(), srcIP, existingClient.conn.RemoteAddr())
-						continue
-					}
-					
-					// First packet from this client, register its IP
-					t.addClient(client, srcIP)
-				} else if !client.clientIP.Equal(srcIP) {
-					// Client is trying to send packets with a different source IP
-					// This is a potential DoS/hijacking attempt or routing loop
-					log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Possible IP spoofing or routing loop. Dropping packet.",
-						client.conn.RemoteAddr(), srcIP, client.clientIP)
+		case PacketTypeFEC:
+			if client.fecManager != nil {
+				if len(payload) < 6 {
 					continue
 				}
+				packetID := binary.BigEndian.Uint32(payload[0:4])
+				shardIdx := int(payload[4])
+				totalShards := int(payload[5])
+				shardData := payload[6:]
 
-				// Route packet based on destination
-				dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
-
-				// Check if destination is another client
-				if t.config.ClientIsolation {
-					// In isolation mode, only send to TUN device (server)
-					// Clients cannot communicate with each other
-					if _, err := t.tunFile.Write(payload); err != nil {
-						select {
-						case <-t.stopCh:
-							// Tunnel is stopping, no need to log
-						default:
-							log.Printf("TUN write error: %v", err)
-						}
-						return
-					}
-				} else {
-					// Check if packet is for another client
-					targetClient := t.getClientByIP(dstIP)
-					if targetClient != nil && targetClient != client {
-						// Forward to target client (server relay mode)
-						// This is expected when P2P is not yet established or when P2P fails
-						// 
-						// IMPORTANT: payload comes from aead.Open which allocates a new slice
-						// We need to copy it into a pooled buffer so it can be properly recycled
-						forwardBuf := t.getPacketBuffer()
-						forwardPacket := forwardBuf[:len(payload)]
-						copy(forwardPacket, payload)
-						
-						queued := false
-						select {
-						case targetClient.sendQueue <- forwardPacket:
-							queued = true
-						case <-t.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return
-						case <-client.stopCh:
-							t.releasePacketBuffer(forwardBuf)
-							return
-						case <-time.After(QueueSendTimeout):
-							// Wait for queue space
-							select {
-							case targetClient.sendQueue <- forwardPacket:
-								queued = true
-							case <-t.stopCh:
-								t.releasePacketBuffer(forwardBuf)
-								return
-							case <-client.stopCh:
-								t.releasePacketBuffer(forwardBuf)
-								return
-							default:
-								log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
-								t.releasePacketBuffer(forwardBuf)
-							}
-						}
-						// Only release if not queued (clientNetWriter will release if queued)
-						if !queued {
-							t.releasePacketBuffer(forwardBuf)
-						}
-					} else {
-						// Send to TUN device (for server or unknown destination)
-						if _, err := t.tunFile.Write(payload); err != nil {
-							select {
-							case <-t.stopCh:
-								// Tunnel is stopping, no need to log
-							default:
-								log.Printf("TUN write error: %v", err)
-							}
-							return
-						}
+				reconstructed := client.fecManager.AddShard(packetID, shardIdx, totalShards, shardData)
+				if reconstructed != nil {
+					if len(reconstructed) >= IPv4MinHeaderLen {
+						t.routePacket(client, reconstructed)
 					}
 				}
 			}
+
 		case PacketTypeKeepalive:
 			// Keepalive received, no action needed
 		case PacketTypePeerInfo:
@@ -1743,6 +1726,22 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 		case packet := <-client.sendQueue:
 			func() {
 				defer t.releasePacketBuffer(packet)
+
+				// Use FEC if enabled
+				if client.fecManager != nil {
+					packetID := atomic.AddUint32(&client.nextPacketID, 1)
+					shards, err := client.fecManager.EncodePacket(packetID, packet)
+					if err == nil {
+						for _, shard := range shards {
+							encryptedShard, err := t.encryptForClient(client, shard)
+							if err != nil {
+								continue
+							}
+							_ = client.conn.WritePacket(encryptedShard)
+						}
+						return
+					}
+				}
 
 				fullPacket, _ := prependPacketType(packet, PacketTypeData)
 
@@ -2745,15 +2744,6 @@ func (t *Tunnel) decryptWithFallback(data []byte) ([]byte, *crypto.Cipher, uint6
 		}
 	}
 
-	// Last resort: check if this looks like plaintext passthrough that wasn't properly marked
-	// This can happen if random ciphertext starts with PacketTypeData byte
-	if (active != nil || prev != nil) && isPlainPassThroughPacket(data) {
-		// Change to PacketTypeData for processing
-		if data[0] == PacketTypeData {
-			return data, nil, 0, nil
-		}
-	}
-
 	if activeErr != nil {
 		return nil, nil, 0, activeErr
 	}
@@ -3387,4 +3377,115 @@ func (t *Tunnel) sendPeerInfoAndPunch(client *ClientConnection, peerInfo string)
 
 // broadcastPeerInfo is no longer used in on-demand P2P mode
 // Connections are established only when needed via handleP2PRequest
+
+// routePacket handles the routing of a data packet from a client
+func (t *Tunnel) routePacket(client *ClientConnection, payload []byte) {
+	// Extract source IP from the packet to register client
+	if payload[0]>>4 == IPv4Version { // IPv4
+		srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
+
+		// Register client IP if not yet registered
+		client.mu.RLock()
+		cIP := client.clientIP
+		client.mu.RUnlock()
+
+		if cIP == nil {
+			// Prevent source IP spoofing: reject if srcIP is server's IP
+			if srcIP.Equal(t.myTunnelIP) {
+				log.Printf("WARNING: Client %s attempting to spoof source IP as server IP %s. Dropping packet.",
+					client.conn.RemoteAddr(), srcIP)
+				return
+			}
+
+			// Prevent source IP spoofing: reject if srcIP is already registered to another client
+			if existingClient := t.getClientByIP(srcIP); existingClient != nil && existingClient != client {
+				log.Printf("WARNING: Client %s attempting to use source IP %s already registered to %s. Dropping packet.",
+					client.conn.RemoteAddr(), srcIP, existingClient.conn.RemoteAddr())
+				return
+			}
+
+			// First packet from this client, register its IP
+			t.addClient(client, srcIP)
+		} else if !cIP.Equal(srcIP) {
+			// Client is trying to send packets with a different source IP
+			// This is a potential DoS/hijacking attempt or routing loop
+			log.Printf("WARNING: Client %s trying to send packet with different source IP %s (registered as %s). Possible IP spoofing or routing loop. Dropping packet.",
+				client.conn.RemoteAddr(), srcIP, cIP)
+			return
+		}
+
+		// Route packet based on destination
+		dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
+
+		// Check if destination is another client
+		if t.config.ClientIsolation {
+			// In isolation mode, only send to TUN device (server)
+			// Clients cannot communicate with each other
+			if _, err := t.tunFile.Write(payload); err != nil {
+				select {
+				case <-t.stopCh:
+					// Tunnel is stopping, no need to log
+				default:
+					log.Printf("TUN write error: %v", err)
+				}
+				return
+			}
+		} else {
+			// Check if packet is for another client
+			targetClient := t.getClientByIP(dstIP)
+			if targetClient != nil && targetClient != client {
+				// Forward to target client (server relay mode)
+				// This is expected when P2P is not yet established or when P2P fails
+
+				// IMPORTANT: payload comes from aead.Open which allocates a new slice
+				// We need to copy it into a pooled buffer so it can be properly recycled
+				forwardBuf := t.getPacketBuffer()
+				forwardPacket := forwardBuf[:len(payload)]
+				copy(forwardPacket, payload)
+
+				queued := false
+				select {
+				case targetClient.sendQueue <- forwardPacket:
+					queued = true
+				case <-t.stopCh:
+					t.releasePacketBuffer(forwardBuf)
+					return
+				case <-client.stopCh:
+					t.releasePacketBuffer(forwardBuf)
+					return
+				case <-time.After(QueueSendTimeout):
+					// Wait for queue space
+					select {
+					case targetClient.sendQueue <- forwardPacket:
+						queued = true
+					case <-t.stopCh:
+						t.releasePacketBuffer(forwardBuf)
+						return
+					case <-client.stopCh:
+						t.releasePacketBuffer(forwardBuf)
+						return
+					default:
+						log.Printf("⚠️  Target client send queue full for %s after timeout, dropping packet", dstIP)
+						t.releasePacketBuffer(forwardBuf)
+					}
+				}
+				// Only release if not queued (clientNetWriter will release if queued)
+				if !queued {
+					t.releasePacketBuffer(forwardBuf)
+				}
+			} else {
+				// Send to TUN device (for server or unknown destination)
+				if _, err := t.tunFile.Write(payload); err != nil {
+					select {
+					case <-t.stopCh:
+						// Tunnel is stopping, no need to log
+					default:
+						log.Printf("TUN write error: %v", err)
+					}
+					return
+				}
+			}
+		}
+	}
+}
 

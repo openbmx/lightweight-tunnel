@@ -143,7 +143,15 @@ func looksLikeAEADProxy(payload []byte) bool {
 }
 
 func isPlainPassThroughPacket(packet []byte) bool {
-	if len(packet) < 1 || packet[0] != PacketTypeData {
+	if len(packet) < 1 {
+		return false
+	}
+	// If explicitly marked as plain by sender, trust it
+	if packet[0] == PacketTypeDataPlain {
+		return true
+	}
+	// Otherwise, only check if it's PacketTypeData and looks like encrypted traffic
+	if packet[0] != PacketTypeData {
 		return false
 	}
 	return isLikelyEncryptedTraffic(packet[1:])
