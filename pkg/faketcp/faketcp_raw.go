@@ -926,6 +926,11 @@ func (l *ListenerRaw) acceptLoop() {
 				continue
 			}
 
+			// CRITICAL FIX: Release the global lock before processing packets
+			// This allows other clients to receive their packets concurrently
+			// The connection is already verified to exist and is protected by its own mutex
+			l.mu.Unlock()
+
 			// Handle data packets with out-of-order reassembly for DPI resistance
 			if len(payload) > 0 {
 				// Use handleOutOfOrderPacket to properly sequence packets
@@ -964,15 +969,15 @@ func (l *ListenerRaw) acceptLoop() {
 					copy(fullData, headerBytes)
 					copy(fullData[len(headerBytes):], orderedPayload)
 
+					// Use non-blocking send with timeout to avoid blocking the accept loop
 					select {
 					case conn.recvQueue <- fullData:
-					default:
-						// 队列满，丢弃
-						log.Printf("Warning: server recv queue full for %s, dropping packet", connKey)
+					case <-time.After(10 * time.Millisecond):
+						// Queue full after timeout, drop packet
+						log.Printf("Warning: server recv queue full for %s after timeout, dropping packet", connKey)
 					}
 				}
 			}
-			l.mu.Unlock()
 			continue
 		}
 
