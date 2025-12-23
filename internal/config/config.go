@@ -239,7 +239,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 
 	origPerm := info.Mode().Perm()
 	targetPerm := origPerm | ownerWritePerm // ensure owner-write while updating
-	restorePerm := origPerm&ownerWritePerm == 0
+	restorePerm := (origPerm & ownerWritePerm) == 0
 
 	if restorePerm {
 		if err := os.Chmod(filename, targetPerm); err != nil {
@@ -254,7 +254,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 		return os.Chmod(filename, origPerm)
 	}
 
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, 0)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
 	writeErr := err
 	if writeErr == nil {
 		if _, err := f.Write(updated); err != nil {
