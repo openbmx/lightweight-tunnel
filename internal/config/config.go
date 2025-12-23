@@ -245,17 +245,18 @@ func UpdateConfigKey(filename string, newKey string) error {
 		}
 	}
 
-	writeErr := func() error {
-		f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(updated); err != nil {
-			_ = f.Close()
-			return err
-		}
-		return f.Close()
-	}()
+	var writeErr error
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
+	if err != nil {
+		writeErr = err
+	} else {
+		defer func() {
+			if cerr := f.Close(); cerr != nil && writeErr == nil {
+				writeErr = cerr
+			}
+		}()
+		_, writeErr = f.Write(updated)
+	}
 
 	if writeErr != nil {
 		if restorePerm {
