@@ -245,11 +245,25 @@ func UpdateConfigKey(filename string, newKey string) error {
 		}
 	}
 
-	if err := os.WriteFile(filename, updated, origPerm); err != nil {
-		if restorePerm {
-			_ = os.Chmod(filename, origPerm)
+	writeErr := func() error {
+		f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
+		if err != nil {
+			return err
 		}
-		return err
+		if _, err := f.Write(updated); err != nil {
+			_ = f.Close()
+			return err
+		}
+		return f.Close()
+	}()
+
+	if writeErr != nil {
+		if restorePerm {
+			if restoreErr := os.Chmod(filename, origPerm); restoreErr != nil {
+				return fmt.Errorf("%w (and failed to restore permissions on %s: %v)", writeErr, filename, restoreErr)
+			}
+		}
+		return writeErr
 	}
 
 	if restorePerm {
