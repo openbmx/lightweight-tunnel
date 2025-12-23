@@ -48,29 +48,29 @@ type Config struct {
 // DefaultConfig returns a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Mode:                "server",
-		Transport:           "rawtcp", // Fixed to rawtcp for true TCP disguise
-		LocalAddr:           "0.0.0.0:9000",
-		RemoteAddr:          "",
-		TunnelAddr:          "10.0.0.1/24",
-		MTU:                 1400,
-		FECDataShards:       10,
-		FECParityShards:     3,
-		Timeout:             30,
-		KeepaliveInterval:   10,
-		SendQueueSize:       5000, // Increased from 1000 to prevent queue full errors
-		RecvQueueSize:       5000, // Increased from 1000 to handle burst traffic
-		TunName:             "",
-		Routes:              []string{},
-		ConfigPushInterval:  0,
-		MultiClient:         true,
-		MaxClients:          100,
-		ClientIsolation:     false,
-		P2PEnabled:          true,
-		P2PPort:             0, // Auto-select
-		EnableMeshRouting:   true,
-		MaxHops:             3,
-		RouteUpdateInterval: 30,
+		Mode:                 "server",
+		Transport:            "rawtcp", // Fixed to rawtcp for true TCP disguise
+		LocalAddr:            "0.0.0.0:9000",
+		RemoteAddr:           "",
+		TunnelAddr:           "10.0.0.1/24",
+		MTU:                  1400,
+		FECDataShards:        10,
+		FECParityShards:      3,
+		Timeout:              30,
+		KeepaliveInterval:    10,
+		SendQueueSize:        5000, // Increased from 1000 to prevent queue full errors
+		RecvQueueSize:        5000, // Increased from 1000 to handle burst traffic
+		TunName:              "",
+		Routes:               []string{},
+		ConfigPushInterval:   0,
+		MultiClient:          true,
+		MaxClients:           100,
+		ClientIsolation:      false,
+		P2PEnabled:           true,
+		P2PPort:              0, // Auto-select
+		EnableMeshRouting:    true,
+		MaxHops:              3,
+		RouteUpdateInterval:  30,
 		P2PTimeout:           5,
 		EnableNATDetection:   true,
 		EnableXDP:            true,
@@ -230,5 +230,21 @@ func UpdateConfigKey(filename string, newKey string) error {
 		return err
 	}
 
-	return os.WriteFile(filename, updated, 0600)
+	info, err := os.Stat(filename)
+	if err != nil {
+		return err
+	}
+
+	origPerm := info.Mode().Perm()
+	targetPerm := origPerm | 0o200 // ensure owner-write while updating
+	restorePerm := origPerm != targetPerm
+
+	if restorePerm {
+		if err := os.Chmod(filename, targetPerm); err != nil {
+			return fmt.Errorf("failed to enable write permission on %s: %w", filename, err)
+		}
+		defer os.Chmod(filename, origPerm)
+	}
+
+	return os.WriteFile(filename, updated, targetPerm)
 }
