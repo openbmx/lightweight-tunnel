@@ -243,8 +243,20 @@ func UpdateConfigKey(filename string, newKey string) error {
 		if err := os.Chmod(filename, targetPerm); err != nil {
 			return fmt.Errorf("failed to enable write permission on %s: %w", filename, err)
 		}
-		defer os.Chmod(filename, origPerm)
 	}
 
-	return os.WriteFile(filename, updated, targetPerm)
+	if err := os.WriteFile(filename, updated, origPerm); err != nil {
+		if restorePerm {
+			_ = os.Chmod(filename, origPerm)
+		}
+		return err
+	}
+
+	if restorePerm {
+		if err := os.Chmod(filename, origPerm); err != nil {
+			return fmt.Errorf("failed to restore permissions on %s: %w", filename, err)
+		}
+	}
+
+	return nil
 }
