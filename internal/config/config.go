@@ -239,22 +239,22 @@ func UpdateConfigKey(filename string, newKey string) error {
 
 	origPerm := info.Mode().Perm()
 	targetPerm := origPerm | ownerWritePerm // ensure owner-write while updating
-	restorePerm := (origPerm & ownerWritePerm) == 0
+	shouldRestore := (origPerm & ownerWritePerm) == 0
 
-	if restorePerm {
+	if shouldRestore {
 		if err := os.Chmod(filename, targetPerm); err != nil {
 			return fmt.Errorf("failed to enable write permission on %s: %w", filename, err)
 		}
 	}
 
 	restore := func() error {
-		if !restorePerm {
+		if !shouldRestore {
 			return nil
 		}
 		return os.Chmod(filename, origPerm)
 	}
 
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, 0)
 	writeErr := err
 	if writeErr == nil {
 		if _, err := f.Write(updated); err != nil {
