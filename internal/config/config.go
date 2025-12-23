@@ -239,7 +239,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 
 	origPerm := info.Mode().Perm()
 	targetPerm := origPerm | ownerWritePerm // ensure owner-write while updating
-	restorePerm := origPerm != targetPerm
+	restorePerm := origPerm&ownerWritePerm == 0
 
 	if restorePerm {
 		if err := os.Chmod(filename, targetPerm); err != nil {
@@ -247,7 +247,14 @@ func UpdateConfigKey(filename string, newKey string) error {
 		}
 	}
 
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
+	restore := func() error {
+		if !restorePerm {
+			return nil
+		}
+		return os.Chmod(filename, origPerm)
+	}
+
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, 0)
 	writeErr := err
 	if writeErr == nil {
 		if _, err := f.Write(updated); err != nil {
@@ -259,18 +266,14 @@ func UpdateConfigKey(filename string, newKey string) error {
 	}
 
 	if writeErr != nil {
-		if restorePerm {
-			if restoreErr := os.Chmod(filename, origPerm); restoreErr != nil {
-				return fmt.Errorf("update config: %w; failed to restore permissions on %s: %v", writeErr, filename, restoreErr)
-			}
+		if restoreErr := restore(); restoreErr != nil {
+			return fmt.Errorf("update config: %w; failed to restore permissions on %s: %v", writeErr, filename, restoreErr)
 		}
 		return writeErr
 	}
 
-	if restorePerm {
-		if err := os.Chmod(filename, origPerm); err != nil {
-			return fmt.Errorf("failed to restore permissions on %s: %w", filename, err)
-		}
+	if err := restore(); err != nil {
+		return fmt.Errorf("failed to restore permissions on %s: %w", filename, err)
 	}
 
 	return nil
