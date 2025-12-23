@@ -7,6 +7,8 @@ import (
 	"os"
 )
 
+const ownerWritePerm = 0o200
+
 // Config holds the tunnel configuration
 type Config struct {
 	Mode               string   `json:"mode"`                 // "client" or "server"
@@ -236,7 +238,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 	}
 
 	origPerm := info.Mode().Perm()
-	targetPerm := origPerm | 0o200 // ensure owner-write while updating
+	targetPerm := origPerm | ownerWritePerm // ensure owner-write while updating
 	restorePerm := origPerm != targetPerm
 
 	if restorePerm {
@@ -245,7 +247,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 		}
 	}
 
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, 0)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
 	writeErr := err
 	if writeErr == nil {
 		if _, err := f.Write(updated); err != nil {
@@ -259,7 +261,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 	if writeErr != nil {
 		if restorePerm {
 			if restoreErr := os.Chmod(filename, origPerm); restoreErr != nil {
-				return fmt.Errorf("update config: %w; failed to restore permissions on %s: %w", writeErr, filename, restoreErr)
+				return fmt.Errorf("update config: %w; failed to restore permissions on %s: %v", writeErr, filename, restoreErr)
 			}
 		}
 		return writeErr
