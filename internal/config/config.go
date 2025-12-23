@@ -246,7 +246,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 	}
 
 	var writeErr error
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, origPerm)
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
 		writeErr = err
 	} else {
@@ -261,7 +261,7 @@ func UpdateConfigKey(filename string, newKey string) error {
 	if writeErr != nil {
 		if restorePerm {
 			if restoreErr := os.Chmod(filename, origPerm); restoreErr != nil {
-				return fmt.Errorf("%w (and failed to restore permissions on %s: %v)", writeErr, filename, restoreErr)
+				return fmt.Errorf("update config: %w; failed to restore permissions on %s: %v", writeErr, filename, restoreErr)
 			}
 		}
 		return writeErr
