@@ -7,7 +7,7 @@ SERVICE_NAME?=$(BINARY_NAME)
 CONFIG_PATH?=
 INSTALL_BIN_DIR=/usr/local/bin
 SYSTEMD_UNIT=/etc/systemd/system/$(SERVICE_NAME).service
-SERVICE_USER?=lightweight-tunnel
+SERVICE_USER?=root
 SERVICE_GROUP?=$(SERVICE_USER)
 
 # Build variables
