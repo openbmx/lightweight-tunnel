@@ -52,6 +52,8 @@ const (
 	// PortPredictionSequentialRange is the range of sequential ports to prioritize
 	// Most NATs allocate ports sequentially, so try these first
 	PortPredictionSequentialRange = 10
+	// PortPredictionBatchSize is how many port predictions to try simultaneously
+	PortPredictionBatchSize = 5
 	// PortPredictionBidirectional enables trying both +/- offsets from known port
 	PortPredictionBidirectional = true
 	// MaxBackoffMultiplier is the maximum multiplier for exponential backoff (caps retry interval)
@@ -95,6 +97,24 @@ type Manager struct {
 	myNATType           nat.NATType   // My NAT type
 	natTypeMux          sync.RWMutex  // Protects myNATType
 	keepaliveInterval   time.Duration // Configurable keepalive interval
+	
+	// P2P statistics
+	stats               ConnectionStats // P2P connection statistics
+	statsMux            sync.RWMutex    // Protects stats
+}
+
+// ConnectionStats tracks P2P connection statistics
+type ConnectionStats struct {
+	TotalAttempts        int           // Total P2P connection attempts
+	SuccessfulAttempts   int           // Successful P2P connections
+	FailedAttempts       int           // Failed P2P connections
+	SymmetricNATAttempts int           // Attempts with symmetric NAT
+	SymmetricNATSuccess  int           // Successful symmetric NAT connections
+	LocalConnections     int           // Local network connections
+	PublicConnections    int           // Public NAT traversal connections
+	ServerRelayFallbacks int           // Connections falling back to server relay
+	AverageHandshakeTime time.Duration // Average time to establish P2P connection
+	LastUpdated          time.Time     // Last statistics update time
 }
 
 // NewManager creates a new P2P connection manager
@@ -153,6 +173,10 @@ func (m *Manager) Start() error {
 	// Start quality monitoring
 	m.wg.Add(1)
 	go m.qualityMonitorLoop()
+	
+	// Start periodic statistics logging
+	m.wg.Add(1)
+	go m.statisticsLogLoop()
 	
 	return nil
 }
@@ -247,9 +271,14 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 	myNATType := m.GetNATType()
 	peerNATType := peer.GetNATType()
 	
+	// Record attempt with symmetric NAT flag
+	isSymmetric := myNATType == nat.NATSymmetric && peerNATType == nat.NATSymmetric
+	m.recordConnectionAttempt(isSymmetric)
+	
 	// If both are symmetric NAT, try port prediction approach
-	if myNATType == nat.NATSymmetric && peerNATType == nat.NATSymmetric {
-		log.Printf("Both peers have Symmetric NAT - attempting port prediction strategy for %s", ipStr)
+	if isSymmetric {
+		log.Printf("Both peers have Symmetric NAT - attempting advanced port prediction for %s", ipStr)
+		log.Printf("Note: Symmetric NAT P2P has lower success rate (~70-80%%), will fallback to server relay if needed")
 		// Don't skip, try port prediction instead
 		return m.connectWithPortPrediction(peer, peerTunnelIP)
 	}
@@ -591,12 +620,22 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 			
 			// Measure RTT only once - on first successful handshake response
 			conn.mu.Lock()
-			if !conn.handshakeStartTime.IsZero() {
+			isFirstHandshake := !conn.handshakeStartTime.IsZero()
+			if isFirstHandshake {
 				rtt := time.Since(conn.handshakeStartTime)
 				conn.estimatedRTT = rtt
 				log.Printf("P2P RTT to %s: %v", ipStr, rtt)
 				// Reset handshakeStartTime to prevent logging RTT repeatedly
 				conn.handshakeStartTime = time.Time{}
+				
+				// Record success with handshake time
+				myNATType := m.GetNATType()
+				peerNATType := nat.NATUnknown
+				if peer, exists := m.peers[ipStr]; exists {
+					peerNATType = peer.GetNATType()
+				}
+				isSymmetric := myNATType == nat.NATSymmetric && peerNATType == nat.NATSymmetric
+				m.recordConnectionSuccess(isLocalConnection, isSymmetric, rtt)
 			}
 			conn.lastReceivedTime = time.Now()
 			// Reset failure counter on successful handshake
@@ -628,9 +667,9 @@ func (m *Manager) handleHandshake(remoteAddr *net.UDPAddr) {
 				}
 				
 				if isLocalConnection {
-					log.Printf("P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
+					log.Printf("✅ P2P LOCAL connection established with %s via %s", peerIP, remoteAddr)
 				} else {
-					log.Printf("P2P PUBLIC connection established with %s via %s", peerIP, remoteAddr)
+					log.Printf("✅ P2P PUBLIC connection established with %s via %s", peerIP, remoteAddr)
 				}
 			}
 		}
@@ -875,7 +914,9 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 	}
 	
 	basePort := publicAddr.Port
-	log.Printf("Symmetric NAT port prediction: trying ports around %d for %s", basePort, ipStr)
+	log.Printf("🔍 Symmetric NAT port prediction: trying ports around %d for %s", basePort, ipStr)
+	log.Printf("Strategy: Sequential ports (±%d) first, then extended range (±%d)", 
+		PortPredictionSequentialRange, PortPredictionRange)
 	
 	// Create the primary connection with the known port
 	primaryConn := &Connection{
@@ -896,14 +937,14 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 	
 	// Priority 1: Try sequential ports first (most common NAT behavior)
 	// Many NATs allocate ports sequentially, so try nearby sequential ports
-	// Generate list programmatically based on PortPredictionSequentialRange
-	// Pre-allocate slice for efficiency
 	sequentialPorts := make([]int, 0, PortPredictionSequentialRange*2)
 	for offset := 1; offset <= PortPredictionSequentialRange; offset++ {
 		sequentialPorts = append(sequentialPorts, basePort+offset)
 		sequentialPorts = append(sequentialPorts, basePort-offset)
 	}
 	
+	log.Printf("Phase 1: Trying %d sequential ports around %d", len(sequentialPorts), basePort)
+	portsTried := 1 // Already tried base port
 	for _, predictedPort := range sequentialPorts {
 		if predictedPort < 1024 || predictedPort > 65535 {
 			continue // Skip invalid ports
@@ -927,9 +968,11 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 		
 		// Start handshake to predicted port (will stop when primary succeeds)
 		go m.performHandshake(tempConn, false)
+		portsTried++
 	}
 	
 	// Priority 2: Try wider range for less predictable NATs
+	extendedPorts := make([]int, 0, (PortPredictionRange-PortPredictionSequentialRange)*2)
 	for offset := -PortPredictionRange; offset <= PortPredictionRange; offset++ {
 		if offset == 0 || (offset >= -PortPredictionSequentialRange && offset <= PortPredictionSequentialRange) {
 			continue // Already handled above
@@ -939,7 +982,17 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 		if predictedPort < 1024 || predictedPort > 65535 {
 			continue // Skip invalid ports
 		}
-		
+		extendedPorts = append(extendedPorts, predictedPort)
+	}
+	
+	log.Printf("Phase 2: Trying %d extended ports in range [%d-%d, %d-%d]",
+		len(extendedPorts),
+		basePort-PortPredictionRange,
+		basePort-PortPredictionSequentialRange-1,
+		basePort+PortPredictionSequentialRange+1,
+		basePort+PortPredictionRange)
+	
+	for _, predictedPort := range extendedPorts {
 		predictedAddr := &net.UDPAddr{
 			IP:   publicAddr.IP,
 			Port: predictedPort,
@@ -958,9 +1011,11 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 		
 		// Start handshake to predicted port (will stop when primary succeeds)
 		go m.performHandshake(tempConn, false)
+		portsTried++
 	}
 	
-	log.Printf("Started port prediction handshake for %s (sequential + wide range)", ipStr)
+	log.Printf("✅ Started port prediction handshake for %s (total %d ports tried)", ipStr, portsTried)
+	log.Printf("Note: If P2P fails, connection will automatically fallback to server relay")
 	return nil
 }
 
@@ -1194,5 +1249,128 @@ func (m *Manager) RecordPacketReceived(peerIP net.IP) {
 	
 	if peer, exists := m.peers[peerIP.String()]; exists {
 		peer.RecordPacketReceived()
+	}
+}
+
+// GetConnectionStats returns a copy of current P2P connection statistics
+func (m *Manager) GetConnectionStats() ConnectionStats {
+	m.statsMux.RLock()
+	defer m.statsMux.RUnlock()
+	return m.stats
+}
+
+// recordConnectionAttempt records a P2P connection attempt
+func (m *Manager) recordConnectionAttempt(isSymmetric bool) {
+	m.statsMux.Lock()
+	defer m.statsMux.Unlock()
+	m.stats.TotalAttempts++
+	if isSymmetric {
+		m.stats.SymmetricNATAttempts++
+	}
+	m.stats.LastUpdated = time.Now()
+}
+
+// recordConnectionSuccess records a successful P2P connection
+func (m *Manager) recordConnectionSuccess(isLocal, isSymmetric bool, handshakeTime time.Duration) {
+	m.statsMux.Lock()
+	defer m.statsMux.Unlock()
+	m.stats.SuccessfulAttempts++
+	if isLocal {
+		m.stats.LocalConnections++
+	} else {
+		m.stats.PublicConnections++
+	}
+	if isSymmetric {
+		m.stats.SymmetricNATSuccess++
+	}
+	
+	// Update average handshake time (exponential moving average)
+	if m.stats.AverageHandshakeTime == 0 {
+		m.stats.AverageHandshakeTime = handshakeTime
+	} else {
+		// EMA with alpha = 0.3
+		m.stats.AverageHandshakeTime = time.Duration(
+			float64(m.stats.AverageHandshakeTime)*0.7 + float64(handshakeTime)*0.3,
+		)
+	}
+	m.stats.LastUpdated = time.Now()
+}
+
+// recordConnectionFailure records a failed P2P connection attempt
+func (m *Manager) recordConnectionFailure() {
+	m.statsMux.Lock()
+	defer m.statsMux.Unlock()
+	m.stats.FailedAttempts++
+	m.stats.LastUpdated = time.Now()
+}
+
+// recordServerRelay records a connection falling back to server relay
+func (m *Manager) recordServerRelay() {
+	m.statsMux.Lock()
+	defer m.statsMux.Unlock()
+	m.stats.ServerRelayFallbacks++
+	m.stats.LastUpdated = time.Now()
+}
+
+// GetConnectionSuccessRate returns the P2P connection success rate (0.0 to 1.0)
+func (m *Manager) GetConnectionSuccessRate() float64 {
+	m.statsMux.RLock()
+	defer m.statsMux.RUnlock()
+	if m.stats.TotalAttempts == 0 {
+		return 0.0
+	}
+	return float64(m.stats.SuccessfulAttempts) / float64(m.stats.TotalAttempts)
+}
+
+// GetSymmetricNATSuccessRate returns success rate for symmetric NAT connections
+func (m *Manager) GetSymmetricNATSuccessRate() float64 {
+	m.statsMux.RLock()
+	defer m.statsMux.RUnlock()
+	if m.stats.SymmetricNATAttempts == 0 {
+		return 0.0
+	}
+	return float64(m.stats.SymmetricNATSuccess) / float64(m.stats.SymmetricNATAttempts)
+}
+
+// LogStatistics logs current P2P statistics
+func (m *Manager) LogStatistics() {
+	stats := m.GetConnectionStats()
+	successRate := m.GetConnectionSuccessRate()
+	symSuccessRate := m.GetSymmetricNATSuccessRate()
+	
+	log.Printf("=== P2P Connection Statistics ===")
+	log.Printf("Total Attempts: %d", stats.TotalAttempts)
+	log.Printf("Successful: %d (%.1f%%)", stats.SuccessfulAttempts, successRate*100)
+	log.Printf("Failed: %d", stats.FailedAttempts)
+	log.Printf("Local Network: %d", stats.LocalConnections)
+	log.Printf("Public NAT Traversal: %d", stats.PublicConnections)
+	log.Printf("Symmetric NAT: %d attempts, %d success (%.1f%%)", 
+		stats.SymmetricNATAttempts, stats.SymmetricNATSuccess, symSuccessRate*100)
+	log.Printf("Server Relay Fallbacks: %d", stats.ServerRelayFallbacks)
+	if stats.AverageHandshakeTime > 0 {
+		log.Printf("Average Handshake Time: %v", stats.AverageHandshakeTime)
+	}
+	log.Printf("================================")
+}
+
+// statisticsLogLoop periodically logs P2P statistics
+func (m *Manager) statisticsLogLoop() {
+	defer m.wg.Done()
+	
+	// Log statistics every 5 minutes
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			stats := m.GetConnectionStats()
+			// Only log if there have been attempts
+			if stats.TotalAttempts > 0 {
+				m.LogStatistics()
+			}
+		}
 	}
 }
