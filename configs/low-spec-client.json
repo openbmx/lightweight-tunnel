@@ -1,8 +1,8 @@
 {
   "mode": "client",
-  "remote_addr": "YOUR-SERVER-IP:9000",
+  "remote_addr": "1.2.3.4:9000",
   "tunnel_addr": "10.0.0.2/24",
-  "key": "CHANGE-THIS-TO-YOUR-STRONG-KEY",
+  "key": "CHANGE-ME-use-openssl-rand-base64-32-to-generate",
   "mtu": 1200,
   "fec_data": 5,
   "fec_parity": 1,

@@ -2,7 +2,7 @@
   "mode": "server",
   "local_addr": "0.0.0.0:9000",
   "tunnel_addr": "10.0.0.1/24",
-  "key": "CHANGE-THIS-TO-YOUR-STRONG-KEY",
+  "key": "CHANGE-ME-use-openssl-rand-base64-32-to-generate",
   "mtu": 1200,
   "fec_data": 8,
   "fec_parity": 2,
