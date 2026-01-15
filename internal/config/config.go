@@ -57,7 +57,7 @@ func DefaultConfig() *Config {
 		FECDataShards:       10,
 		FECParityShards:     3,
 		Timeout:             30,
-		KeepaliveInterval:   10,
+		KeepaliveInterval:   5, // Reduced from 10 to 5 seconds for faster detection of connection issues
 		SendQueueSize:       5000, // Increased from 1000 to prevent queue full errors
 		RecvQueueSize:       5000, // Increased from 1000 to handle burst traffic
 		TunName:             "",
@@ -112,7 +112,7 @@ func LoadConfig(filename string) (*Config, error) {
 		config.Timeout = 30
 	}
 	if config.KeepaliveInterval == 0 {
-		config.KeepaliveInterval = 10
+		config.KeepaliveInterval = 5 // Default to 5 seconds for aggressive connection health monitoring
 	}
 	if config.SendQueueSize == 0 {
 		config.SendQueueSize = 5000 // Increased default from 1000
