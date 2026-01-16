@@ -81,11 +81,17 @@ type Connection struct {
 	estimatedRTT            time.Duration // Estimated round-trip time
 	handshakeStartTime      time.Time     // When handshake started (for RTT measurement)
 	connectionEstablishedAt time.Time     // When connection was established (for fast keepalive logic)
-	connectionCreatedAt     time.Time     // When connection object was created (for initial timeout)
 	consecutiveFailures     int           // Number of consecutive failed handshake attempts
 	nextHandshakeAttemptAt  time.Time     // When next handshake attempt is allowed (for rate limiting)
 	handshakeInProgress     bool          // Whether a handshake goroutine is currently running
 	mu                      sync.RWMutex  // Protects connection state
+}
+
+// IsInitialConnection returns true if this connection has never been successfully established
+func (c *Connection) IsInitialConnection() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connectionEstablishedAt.IsZero()
 }
 
 // Manager manages P2P connections
@@ -285,7 +291,6 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 				stopCh:              make(chan struct{}),
 				handshakeStartTime:  time.Now(),
 				lastHandshakeTime:   time.Now(),
-				connectionCreatedAt: time.Now(),
 				handshakeInProgress: true, // Mark handshake as in progress
 			}
 			m.connections[ipStr] = conn
@@ -314,7 +319,6 @@ func (m *Manager) ConnectToPeer(peerTunnelIP net.IP) error {
 		stopCh:              make(chan struct{}),
 		handshakeStartTime:  time.Now(),
 		lastHandshakeTime:   time.Now(),
-		connectionCreatedAt: time.Now(),
 		handshakeInProgress: true, // Mark handshake as in progress
 	}
 	m.connections[ipStr] = conn
@@ -895,7 +899,6 @@ func (m *Manager) connectWithPortPrediction(peer *PeerInfo, peerTunnelIP net.IP)
 		stopCh:             make(chan struct{}),
 		handshakeStartTime: time.Now(),
 		lastHandshakeTime:  time.Now(),
-		connectionCreatedAt: time.Now(),
 	}
 	
 	// Store the primary connection
@@ -1052,8 +1055,7 @@ func (m *Manager) sendKeepalives() {
 			
 			// Determine max backoff based on whether this is initial connection or reconnection
 			maxBackoff := MaxBackoffMultiplier
-			isInitialConnection := conn.connectionEstablishedAt.IsZero()
-			if isInitialConnection {
+			if conn.connectionEstablishedAt.IsZero() {
 				// Never connected before - use faster retry (lower backoff cap)
 				maxBackoff = InitialBackoffMultiplier
 			}
@@ -1071,12 +1073,8 @@ func (m *Manager) sendKeepalives() {
 		
 		// Check if connection is stale
 		// Use different timeout for "never connected" vs "connection lost"
-		conn.mu.RLock()
-		establishedAt := conn.connectionEstablishedAt
-		conn.mu.RUnlock()
-		
 		timeSinceLastSeen := now.Sub(lastSeen)
-		isInitialConnection := establishedAt.IsZero()
+		isInitialConnection := conn.IsInitialConnection()
 		
 		var staleThreshold time.Duration
 		if isInitialConnection {
