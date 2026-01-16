@@ -1029,7 +1029,6 @@ func (m *Manager) sendKeepalives() {
 			
 			conn.lastHandshakeTime = now
 			failures := conn.consecutiveFailures
-			createdAt := conn.connectionCreatedAt
 			conn.mu.Unlock()
 			
 			_, err := m.listener.WriteToUDP(handshakeMsg, conn.RemoteAddr)
@@ -1038,6 +1037,8 @@ func (m *Manager) sendKeepalives() {
 			} else {
 				// Update LastSeen to reflect that we're actively attempting connection
 				// This prevents premature timeout during initial connection phase
+				// Note: LastSeen represents "last communication activity" (send or receive)
+				// not just "last received" - this is intentional for initial connection phase
 				peer.mu.Lock()
 				peer.LastSeen = now
 				peer.mu.Unlock()
@@ -1051,7 +1052,7 @@ func (m *Manager) sendKeepalives() {
 			
 			// Determine max backoff based on whether this is initial connection or reconnection
 			maxBackoff := MaxBackoffMultiplier
-			isInitialConnection := !createdAt.IsZero() && conn.connectionEstablishedAt.IsZero()
+			isInitialConnection := conn.connectionEstablishedAt.IsZero()
 			if isInitialConnection {
 				// Never connected before - use faster retry (lower backoff cap)
 				maxBackoff = InitialBackoffMultiplier
@@ -1071,12 +1072,11 @@ func (m *Manager) sendKeepalives() {
 		// Check if connection is stale
 		// Use different timeout for "never connected" vs "connection lost"
 		conn.mu.RLock()
-		createdAt := conn.connectionCreatedAt
 		establishedAt := conn.connectionEstablishedAt
 		conn.mu.RUnlock()
 		
 		timeSinceLastSeen := now.Sub(lastSeen)
-		isInitialConnection := !createdAt.IsZero() && establishedAt.IsZero()
+		isInitialConnection := establishedAt.IsZero()
 		
 		var staleThreshold time.Duration
 		if isInitialConnection {
