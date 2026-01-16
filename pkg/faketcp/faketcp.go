@@ -295,7 +295,6 @@ func Dial(remoteAddr string, timeout time.Duration) (*Conn, error) {
 	// Build SYN
 	synHdr := conn.buildTCPHeader(0)
 	synHdr.Flags = SYN
-	synHdr.Options = synHdr.Options // keep options
 	synBytes := conn.serializeTCPHeader(synHdr)
 	if _, err := conn.udpConn.Write(synBytes); err != nil {
 		conn.udpConn.Close()
