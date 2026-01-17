@@ -68,8 +68,9 @@ const (
 	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
 
 	// FEC constants
-	FECGroupTimeout    = 100 * time.Millisecond // Max time to wait for completing a FEC group
-	FECShardHeaderSize = 9                      // 1 byte flags + 4 bytes groupID + 2 bytes shardIndex + 2 bytes totalShards
+	FECGroupTimeout       = 100 * time.Millisecond // Max time to wait for completing a FEC group
+	FECShardHeaderSize    = 9                      // 1 byte flags + 4 bytes groupID + 2 bytes shardIndex + 2 bytes totalShards
+	FECGroupExpiryTimeout = 5 * time.Second        // Timeout for incomplete FEC groups
 )
 
 // enqueueWithTimeout attempts to enqueue a packet, waiting briefly for capacity.
@@ -1478,7 +1479,9 @@ func (t *Tunnel) sendFECShard(groupID uint32, shardIndex, totalShards uint16, da
 	shardPacket[9] = byte(totalShards)
 	copy(shardPacket[10:], data)
 
-	// Send directly (already includes packet type, don't encrypt again)
+	// Note: The shard data is already encrypted (from encryptedPacket in sendPacketWithFEC).
+	// The shard headers (PacketType, flags, groupID, indices) are sent unencrypted for reassembly.
+	// This is intentional - the actual payload data is encrypted, metadata must be readable.
 	if t.conn == nil {
 		if err := t.reconnectToServer(); err != nil {
 			return err
@@ -1592,15 +1595,21 @@ func (t *Tunnel) reconstructFECGroup(groupID uint32, group *fecGroup) {
 		// Need to use FEC to recover missing shards
 		log.Printf("FEC group %d: recovering missing shards (%d/%d received)", groupID, group.receivedCount, group.totalShards)
 		
-		// Use FEC decoder
-		fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
-		if fecErr != nil {
-			log.Printf("Failed to create FEC decoder: %v", fecErr)
-			t.cleanupFECGroup(groupID)
-			return
+		// Reuse the tunnel's FEC codec if it matches the shard configuration
+		// This avoids repeatedly allocating new FEC codecs
+		if t.fec != nil && t.fec.DataShards() == group.dataShards && t.fec.ParityShards() == group.parityShards {
+			reconstructedData, err = t.fec.Decode(group.shards, group.shardsPresent)
+		} else {
+			// Create a temporary FEC codec for mismatched configurations
+			fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
+			if fecErr != nil {
+				log.Printf("Failed to create FEC decoder: %v", fecErr)
+				t.cleanupFECGroup(groupID)
+				return
+			}
+			reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
 		}
 
-		reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
 		if err != nil {
 			log.Printf("FEC reconstruction failed for group %d: %v", groupID, err)
 			t.fecStatsMux.Lock()
@@ -1689,11 +1698,10 @@ func (t *Tunnel) fecCleanupLoop() {
 // cleanupExpiredFECGroups removes FEC groups that haven't completed within timeout
 func (t *Tunnel) cleanupExpiredFECGroups() {
 	now := time.Now()
-	timeout := 5 * time.Second // Groups older than 5 seconds are considered expired
 
 	t.fecRecvGroupsMux.Lock()
 	for groupID, group := range t.fecRecvGroups {
-		if now.Sub(group.createdAt) > timeout {
+		if now.Sub(group.createdAt) > FECGroupExpiryTimeout {
 			log.Printf("FEC group %d expired after %v (received %d/%d shards)",
 				groupID, now.Sub(group.createdAt), group.receivedCount, group.totalShards)
 			delete(t.fecRecvGroups, groupID)
@@ -1871,14 +1879,19 @@ func (t *Tunnel) reconstructClientFECGroup(client *ClientConnection, groupID uin
 		// Use FEC to recover
 		log.Printf("Client FEC group %d: recovering missing shards (%d/%d received)", groupID, group.receivedCount, group.totalShards)
 		
-		fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
-		if fecErr != nil {
-			log.Printf("Failed to create FEC decoder for client: %v", fecErr)
-			t.cleanupClientFECGroup(client, groupID)
-			return
+		// Reuse the tunnel's FEC codec if it matches
+		if t.fec != nil && t.fec.DataShards() == group.dataShards && t.fec.ParityShards() == group.parityShards {
+			reconstructedData, err = t.fec.Decode(group.shards, group.shardsPresent)
+		} else {
+			fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
+			if fecErr != nil {
+				log.Printf("Failed to create FEC decoder for client: %v", fecErr)
+				t.cleanupClientFECGroup(client, groupID)
+				return
+			}
+			reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
 		}
 
-		reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
 		if err != nil {
 			log.Printf("Client FEC reconstruction failed for group %d: %v", groupID, err)
 			t.cleanupClientFECGroup(client, groupID)
@@ -2037,6 +2050,8 @@ func (t *Tunnel) sendClientFECShard(client *ClientConnection, groupID uint32, sh
 	shardPacket[9] = byte(totalShards)
 	copy(shardPacket[10:], data)
 
+	// Note: The shard data is already encrypted (from sendClientPacketWithFEC).
+	// The shard headers are unencrypted for reassembly - this is intentional.
 	return client.conn.WritePacket(shardPacket)
 }
 
