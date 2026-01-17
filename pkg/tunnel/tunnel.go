@@ -36,6 +36,7 @@ const (
 	PacketTypePunch        = 0x06 // Server requests simultaneous hole-punch
 	PacketTypeConfigUpdate = 0x07 // Server pushes new config (e.g., rotated key)
 	PacketTypeP2PRequest   = 0x08 // Client requests P2P connection to another client
+	PacketTypeFECShard     = 0x09 // FEC encoded shard (data or parity)
 
 	// IPv4 constants
 	IPv4Version      = 4
@@ -65,6 +66,10 @@ const (
 	DefaultRouteAdvertInterval = 60 * time.Second
 
 	packetBufferSlack = 128 // Extra bytes to leave headroom for prepending headers without reallocations
+
+	// FEC constants
+	FECGroupTimeout    = 100 * time.Millisecond // Max time to wait for completing a FEC group
+	FECShardHeaderSize = 9                      // 1 byte flags + 4 bytes groupID + 2 bytes shardIndex + 2 bytes totalShards
 )
 
 // enqueueWithTimeout attempts to enqueue a packet, waiting briefly for capacity.
@@ -136,6 +141,27 @@ func (c *ClientConnection) getCipher() (*crypto.Cipher, uint64) {
 	return c.cipher, c.cipherGen
 }
 
+// fecGroup tracks a group of FEC shards being reconstructed
+type fecGroup struct {
+	shards        [][]byte // All shards (data + parity)
+	shardsPresent []bool   // Which shards have been received
+	receivedCount int      // Number of shards received
+	dataShards    int      // Number of data shards
+	parityShards  int      // Number of parity shards
+	totalShards   int      // Total shards (data + parity)
+	createdAt     time.Time // When this group was created
+}
+
+// fecStatistics tracks FEC performance metrics
+type fecStatistics struct {
+	groupsSent       uint64 // Total FEC groups sent
+	groupsReceived   uint64 // Total FEC groups received
+	groupsRecovered  uint64 // Groups recovered using FEC
+	packetsLost      uint64 // Packets that couldn't be recovered
+	shardsReceived   uint64 // Total shards received
+	shardsRecovered  uint64 // Shards recovered via FEC
+}
+
 // Tunnel represents a lightweight tunnel
 type Tunnel struct {
 	config         *config.Config
@@ -183,6 +209,14 @@ type Tunnel struct {
 	routeMux         sync.RWMutex
 	advertisedRoutes []clientRoute
 	clientRoutes     map[*ClientConnection][]string
+
+	// FEC state (client mode)
+	fecGroupID      uint32            // Current FEC group ID for sending
+	fecGroupMux     sync.Mutex        // Protects fecGroupID
+	fecRecvGroups   map[uint32]*fecGroup // Received FEC groups being reconstructed
+	fecRecvGroupsMux sync.RWMutex     // Protects fecRecvGroups
+	fecStats        fecStatistics     // FEC statistics
+	fecStatsMux     sync.Mutex        // Protects fecStats
 
 	// On-demand P2P state tracking
 	pendingP2PRequests map[string]time.Time // Tracks pending P2P requests (key: target client IP)
@@ -279,6 +313,8 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create FEC: %v", err)
 	}
+	log.Printf("✅ FEC启用: %d 数据分片 + %d 校验分片 (可恢复最多 %d 个丢失的分片)",
+		cfg.FECDataShards, cfg.FECParityShards, cfg.FECParityShards)
 
 	// Parse my tunnel IP
 	myIP, err := parseTunnelIP(cfg.TunnelAddr)
@@ -340,6 +376,7 @@ func NewTunnel(cfg *config.Config, configFilePath string) (*Tunnel, error) {
 		allClients:         make(map[*ClientConnection]struct{}),
 		xdpAccel:           accel,
 		pendingP2PRequests: make(map[string]time.Time),
+		fecRecvGroups:      make(map[uint32]*fecGroup),
 	}
 	t.packetPool = &sync.Pool{
 		New: func() any {
@@ -459,6 +496,11 @@ func (t *Tunnel) Start() error {
 		// Start keepalive
 		t.wg.Add(1)
 		go t.keepalive()
+
+		// Start FEC cleanup and stats logging
+		t.wg.Add(2)
+		go t.fecCleanupLoop()
+		go t.logFECStats()
 
 		// Periodically announce routes to server
 		if len(t.getAdvertisedRoutes()) > 0 {
@@ -1325,6 +1367,9 @@ func (t *Tunnel) netReader() {
 			t.handleRouteInfoPayload(payload)
 		case PacketTypeConfigUpdate:
 			t.handleConfigUpdate(payload)
+		case PacketTypeFECShard:
+			// Handle FEC shard
+			t.handleFECShard(payload)
 		}
 	}
 }
@@ -1341,63 +1386,342 @@ func (t *Tunnel) netWriter() {
 			func() {
 				defer t.releasePacketBuffer(packet)
 
-				fullPacket, _ := prependPacketType(packet, PacketTypeData)
-
-				// Encrypt if cipher is available
-				encryptedPacket, err := t.encryptPacket(fullPacket)
-				if err != nil {
-					log.Printf("Encryption error: %v", err)
-					return
-				}
-
-				// Ensure we have a live connection before writing
-				if t.conn == nil {
-					if err := t.reconnectToServer(); err != nil {
-						// Only returns error when stopCh is closed
-						return
-					}
-				}
-
-				if err := t.conn.WritePacket(encryptedPacket); err != nil {
-					select {
-					case <-t.stopCh:
-						// Tunnel is stopping, no need to log
-						return
-					default:
-						log.Printf("Network write error: %v, attempting reconnection...", err)
-					}
-
-					// Close and clear connection then try to reconnect
-					t.connMux.Lock()
-					if t.conn != nil {
-						_ = t.conn.Close()
-						t.conn = nil
-					}
-					t.connMux.Unlock()
-
-					// Keep trying to reconnect - only exits if tunnel is stopping
-					if err := t.reconnectToServer(); err != nil {
-						// Only returns error when stopCh is closed
-						return
-					}
-
-					// Try writing once more after reconnect
-					log.Printf("Reconnection successful, retrying packet send")
-
-					// Re-announce P2P info after reconnection to re-establish P2P connections
-					t.reannounceP2PInfoAfterReconnect()
-
-					if t.conn != nil {
-						if err2 := t.conn.WritePacket(encryptedPacket); err2 != nil {
-							log.Printf("Network write retry failed: %v, packet will be lost", err2)
-							// Don't return - continue processing queue
-							// Accept packet loss to maintain tunnel connectivity for subsequent packets.
-							// This is better than exiting the goroutine, which would prevent any future
-							// packets from being sent even after the connection is restored.
+				// Use FEC encoding for packet transmission
+				if err := t.sendPacketWithFEC(packet); err != nil {
+					log.Printf("Failed to send packet with FEC: %v", err)
+					
+					// Try reconnecting if needed
+					if t.conn == nil {
+						if err := t.reconnectToServer(); err != nil {
+							return
 						}
+						// Re-announce P2P info after reconnection
+						t.reannounceP2PInfoAfterReconnect()
 					}
 				}
 			}()
+		}
+	}
+}
+
+// sendPacketWithFEC encodes a packet with FEC and sends all shards
+func (t *Tunnel) sendPacketWithFEC(packet []byte) error {
+	if t.fec == nil {
+		// FEC not configured, send directly
+		return t.sendPacketDirect(packet)
+	}
+
+	// Get next group ID
+	t.fecGroupMux.Lock()
+	groupID := t.fecGroupID
+	t.fecGroupID++
+	t.fecGroupMux.Unlock()
+
+	// Prepend packet type to packet
+	fullPacket, _ := prependPacketType(packet, PacketTypeData)
+
+	// Encrypt if cipher is available
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		return fmt.Errorf("encryption error: %v", err)
+	}
+
+	// Encode with FEC
+	shards, err := t.fec.Encode(encryptedPacket)
+	if err != nil {
+		return fmt.Errorf("FEC encoding error: %v", err)
+	}
+
+	dataShards := t.fec.DataShards()
+	parityShards := t.fec.ParityShards()
+	totalShards := dataShards + parityShards
+
+	// Update stats
+	t.fecStatsMux.Lock()
+	t.fecStats.groupsSent++
+	t.fecStatsMux.Unlock()
+
+	// Send each shard
+	for i, shard := range shards {
+		if err := t.sendFECShard(groupID, uint16(i), uint16(totalShards), uint8(dataShards), uint8(parityShards), shard); err != nil {
+			log.Printf("Failed to send FEC shard %d/%d: %v", i, totalShards, err)
+			// Continue sending other shards even if one fails
+		}
+	}
+
+	return nil
+}
+
+// sendFECShard sends a single FEC shard
+func (t *Tunnel) sendFECShard(groupID uint32, shardIndex, totalShards uint16, dataShards, parityShards uint8, data []byte) error {
+	// Build FEC shard packet: [PacketType(1)] [flags(1)] [groupID(4)] [shardIndex(2)] [totalShards(2)] [data...]
+	// flags byte contains: [dataShards(4 bits)][parityShards(4 bits)]
+	flags := (dataShards << 4) | (parityShards & 0x0F)
+	
+	shardPacket := make([]byte, 1+1+4+2+2+len(data))
+	shardPacket[0] = PacketTypeFECShard
+	shardPacket[1] = flags
+	shardPacket[2] = byte(groupID >> 24)
+	shardPacket[3] = byte(groupID >> 16)
+	shardPacket[4] = byte(groupID >> 8)
+	shardPacket[5] = byte(groupID)
+	shardPacket[6] = byte(shardIndex >> 8)
+	shardPacket[7] = byte(shardIndex)
+	shardPacket[8] = byte(totalShards >> 8)
+	shardPacket[9] = byte(totalShards)
+	copy(shardPacket[10:], data)
+
+	// Send directly (already includes packet type, don't encrypt again)
+	if t.conn == nil {
+		if err := t.reconnectToServer(); err != nil {
+			return err
+		}
+	}
+
+	return t.conn.WritePacket(shardPacket)
+}
+
+// sendPacketDirect sends a packet without FEC (fallback mode)
+func (t *Tunnel) sendPacketDirect(packet []byte) error {
+	fullPacket, _ := prependPacketType(packet, PacketTypeData)
+	encryptedPacket, err := t.encryptPacket(fullPacket)
+	if err != nil {
+		return fmt.Errorf("encryption error: %v", err)
+	}
+
+	if t.conn == nil {
+		if err := t.reconnectToServer(); err != nil {
+			return err
+		}
+	}
+
+	return t.conn.WritePacket(encryptedPacket)
+}
+
+// handleFECShard processes an incoming FEC shard and attempts reconstruction
+func (t *Tunnel) handleFECShard(payload []byte) {
+	// Parse FEC shard header: [flags(1)] [groupID(4)] [shardIndex(2)] [totalShards(2)] [data...]
+	if len(payload) < 9 {
+		log.Printf("Invalid FEC shard: too short")
+		return
+	}
+
+	flags := payload[0]
+	dataShards := int(flags >> 4)
+	parityShards := int(flags & 0x0F)
+	
+	groupID := uint32(payload[1])<<24 | uint32(payload[2])<<16 | uint32(payload[3])<<8 | uint32(payload[4])
+	shardIndex := uint16(payload[5])<<8 | uint16(payload[6])
+	totalShards := uint16(payload[7])<<8 | uint16(payload[8])
+	shardData := payload[9:]
+
+	if int(totalShards) != dataShards+parityShards {
+		log.Printf("Invalid FEC shard: totalShards mismatch")
+		return
+	}
+
+	// Update stats
+	t.fecStatsMux.Lock()
+	t.fecStats.shardsReceived++
+	t.fecStatsMux.Unlock()
+
+	// Get or create FEC group
+	t.fecRecvGroupsMux.Lock()
+	group, exists := t.fecRecvGroups[groupID]
+	if !exists {
+		// Create new group
+		group = &fecGroup{
+			shards:        make([][]byte, totalShards),
+			shardsPresent: make([]bool, totalShards),
+			receivedCount: 0,
+			dataShards:    dataShards,
+			parityShards:  parityShards,
+			totalShards:   int(totalShards),
+			createdAt:     time.Now(),
+		}
+		t.fecRecvGroups[groupID] = group
+
+		// Update stats
+		t.fecStatsMux.Lock()
+		t.fecStats.groupsReceived++
+		t.fecStatsMux.Unlock()
+	}
+	t.fecRecvGroupsMux.Unlock()
+
+	// Add shard to group
+	if int(shardIndex) >= group.totalShards {
+		log.Printf("Invalid shard index %d (total: %d)", shardIndex, group.totalShards)
+		return
+	}
+
+	if !group.shardsPresent[shardIndex] {
+		group.shards[shardIndex] = make([]byte, len(shardData))
+		copy(group.shards[shardIndex], shardData)
+		group.shardsPresent[shardIndex] = true
+		group.receivedCount++
+	}
+
+	// Try to reconstruct if we have enough shards
+	if group.receivedCount >= group.dataShards {
+		t.reconstructFECGroup(groupID, group)
+	}
+}
+
+// reconstructFECGroup attempts to reconstruct and process a complete FEC group
+func (t *Tunnel) reconstructFECGroup(groupID uint32, group *fecGroup) {
+	// Check if we already have all data shards
+	allDataPresent := true
+	for i := 0; i < group.dataShards; i++ {
+		if !group.shardsPresent[i] {
+			allDataPresent = false
+			break
+		}
+	}
+
+	var reconstructedData []byte
+	var err error
+
+	if !allDataPresent {
+		// Need to use FEC to recover missing shards
+		log.Printf("FEC group %d: recovering missing shards (%d/%d received)", groupID, group.receivedCount, group.totalShards)
+		
+		// Use FEC decoder
+		fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
+		if fecErr != nil {
+			log.Printf("Failed to create FEC decoder: %v", fecErr)
+			t.cleanupFECGroup(groupID)
+			return
+		}
+
+		reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
+		if err != nil {
+			log.Printf("FEC reconstruction failed for group %d: %v", groupID, err)
+			t.fecStatsMux.Lock()
+			t.fecStats.packetsLost++
+			t.fecStatsMux.Unlock()
+			t.cleanupFECGroup(groupID)
+			return
+		}
+
+		// Update stats - this group was recovered using FEC
+		t.fecStatsMux.Lock()
+		t.fecStats.groupsRecovered++
+		missingCount := group.totalShards - group.receivedCount
+		t.fecStats.shardsRecovered += uint64(missingCount)
+		t.fecStatsMux.Unlock()
+
+		log.Printf("✓ FEC recovery successful for group %d (recovered %d missing shards)", groupID, missingCount)
+	} else {
+		// All data shards present, just concatenate them
+		totalSize := 0
+		for i := 0; i < group.dataShards; i++ {
+			totalSize += len(group.shards[i])
+		}
+		reconstructedData = make([]byte, 0, totalSize)
+		for i := 0; i < group.dataShards; i++ {
+			reconstructedData = append(reconstructedData, group.shards[i]...)
+		}
+	}
+
+	// Decrypt the reconstructed data
+	decryptedData, err := t.decryptPacket(reconstructedData)
+	if err != nil {
+		log.Printf("Failed to decrypt reconstructed packet: %v", err)
+		t.cleanupFECGroup(groupID)
+		return
+	}
+
+	// Check packet type and extract payload
+	if len(decryptedData) < 1 {
+		t.cleanupFECGroup(groupID)
+		return
+	}
+
+	packetType := decryptedData[0]
+	payload := decryptedData[1:]
+
+	// Process the packet
+	switch packetType {
+	case PacketTypeData:
+		// Queue for TUN device
+		if !enqueueWithTimeout(t.recvQueue, payload, t.stopCh) {
+			log.Printf("Receive queue full, dropping FEC-recovered packet")
+		}
+	default:
+		log.Printf("Unexpected packet type in FEC group: 0x%02x", packetType)
+	}
+
+	// Clean up the group
+	t.cleanupFECGroup(groupID)
+}
+
+// cleanupFECGroup removes a completed or expired FEC group
+func (t *Tunnel) cleanupFECGroup(groupID uint32) {
+	t.fecRecvGroupsMux.Lock()
+	delete(t.fecRecvGroups, groupID)
+	t.fecRecvGroupsMux.Unlock()
+}
+
+// fecCleanupLoop periodically removes expired FEC groups
+func (t *Tunnel) fecCleanupLoop() {
+	defer t.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-ticker.C:
+			t.cleanupExpiredFECGroups()
+		}
+	}
+}
+
+// cleanupExpiredFECGroups removes FEC groups that haven't completed within timeout
+func (t *Tunnel) cleanupExpiredFECGroups() {
+	now := time.Now()
+	timeout := 5 * time.Second // Groups older than 5 seconds are considered expired
+
+	t.fecRecvGroupsMux.Lock()
+	for groupID, group := range t.fecRecvGroups {
+		if now.Sub(group.createdAt) > timeout {
+			log.Printf("FEC group %d expired after %v (received %d/%d shards)",
+				groupID, now.Sub(group.createdAt), group.receivedCount, group.totalShards)
+			delete(t.fecRecvGroups, groupID)
+			
+			// Update stats
+			t.fecStatsMux.Lock()
+			t.fecStats.packetsLost++
+			t.fecStatsMux.Unlock()
+		}
+	}
+	t.fecRecvGroupsMux.Unlock()
+}
+
+// logFECStats periodically logs FEC statistics
+func (t *Tunnel) logFECStats() {
+	defer t.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.stopCh:
+			return
+		case <-ticker.C:
+			t.fecStatsMux.Lock()
+			stats := t.fecStats
+			t.fecStatsMux.Unlock()
+
+			if stats.groupsReceived > 0 {
+				recoveryRate := float64(stats.groupsRecovered) / float64(stats.groupsReceived) * 100
+				log.Printf("📊 FEC Stats: sent=%d recv=%d recovered=%d (%.1f%%) lost=%d shardsRecv=%d shardsRecovered=%d",
+					stats.groupsSent, stats.groupsReceived, stats.groupsRecovered, recoveryRate,
+					stats.packetsLost, stats.shardsReceived, stats.shardsRecovered)
+			}
 		}
 	}
 }
