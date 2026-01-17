@@ -108,6 +108,12 @@ type ClientConnection struct {
 	cipherGen    uint64
 	lastRecvTime time.Time // Last time we received a packet from this client
 	mu           sync.RWMutex
+	
+	// FEC state (server mode - per client)
+	fecGroupID      uint32            // Current FEC group ID for sending
+	fecGroupMux     sync.Mutex        // Protects fecGroupID
+	fecRecvGroups   map[uint32]*fecGroup // Received FEC groups being reconstructed
+	fecRecvGroupsMux sync.RWMutex     // Protects fecRecvGroups
 }
 
 // ConfigUpdateMessage carries server-pushed configuration updates.
@@ -930,10 +936,11 @@ func (t *Tunnel) handleClient(conn faketcp.ConnAdapter) {
 	log.Printf("Client connected: %s", conn.RemoteAddr())
 
 	client := &ClientConnection{
-		conn:      conn,
-		sendQueue: make(chan []byte, t.config.SendQueueSize),
-		recvQueue: make(chan []byte, t.config.RecvQueueSize),
-		stopCh:    make(chan struct{}),
+		conn:          conn,
+		sendQueue:     make(chan []byte, t.config.SendQueueSize),
+		recvQueue:     make(chan []byte, t.config.RecvQueueSize),
+		stopCh:        make(chan struct{}),
+		fecRecvGroups: make(map[uint32]*fecGroup),
 	}
 
 	t.trackClientConnection(client)
@@ -1788,6 +1795,261 @@ func (t *Tunnel) keepalive() {
 	}
 }
 
+// handleClientFECShard processes FEC shard from a client (server mode)
+func (t *Tunnel) handleClientFECShard(client *ClientConnection, payload []byte) {
+	// Parse FEC shard header
+	if len(payload) < 9 {
+		log.Printf("Invalid FEC shard from client: too short")
+		return
+	}
+
+	flags := payload[0]
+	dataShards := int(flags >> 4)
+	parityShards := int(flags & 0x0F)
+	
+	groupID := uint32(payload[1])<<24 | uint32(payload[2])<<16 | uint32(payload[3])<<8 | uint32(payload[4])
+	shardIndex := uint16(payload[5])<<8 | uint16(payload[6])
+	totalShards := uint16(payload[7])<<8 | uint16(payload[8])
+	shardData := payload[9:]
+
+	if int(totalShards) != dataShards+parityShards {
+		log.Printf("Invalid FEC shard from client: totalShards mismatch")
+		return
+	}
+
+	// Get or create FEC group for this client
+	client.fecRecvGroupsMux.Lock()
+	group, exists := client.fecRecvGroups[groupID]
+	if !exists {
+		group = &fecGroup{
+			shards:        make([][]byte, totalShards),
+			shardsPresent: make([]bool, totalShards),
+			receivedCount: 0,
+			dataShards:    dataShards,
+			parityShards:  parityShards,
+			totalShards:   int(totalShards),
+			createdAt:     time.Now(),
+		}
+		client.fecRecvGroups[groupID] = group
+	}
+	client.fecRecvGroupsMux.Unlock()
+
+	// Add shard to group
+	if int(shardIndex) >= group.totalShards {
+		log.Printf("Invalid shard index %d from client (total: %d)", shardIndex, group.totalShards)
+		return
+	}
+
+	if !group.shardsPresent[shardIndex] {
+		group.shards[shardIndex] = make([]byte, len(shardData))
+		copy(group.shards[shardIndex], shardData)
+		group.shardsPresent[shardIndex] = true
+		group.receivedCount++
+	}
+
+	// Try to reconstruct if we have enough shards
+	if group.receivedCount >= group.dataShards {
+		t.reconstructClientFECGroup(client, groupID, group)
+	}
+}
+
+// reconstructClientFECGroup reconstructs FEC group from client (server mode)
+func (t *Tunnel) reconstructClientFECGroup(client *ClientConnection, groupID uint32, group *fecGroup) {
+	// Check if we have all data shards
+	allDataPresent := true
+	for i := 0; i < group.dataShards; i++ {
+		if !group.shardsPresent[i] {
+			allDataPresent = false
+			break
+		}
+	}
+
+	var reconstructedData []byte
+	var err error
+
+	if !allDataPresent {
+		// Use FEC to recover
+		log.Printf("Client FEC group %d: recovering missing shards (%d/%d received)", groupID, group.receivedCount, group.totalShards)
+		
+		fecCodec, fecErr := fec.NewFEC(group.dataShards, group.parityShards, 0)
+		if fecErr != nil {
+			log.Printf("Failed to create FEC decoder for client: %v", fecErr)
+			t.cleanupClientFECGroup(client, groupID)
+			return
+		}
+
+		reconstructedData, err = fecCodec.Decode(group.shards, group.shardsPresent)
+		if err != nil {
+			log.Printf("Client FEC reconstruction failed for group %d: %v", groupID, err)
+			t.cleanupClientFECGroup(client, groupID)
+			return
+		}
+
+		log.Printf("✓ Client FEC recovery successful for group %d (recovered %d shards)", groupID, group.totalShards-group.receivedCount)
+	} else {
+		// Concatenate data shards
+		totalSize := 0
+		for i := 0; i < group.dataShards; i++ {
+			totalSize += len(group.shards[i])
+		}
+		reconstructedData = make([]byte, 0, totalSize)
+		for i := 0; i < group.dataShards; i++ {
+			reconstructedData = append(reconstructedData, group.shards[i]...)
+		}
+	}
+
+	// Decrypt
+	decryptedData, usedCipher, gen, err := t.decryptPacketForServer(reconstructedData)
+	if err != nil {
+		log.Printf("Failed to decrypt client FEC packet: %v", err)
+		t.cleanupClientFECGroup(client, groupID)
+		return
+	}
+
+	// Update client cipher if a different one was used
+	if usedCipher != nil {
+		currentCipher, currentGen := client.getCipher()
+		if currentCipher != usedCipher || currentGen != gen {
+			client.setCipherWithGen(usedCipher, gen)
+		}
+	}
+
+	if len(decryptedData) < 1 {
+		t.cleanupClientFECGroup(client, groupID)
+		return
+	}
+
+	// Process the packet (similar to regular data packet handling)
+	packetType := decryptedData[0]
+	payload := decryptedData[1:]
+
+	if packetType == PacketTypeData {
+		if len(payload) >= IPv4MinHeaderLen && payload[0]>>4 == IPv4Version {
+			srcIP := net.IP(payload[IPv4SrcIPOffset : IPv4SrcIPOffset+4])
+
+			// Register client IP if not yet registered
+			if client.clientIP == nil {
+				t.addClient(client, srcIP)
+			} else if !client.clientIP.Equal(srcIP) {
+				log.Printf("WARNING: Client FEC packet with wrong source IP")
+				t.cleanupClientFECGroup(client, groupID)
+				return
+			}
+
+			// Route packet (similar to regular data packet)
+			dstIP := net.IP(payload[IPv4DstIPOffset : IPv4DstIPOffset+4])
+			
+			if t.config.ClientIsolation {
+				// Send to TUN only
+				if _, err := t.tunFile.Write(payload); err != nil {
+					log.Printf("TUN write error for FEC packet: %v", err)
+				}
+			} else {
+				// Check if for another client
+				targetClient := t.getClientByIP(dstIP)
+				if targetClient != nil && targetClient != client {
+					// Forward to target client
+					forwardBuf := t.getPacketBuffer()
+					forwardPacket := forwardBuf[:len(payload)]
+					copy(forwardPacket, payload)
+					
+					select {
+					case targetClient.sendQueue <- forwardPacket:
+					default:
+						t.releasePacketBuffer(forwardBuf)
+						log.Printf("Target client queue full, dropping FEC-recovered packet")
+					}
+				} else {
+					// Send to TUN
+					if _, err := t.tunFile.Write(payload); err != nil {
+						log.Printf("TUN write error for FEC packet: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	t.cleanupClientFECGroup(client, groupID)
+}
+
+// cleanupClientFECGroup removes FEC group for a client
+func (t *Tunnel) cleanupClientFECGroup(client *ClientConnection, groupID uint32) {
+	client.fecRecvGroupsMux.Lock()
+	delete(client.fecRecvGroups, groupID)
+	client.fecRecvGroupsMux.Unlock()
+}
+
+// sendClientPacketWithFEC sends packet to client with FEC encoding
+func (t *Tunnel) sendClientPacketWithFEC(client *ClientConnection, packet []byte) error {
+	if t.fec == nil {
+		return t.sendClientPacketDirect(client, packet)
+	}
+
+	// Get next group ID for this client
+	client.fecGroupMux.Lock()
+	groupID := client.fecGroupID
+	client.fecGroupID++
+	client.fecGroupMux.Unlock()
+
+	// Prepend packet type
+	fullPacket, _ := prependPacketType(packet, PacketTypeData)
+
+	// Encrypt
+	encryptedPacket, err := t.encryptForClient(client, fullPacket)
+	if err != nil {
+		return fmt.Errorf("encryption error: %v", err)
+	}
+
+	// Encode with FEC
+	shards, err := t.fec.Encode(encryptedPacket)
+	if err != nil {
+		return fmt.Errorf("FEC encoding error: %v", err)
+	}
+
+	dataShards := t.fec.DataShards()
+	parityShards := t.fec.ParityShards()
+	totalShards := dataShards + parityShards
+
+	// Send each shard
+	for i, shard := range shards {
+		if err := t.sendClientFECShard(client, groupID, uint16(i), uint16(totalShards), uint8(dataShards), uint8(parityShards), shard); err != nil {
+			log.Printf("Failed to send FEC shard %d/%d to client: %v", i, totalShards, err)
+		}
+	}
+
+	return nil
+}
+
+// sendClientFECShard sends a single FEC shard to client
+func (t *Tunnel) sendClientFECShard(client *ClientConnection, groupID uint32, shardIndex, totalShards uint16, dataShards, parityShards uint8, data []byte) error {
+	flags := (dataShards << 4) | (parityShards & 0x0F)
+	
+	shardPacket := make([]byte, 1+1+4+2+2+len(data))
+	shardPacket[0] = PacketTypeFECShard
+	shardPacket[1] = flags
+	shardPacket[2] = byte(groupID >> 24)
+	shardPacket[3] = byte(groupID >> 16)
+	shardPacket[4] = byte(groupID >> 8)
+	shardPacket[5] = byte(groupID)
+	shardPacket[6] = byte(shardIndex >> 8)
+	shardPacket[7] = byte(shardIndex)
+	shardPacket[8] = byte(totalShards >> 8)
+	shardPacket[9] = byte(totalShards)
+	copy(shardPacket[10:], data)
+
+	return client.conn.WritePacket(shardPacket)
+}
+
+// sendClientPacketDirect sends packet to client without FEC
+func (t *Tunnel) sendClientPacketDirect(client *ClientConnection, packet []byte) error {
+	fullPacket, _ := prependPacketType(packet, PacketTypeData)
+	encryptedPacket, err := t.encryptForClient(client, fullPacket)
+	if err != nil {
+		return fmt.Errorf("encryption error: %v", err)
+	}
+	return client.conn.WritePacket(encryptedPacket)
+}
+
 // clientNetReader reads packets from a client connection
 func (t *Tunnel) clientNetReader(client *ClientConnection) {
 	defer client.wg.Done()
@@ -1993,6 +2255,9 @@ func (t *Tunnel) clientNetReader(client *ClientConnection) {
 		case PacketTypeP2PRequest:
 			// Handle P2P connection request from client (server mode)
 			t.handleP2PRequest(client, payload)
+		case PacketTypeFECShard:
+			// Handle FEC shard from client
+			t.handleClientFECShard(client, payload)
 		case PacketTypeRouteInfo:
 			// Register routes advertised by client and respond with server routes
 			routes := parseRouteList(string(payload))
@@ -2018,16 +2283,8 @@ func (t *Tunnel) clientNetWriter(client *ClientConnection) {
 			func() {
 				defer t.releasePacketBuffer(packet)
 
-				fullPacket, _ := prependPacketType(packet, PacketTypeData)
-
-				// Encrypt if cipher is available
-				encryptedPacket, err := t.encryptForClient(client, fullPacket)
-				if err != nil {
-					log.Printf("Client encryption error: %v", err)
-					return
-				}
-
-				if err := client.conn.WritePacket(encryptedPacket); err != nil {
+				// Use FEC encoding for client packets
+				if err := t.sendClientPacketWithFEC(client, packet); err != nil {
 					select {
 					case <-t.stopCh:
 						// Tunnel is stopping, no need to log
